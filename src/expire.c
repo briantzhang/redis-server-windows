@@ -415,15 +415,47 @@ int checkAlreadyExpired(PORT_LONGLONG when) {
 void expireGenericCommand(client *c, PORT_LONGLONG basetime, int unit) {
     robj *key = c->argv[1], *param = c->argv[2];
     PORT_LONGLONG when; /* unix time in milliseconds when the key will expire. */
+    int nx = 0, xx = 0, gt = 0, lt = 0;
 
-    if (getLongLongFromObjectOrReply(c, param, &when, NULL) != C_OK)
+    for (int j = 3; j < c->argc; j++) {
+        char *opt = c->argv[j]->ptr;
+        if (!strcasecmp(opt,"nx")) nx = 1;
+        else if (!strcasecmp(opt,"xx")) xx = 1;
+        else if (!strcasecmp(opt,"gt")) gt = 1;
+        else if (!strcasecmp(opt,"lt")) lt = 1;
+        else {
+            addReplyErrorFormat(c,"Unsupported option %s",opt);
+            return;
+        }
+    }
+    if ((nx && (xx || gt || lt)) || (gt && lt)) {
+        addReplyError(c,"NX and XX, GT or LT options at the same time are not compatible");
         return;
-
-    if (unit == UNIT_SECONDS) when *= 1000;
+    }
+    if (getLongLongFromObjectOrReply(c, param, &when, NULL) != C_OK) return;
+    if (unit == UNIT_SECONDS) {
+        if (when > LLONG_MAX/1000 || when < LLONG_MIN/1000) {
+            addReplyError(c,"invalid expire time");
+            return;
+        }
+        when *= 1000;
+    }
+    if (basetime > 0 && when > LLONG_MAX-basetime) {
+        addReplyError(c,"invalid expire time");
+        return;
+    }
     when += basetime;
 
     /* No key, return zero. */
     if (lookupKeyWrite(c->db,key) == NULL) {
+        addReply(c,shared.czero);
+        return;
+    }
+
+    PORT_LONGLONG current = getExpire(c->db,key);
+    if ((nx && current != -1) || (xx && current == -1) ||
+        (gt && (current == -1 || when <= current)) ||
+        (lt && current != -1 && when >= current)) {
         addReply(c,shared.czero);
         return;
     }
@@ -449,6 +481,10 @@ void expireGenericCommand(client *c, PORT_LONGLONG basetime, int unit) {
         signalModifiedKey(c->db,key);
         notifyKeyspaceEvent(NOTIFY_GENERIC,"expire",key,c->db->id);
         server.dirty++;
+        /* Persist the successful deadline, not a condition to re-evaluate. */
+        robj *deadline = createStringObjectFromLongLong(when);
+        rewriteClientCommandVector(c,3,shared.pexpireat,key,deadline);
+        decrRefCount(deadline);
         return;
     }
 }
@@ -504,6 +540,26 @@ void ttlCommand(client *c) {
 /* PTTL key */
 void pttlCommand(client *c) {
     ttlGenericCommand(c, 1);
+}
+
+/* Absolute expiry inspection does not touch the key's LRU clock. */
+static void expiretimeGenericCommand(client *c, int output_ms) {
+    if (lookupKeyReadWithFlags(c->db,c->argv[1],LOOKUP_NOTOUCH) == NULL) {
+        addReplyLongLong(c,-2);
+        return;
+    }
+    PORT_LONGLONG when = getExpire(c->db,c->argv[1]);
+    /* Match Redis's nearest-second reply without overflowing when + 500. */
+    addReplyLongLong(c,when == -1 ? -1 :
+                    (output_ms ? when : when/1000 + (when%1000+500)/1000));
+}
+
+void expiretimeCommand(client *c) {
+    expiretimeGenericCommand(c,0);
+}
+
+void pexpiretimeCommand(client *c) {
+    expiretimeGenericCommand(c,1);
 }
 
 /* PERSIST key */

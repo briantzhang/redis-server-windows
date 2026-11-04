@@ -633,20 +633,27 @@ void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int a
         buf = catAppendOnlyExpireAtCommand(buf,cmd,argv[1],argv[2]);
     } else if (cmd->proc == setCommand && argc > 3) {
         int i;
-        robj *exarg = NULL, *pxarg = NULL;
-        /* Translate SET [EX seconds][PX milliseconds] to SET and PEXPIREAT */
+        robj *timearg = NULL;
+        struct redisCommand *timecmd = NULL;
+        /* Record one absolute expiry. PXAT is already absolute; EX/PX are not.
+         * Decode before comparing: an integer-encoded argument stores the
+         * number in ptr, and strcasecmp on it is an access violation. */
         buf = catAppendOnlyGenericCommand(buf,3,argv);
         for (i = 3; i < argc; i ++) {
-            if (!strcasecmp(argv[i]->ptr, "ex")) exarg = argv[i+1];
-            if (!strcasecmp(argv[i]->ptr, "px")) pxarg = argv[i+1];
+            robj *opt;
+            if (i+1 >= argc) break;
+            opt = getDecodedObject(argv[i]);
+            if (!strcasecmp(opt->ptr, "ex")) {
+                timearg = argv[i+1]; timecmd = server.expireCommand;
+            } else if (!strcasecmp(opt->ptr, "px")) {
+                timearg = argv[i+1]; timecmd = server.pexpireCommand;
+            } else if (!strcasecmp(opt->ptr, "pxat")) {
+                timearg = argv[i+1]; timecmd = server.pexpireatCommand;
+            }
+            decrRefCount(opt);
         }
-        serverAssert(!(exarg && pxarg));
-        if (exarg)
-            buf = catAppendOnlyExpireAtCommand(buf,server.expireCommand,argv[1],
-                                               exarg);
-        if (pxarg)
-            buf = catAppendOnlyExpireAtCommand(buf,server.pexpireCommand,argv[1],
-                                               pxarg);
+        if (timearg)
+            buf = catAppendOnlyExpireAtCommand(buf,timecmd,argv[1],timearg);
     } else {
         /* All the other commands don't need translation or need the
          * same translation already operated in the command vector

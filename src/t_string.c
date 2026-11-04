@@ -61,72 +61,95 @@ static int checkStringLength(client *c, PORT_LONGLONG size) {
 #define OBJ_SET_NO_FLAGS 0
 #define OBJ_SET_NX (1<<0)     /* Set if key not exists. */
 #define OBJ_SET_XX (1<<1)     /* Set if key exists. */
-#define OBJ_SET_EX (1<<2)     /* Set if time in seconds is given */
-#define OBJ_SET_PX (1<<3)     /* Set if time in ms in given */
+#define OBJ_SET_EX (1<<2)
+#define OBJ_SET_PX (1<<3)
+#define OBJ_SET_KEEPTTL (1<<4)
+#define OBJ_SET_GET (1<<5)
+#define OBJ_SET_EXAT (1<<6)
+#define OBJ_SET_PXAT (1<<7)
+#define OBJ_SET_PERSIST (1<<8)
 
-void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire, int unit, robj *ok_reply, robj *abort_reply) {
-    PORT_LONGLONG milliseconds = 0; /* initialized to avoid any harmness warning */
+int getGenericCommand(client *c);
 
-    if (expire) {
-        if (getLongLongFromObjectOrReply(c, expire, &milliseconds, NULL) != C_OK)
-            return;
-        if (milliseconds <= 0) {
-            addReplyErrorFormat(c,"invalid expire time in %s",c->cmd->name);
-            return;
-        }
-        if (unit == UNIT_SECONDS) milliseconds *= 1000;
+/* Backported expiration semantics from Redis 6.2/7.0. Always return an
+ * absolute millisecond deadline, checking overflow before multiplication. */
+static int stringExpireTime(client *c, robj *expire, int flags, int unit,
+                            PORT_LONGLONG *when) {
+    PORT_LONGLONG now = mstime();
+    if (getLongLongFromObjectOrReply(c,expire,when,NULL) != C_OK) return C_ERR;
+    if (*when <= 0 || (unit == UNIT_SECONDS && *when > LLONG_MAX/1000))
+        goto invalid;
+    if (unit == UNIT_SECONDS) *when *= 1000;
+    if (!(flags & (OBJ_SET_EXAT|OBJ_SET_PXAT))) {
+        if (*when > LLONG_MAX-now) goto invalid;
+        *when += now;
     }
-
-    if ((flags & OBJ_SET_NX && lookupKeyWrite(c->db,key) != NULL) ||
-        (flags & OBJ_SET_XX && lookupKeyWrite(c->db,key) == NULL))
-    {
-        addReply(c, abort_reply ? abort_reply : shared.nullbulk);
-        return;
-    }
-    setKey(c->db,key,val);
-    server.dirty++;
-    if (expire) setExpire(c,c->db,key,mstime()+milliseconds);
-    notifyKeyspaceEvent(NOTIFY_STRING,"set",key,c->db->id);
-    if (expire) notifyKeyspaceEvent(NOTIFY_GENERIC,
-        "expire",key,c->db->id);
-    addReply(c, ok_reply ? ok_reply : shared.ok);
+    return C_OK;
+invalid:
+    addReplyErrorFormat(c,"invalid expire time in %s",c->cmd->name);
+    return C_ERR;
 }
 
-/* SET key value [NX] [XX] [EX <seconds>] [PX <milliseconds>] */
+void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire, int unit, robj *ok_reply, robj *abort_reply) {
+    PORT_LONGLONG when = -1;
+    if (expire && stringExpireTime(c,expire,flags,unit,&when) != C_OK) return;
+    if ((flags & OBJ_SET_GET) && getGenericCommand(c) == C_ERR) return;
+
+    int found = 0;
+    if (flags & (OBJ_SET_NX|OBJ_SET_XX|OBJ_SET_KEEPTTL))
+        found = lookupKeyWrite(c->db,key) != NULL;
+    if (((flags & OBJ_SET_NX) && found) || ((flags & OBJ_SET_XX) && !found)) {
+        if (!(flags & OBJ_SET_GET))
+            addReply(c,abort_reply ? abort_reply : shared.nullbulk);
+        return;
+    }
+    if ((flags & OBJ_SET_KEEPTTL) && found) when = getExpire(c->db,key);
+    setKeyWithFlags(c->db,key,val,flags & OBJ_SET_KEEPTTL);
+    if (expire) setExpire(c,c->db,key,when);
+    server.dirty++;
+    notifyKeyspaceEvent(NOTIFY_STRING,"set",key,c->db->id);
+    if (expire) notifyKeyspaceEvent(NOTIFY_GENERIC,"expire",key,c->db->id);
+    if (!(flags & OBJ_SET_GET)) addReply(c,ok_reply ? ok_reply : shared.ok);
+
+    /* Leave the common SET hot path allocation-free, as in the base port. */
+    if (!expire && !(flags & (OBJ_SET_GET|OBJ_SET_KEEPTTL))) return;
+
+    /* Record the actual result rather than GET/NX/XX or relative time. The
+     * legacy AOF writer expands PXAT to SET plus PEXPIREAT. Command names
+     * must be the shared objects: the AOF path compares them by pointer. */
+    if (when != -1) {
+        robj *deadline = createStringObjectFromLongLong(when);
+        rewriteClientCommandVector(c,5,shared.set,key,val,shared.pxat,deadline);
+        decrRefCount(deadline);
+    } else {
+        rewriteClientCommandVector(c,3,shared.set,key,val);
+    }
+}
+
+/* SET key value [NX|XX] [GET] [EX|PX|EXAT|PXAT time|KEEPTTL] */
 void setCommand(client *c) {
-    int j;
+    int flags = OBJ_SET_NO_FLAGS, unit = UNIT_SECONDS;
     robj *expire = NULL;
-    int unit = UNIT_SECONDS;
-    int flags = OBJ_SET_NO_FLAGS;
-
-    for (j = 3; j < c->argc; j++) {
+    for (int j = 3; j < c->argc; j++) {
         char *a = c->argv[j]->ptr;
-        robj *next = (j == c->argc-1) ? NULL : c->argv[j+1];
-
-        if ((a[0] == 'n' || a[0] == 'N') &&
-            (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' &&
-            !(flags & OBJ_SET_XX))
-        {
+        robj *next = j+1 < c->argc ? c->argv[j+1] : NULL;
+        if (!strcasecmp(a,"nx") && !(flags & OBJ_SET_XX)) {
             flags |= OBJ_SET_NX;
-        } else if ((a[0] == 'x' || a[0] == 'X') &&
-                   (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' &&
-                   !(flags & OBJ_SET_NX))
-        {
+        } else if (!strcasecmp(a,"xx") && !(flags & OBJ_SET_NX)) {
             flags |= OBJ_SET_XX;
-        } else if ((a[0] == 'e' || a[0] == 'E') &&
-                   (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' &&
-                   !(flags & OBJ_SET_PX) && next)
-        {
-            flags |= OBJ_SET_EX;
-            unit = UNIT_SECONDS;
-            expire = next;
-            j++;
-        } else if ((a[0] == 'p' || a[0] == 'P') &&
-                   (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' &&
-                   !(flags & OBJ_SET_EX) && next)
-        {
-            flags |= OBJ_SET_PX;
-            unit = UNIT_MILLISECONDS;
+        } else if (!strcasecmp(a,"get")) {
+            flags |= OBJ_SET_GET;
+        } else if (!strcasecmp(a,"keepttl") && !expire) {
+            flags |= OBJ_SET_KEEPTTL;
+        } else if ((!strcasecmp(a,"ex") || !strcasecmp(a,"px") ||
+                    !strcasecmp(a,"exat") || !strcasecmp(a,"pxat")) &&
+                   next && !expire && !(flags & OBJ_SET_KEEPTTL)) {
+            if (!strcasecmp(a,"ex")) flags |= OBJ_SET_EX;
+            else if (!strcasecmp(a,"px")) flags |= OBJ_SET_PX;
+            else if (!strcasecmp(a,"exat")) flags |= OBJ_SET_EXAT;
+            else flags |= OBJ_SET_PXAT;
+            unit = (flags & (OBJ_SET_PX|OBJ_SET_PXAT)) ?
+                   UNIT_MILLISECONDS : UNIT_SECONDS;
             expire = next;
             j++;
         } else {
@@ -134,7 +157,6 @@ void setCommand(client *c) {
             return;
         }
     }
-
     c->argv[2] = tryObjectEncoding(c->argv[2]);
     setGenericCommand(c,flags,c->argv[1],c->argv[2],expire,unit,NULL,NULL);
 }
@@ -171,6 +193,71 @@ int getGenericCommand(client *c) {
 
 void getCommand(client *c) {
     getGenericCommand(c);
+}
+
+/* GETDEL and GETEX propagate existing 5.x mutation commands. */
+void getdelCommand(client *c) {
+    robj *key = c->argv[1];
+    robj *o = lookupKeyWriteOrReply(c,key,shared.nullbulk);
+    if (o == NULL || checkType(c,o,OBJ_STRING)) return;
+    addReplyBulk(c,o);
+    serverAssert(dbSyncDelete(c->db,key));
+    signalModifiedKey(c->db,key);
+    notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
+    server.dirty++;
+    rewriteClientCommandVector(c,2,shared.del,key);
+}
+
+void getexCommand(client *c) {
+    int flags = 0, unit = UNIT_SECONDS;
+    robj *expire = NULL, *key = c->argv[1];
+    PORT_LONGLONG when = 0;
+    for (int j = 2; j < c->argc; j++) {
+        char *a = c->argv[j]->ptr;
+        if (!strcasecmp(a,"persist") && !expire) {
+            flags |= OBJ_SET_PERSIST;
+        } else if ((!strcasecmp(a,"ex") || !strcasecmp(a,"px") ||
+                    !strcasecmp(a,"exat") || !strcasecmp(a,"pxat")) &&
+                   j+1 < c->argc && !expire && !(flags & OBJ_SET_PERSIST)) {
+            if (!strcasecmp(a,"ex")) flags |= OBJ_SET_EX;
+            else if (!strcasecmp(a,"px")) flags |= OBJ_SET_PX;
+            else if (!strcasecmp(a,"exat")) flags |= OBJ_SET_EXAT;
+            else flags |= OBJ_SET_PXAT;
+            unit = (flags & (OBJ_SET_PX|OBJ_SET_PXAT)) ?
+                   UNIT_MILLISECONDS : UNIT_SECONDS;
+            expire = c->argv[++j];
+        } else {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+    }
+    robj *o = lookupKeyWriteOrReply(c,key,shared.nullbulk);
+    if (o == NULL || checkType(c,o,OBJ_STRING)) return;
+    if (expire && stringExpireTime(c,expire,flags,unit,&when) != C_OK) return;
+    addReplyBulk(c,o);
+    if (expire && checkAlreadyExpired(when)) {
+        int deleted = server.lazyfree_lazy_expire ? dbAsyncDelete(c->db,key) :
+                                                  dbSyncDelete(c->db,key);
+        serverAssert(deleted);
+        signalModifiedKey(c->db,key);
+        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
+        server.dirty++;
+        rewriteClientCommandVector(c,2,server.lazyfree_lazy_expire ?
+                                   shared.unlink : shared.del,key);
+    } else if (expire) {
+        setExpire(c,c->db,key,when);
+        signalModifiedKey(c->db,key);
+        notifyKeyspaceEvent(NOTIFY_GENERIC,"expire",key,c->db->id);
+        server.dirty++;
+        robj *deadline = createStringObjectFromLongLong(when);
+        rewriteClientCommandVector(c,3,shared.pexpireat,key,deadline);
+        decrRefCount(deadline);
+    } else if ((flags & OBJ_SET_PERSIST) && removeExpire(c->db,key)) {
+        signalModifiedKey(c->db,key);
+        notifyKeyspaceEvent(NOTIFY_GENERIC,"persist",key,c->db->id);
+        server.dirty++;
+        rewriteClientCommandVector(c,2,shared.persist,key);
+    }
 }
 
 void getsetCommand(client *c) {

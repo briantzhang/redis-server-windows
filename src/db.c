@@ -213,18 +213,23 @@ void dbOverwrite(redisDb *db, robj *key, robj *val) {
  *
  * 1) The ref count of the value object is incremented.
  * 2) clients WATCHing for the destination key notified.
- * 3) The expire time of the key is reset (the key is made persistent).
+ * 3) The expire time is reset unless keepttl is requested.
  *
- * All the new keys in the database should be created via this interface. */
-void setKey(redisDb *db, robj *key, robj *val) {
+ * All the new keys in the database should be created via this interface.
+ * setKey keeps the original behavior for existing callers. */
+void setKeyWithFlags(redisDb *db, robj *key, robj *val, int keepttl) {
     if (lookupKeyWrite(db,key) == NULL) {
         dbAdd(db,key,val);
     } else {
         dbOverwrite(db,key,val);
     }
     incrRefCount(val);
-    removeExpire(db,key);
+    if (!keepttl) removeExpire(db,key);
     signalModifiedKey(db,key);
+}
+
+void setKey(redisDb *db, robj *key, robj *val) {
+    setKeyWithFlags(db,key,val,0);
 }
 
 int dbExists(redisDb *db, robj *key) {

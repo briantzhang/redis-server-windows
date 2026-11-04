@@ -816,6 +816,7 @@ struct sharedObjectsStruct {
     *busykeyerr, *oomerr, *plus, *messagebulk, *pmessagebulk, *subscribebulk,
     *unsubscribebulk, *psubscribebulk, *punsubscribebulk, *del, *unlink,
     *rpop, *lpop, *lpush, *rpoplpush, *zpopmin, *zpopmax, *emptyscan,
+    *set, *pxat, *pexpireat, *persist,
     *select[PROTO_SHARED_SELECT_CMDS],
     *integers[OBJ_SHARED_INTEGERS],
     *mbulkhdr[OBJ_SHARED_BULKHDR_LEN], /* "*<value>\r\n" */
@@ -1025,7 +1026,8 @@ struct redisServer {
     struct redisCommand *delCommand, *multiCommand, *lpushCommand,
                         *lpopCommand, *rpopCommand, *zpopminCommand,
                         *zpopmaxCommand, *sremCommand, *execCommand,
-                        *expireCommand, *pexpireCommand, *xclaimCommand,
+                        *expireCommand, *pexpireCommand, *pexpireatCommand,
+                        *xclaimCommand,
                         *xgroupCommand;
     /* Fields used only for stats */
     time_t stat_starttime;          /* Server start time */
@@ -1883,6 +1885,7 @@ void objectSetLRUOrLFU(robj *val, PORT_LONGLONG lfu_freq, PORT_LONGLONG lru_idle
 void dbAdd(redisDb *db, robj *key, robj *val);
 void dbOverwrite(redisDb *db, robj *key, robj *val);
 void setKey(redisDb *db, robj *key, robj *val);
+void setKeyWithFlags(redisDb *db, robj *key, robj *val, int keepttl);
 int dbExists(redisDb *db, robj *key);
 robj *dbRandomKey(redisDb *db);
 int dbSyncDelete(redisDb *db, robj *key);
@@ -1996,6 +1999,12 @@ void setnxCommand(client *c);
 void setexCommand(client *c);
 void psetexCommand(client *c);
 void getCommand(client *c);
+void getdelCommand(client *c);
+void getexCommand(client *c);
+void expiretimeCommand(client *c);
+void pexpiretimeCommand(client *c);
+void smismemberCommand(client *c);
+void zmscoreCommand(client *c);
 void delCommand(client *c);
 void unlinkCommand(client *c);
 void existsCommand(client *c);

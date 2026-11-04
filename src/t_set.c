@@ -385,6 +385,17 @@ void sismemberCommand(client *c) {
         addReply(c,shared.czero);
 }
 
+/* Redis 6.2 batch membership check, one dictionary lookup and one reply. */
+void smismemberCommand(client *c) {
+    robj *set = lookupKeyRead(c->db,c->argv[1]);
+    if (set && checkType(c,set,OBJ_SET)) return;
+    addReplyMultiBulkLen(c,c->argc-2);
+    for (int j = 2; j < c->argc; j++) {
+        addReply(c,set && setTypeIsMember(set,c->argv[j]->ptr) ?
+                   shared.cone : shared.czero);
+    }
+}
+
 void scardCommand(client *c) {
     robj *o;
 

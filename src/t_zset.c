@@ -3103,6 +3103,20 @@ void zscoreCommand(client *c) {
     }
 }
 
+/* Redis 6.2 batch score lookup, retaining the RESP2 score representation. */
+void zmscoreCommand(client *c) {
+    robj *zobj = lookupKeyRead(c->db,c->argv[1]);
+    if (zobj && checkType(c,zobj,OBJ_ZSET)) return;
+    addReplyMultiBulkLen(c,c->argc-2);
+    for (int j = 2; j < c->argc; j++) {
+        double score;
+        if (!zobj || zsetScore(zobj,c->argv[j]->ptr,&score) == C_ERR)
+            addReply(c,shared.nullbulk);
+        else
+            addReplyDouble(c,score);
+    }
+}
+
 void zrankGenericCommand(client *c, int reverse) {
     robj *key = c->argv[1];
     robj *ele = c->argv[2];

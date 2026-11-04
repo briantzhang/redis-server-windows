@@ -56,3 +56,9 @@ tests/tmp/
 /msvs/msi/.vs/RedisMsi/v15/Server/sqlite3
 .vs/
 *.rdb
+/vendor-reference/
+/dist/
+/build-tools/*.log
+/build-tools/vs_BuildTools.exe
+/build-tools/aof-repro/
+/probe-build-tools.ps1

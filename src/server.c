@@ -138,6 +138,10 @@ volatile PORT_ULONG lru_clock; /* Server global current LRU time. */
 struct redisCommand redisCommandTable[] = {
     {"module",moduleCommand,-2,"as",0,NULL,0,0,0,0,0},
     {"get",getCommand,2,"rF",0,NULL,1,1,1,0,0},
+    {"getdel",getdelCommand,2,"wF",0,NULL,1,1,1,0,0},
+    {"getex",getexCommand,-2,"wF",0,NULL,1,1,1,0,0},
+    {"expiretime",expiretimeCommand,2,"rF",0,NULL,1,1,1,0,0},
+    {"pexpiretime",pexpiretimeCommand,2,"rF",0,NULL,1,1,1,0,0},
     {"set",setCommand,-3,"wm",0,NULL,1,1,1,0,0},
     {"setnx",setnxCommand,3,"wmF",0,NULL,1,1,1,0,0},
     {"setex",setexCommand,4,"wm",0,NULL,1,1,1,0,0},
@@ -177,6 +181,7 @@ struct redisCommand redisCommandTable[] = {
     {"srem",sremCommand,-3,"wF",0,NULL,1,1,1,0,0},
     {"smove",smoveCommand,4,"wF",0,NULL,1,2,1,0,0},
     {"sismember",sismemberCommand,3,"rF",0,NULL,1,1,1,0,0},
+    {"smismember",smismemberCommand,-3,"rF",0,NULL,1,1,1,0,0},
     {"scard",scardCommand,2,"rF",0,NULL,1,1,1,0,0},
     {"spop",spopCommand,-2,"wRF",0,NULL,1,1,1,0,0},
     {"srandmember",srandmemberCommand,-2,"rR",0,NULL,1,1,1,0,0},
@@ -206,6 +211,7 @@ struct redisCommand redisCommandTable[] = {
     {"zrevrange",zrevrangeCommand,-4,"r",0,NULL,1,1,1,0,0},
     {"zcard",zcardCommand,2,"rF",0,NULL,1,1,1,0,0},
     {"zscore",zscoreCommand,3,"rF",0,NULL,1,1,1,0,0},
+    {"zmscore",zmscoreCommand,-3,"rF",0,NULL,1,1,1,0,0},
     {"zrank",zrankCommand,3,"rF",0,NULL,1,1,1,0,0},
     {"zrevrank",zrevrankCommand,3,"rF",0,NULL,1,1,1,0,0},
     {"zscan",zscanCommand,-3,"rR",0,NULL,1,1,1,0,0},
@@ -240,10 +246,10 @@ struct redisCommand redisCommandTable[] = {
     {"move",moveCommand,3,"wF",0,NULL,1,1,1,0,0},
     {"rename",renameCommand,3,"w",0,NULL,1,2,1,0,0},
     {"renamenx",renamenxCommand,3,"wF",0,NULL,1,2,1,0,0},
-    {"expire",expireCommand,3,"wF",0,NULL,1,1,1,0,0},
-    {"expireat",expireatCommand,3,"wF",0,NULL,1,1,1,0,0},
-    {"pexpire",pexpireCommand,3,"wF",0,NULL,1,1,1,0,0},
-    {"pexpireat",pexpireatCommand,3,"wF",0,NULL,1,1,1,0,0},
+    {"expire",expireCommand,-3,"wF",0,NULL,1,1,1,0,0},
+    {"expireat",expireatCommand,-3,"wF",0,NULL,1,1,1,0,0},
+    {"pexpire",pexpireCommand,-3,"wF",0,NULL,1,1,1,0,0},
+    {"pexpireat",pexpireatCommand,-3,"wF",0,NULL,1,1,1,0,0},
     {"keys",keysCommand,2,"rS",0,NULL,0,0,0,0,0},
     {"scan",scanCommand,-2,"rR",0,NULL,0,0,0,0,0},
     {"dbsize",dbsizeCommand,1,"rF",0,NULL,0,0,0,0,0},
@@ -1552,6 +1558,10 @@ void createSharedObjects(void) {
     shared.unsubscribebulk = createStringObject("$11\r\nunsubscribe\r\n",18);
     shared.psubscribebulk = createStringObject("$10\r\npsubscribe\r\n",17);
     shared.punsubscribebulk = createStringObject("$12\r\npunsubscribe\r\n",19);
+    shared.set = createStringObject("SET",3);
+    shared.pxat = createStringObject("PXAT",4);
+    shared.pexpireat = createStringObject("PEXPIREAT",9);
+    shared.persist = createStringObject("PERSIST",7);
     shared.del = createStringObject("DEL",3);
     shared.unlink = createStringObject("UNLINK",6);
     shared.rpop = createStringObject("RPOP",4);
@@ -1778,6 +1788,7 @@ void initServerConfig(void) {
     server.execCommand = lookupCommandByCString("exec");
     server.expireCommand = lookupCommandByCString("expire");
     server.pexpireCommand = lookupCommandByCString("pexpire");
+    server.pexpireatCommand = lookupCommandByCString("pexpireat");
     server.xclaimCommand = lookupCommandByCString("xclaim");
     server.xgroupCommand = lookupCommandByCString("xgroup");
 
