@@ -2,7 +2,7 @@
 
 适用版本：Redis for Windows `5.0.14.1-bp1`，仅 Windows x64，单机、非集群。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
 
-本文只覆盖这一个可执行文件的日常操作。它不包含 Redis 官方 6/7/8 才有的 ACL、TLS、多段 AOF 和集群，那些配置项写进 `redis.conf` 也不会生效，启动时会报未知配置。
+本文只覆盖这一个可执行文件的日常操作。它不包含 TLS、多段 AOF 和集群，那些配置项写进 `redis.conf` 也不会生效，启动时会报未知配置。ACL 已按 Redis 6 的范围实现，见第 3 节。
 
 ## 1. 目录与文件
 
@@ -101,12 +101,29 @@ logfile D:/redis-data/redis.log
 
 几点说明：
 
-- `bind 127.0.0.1` 只允许本机连接。要给别的机器用，改成具体网卡地址，并设 `requirepass`。底座的口令是明文配置项，没有 ACL 用户体系。
+- `bind 127.0.0.1` 只允许本机连接。要给别的机器用，改成具体网卡地址，并设口令。`requirepass` 仍然有效，它现在是 `default` 用户的口令；需要多个用户时用下面的 ACL。
 - `appendfsync everysec` 最多丢一秒的写入。改成 `always` 每个写命令都刷盘，安全但慢；`no` 交给操作系统，断电时丢失不可控。
 - `dir` 用正斜杠。改这个目录之前先 `SHUTDOWN`，否则 RDB 和 AOF 会写到旧目录。
 - 内存上限按机器实际可用内存留余量，Windows 上吃满内存会连系统一起被拖慢。
 
 改完配置必须重启进程才生效，本版没有运行期重载全部配置的能力。
+
+### ACL 用户
+
+本版的 ACL 是 Redis 6 的范围：每个用户只有一套权限。规则在运行期用命令设置，不会写进 `redis.conf`，重启后只剩 `default` 用户，其余要在启动脚本里重新下发。
+
+```text
+ACL SETUSER reader on >secret ~cache:* -@all +get +ping
+AUTH reader secret
+ACL WHOAMI
+```
+
+- `on`/`off` 启用或停用用户。`>口令` 追加一个口令，口令以 SHA1 摘要保存，不明文落盘。
+- `-@all +get +ping` 先清空命令权限再放行单个命令。分类有 `read`、`write`、`admin`、`pubsub`、`fast`、`slow`，顺序有意义，`+get` 必须写在 `-@all` 后面。
+- `~cache:*` 只允许匹配该通配符的键，`~*` 是全部键。键权限只有允许或不允许，没有 Redis 7 那种按键区分读和写的选择器，写了 `%R~` 这类规则会报未知规则。
+- 一个用户不能删掉自己看不到的用户：`ACL` 命令本身受权限控制，但 `ACL WHOAMI` 对任何已认证用户都放行。
+- 配置了 `requirepass` 时，未认证连接收到 `NOAUTH`；没有配置时，连接以 `default` 用户进入，`default` 默认拥有全部权限。
+- `ACL DELUSER default` 会被拒绝。删掉一个用户后，仍以该用户身份在线的连接会在下一条命令上失败。
 
 ## 4. 新增命令怎么用
 

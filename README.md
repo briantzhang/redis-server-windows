@@ -16,8 +16,17 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `EXPIRETIME key` / `PEXPIRETIME key` | 7.0 | 查询绝对过期时间；键不存在返回 -2，没有 TTL 返回 -1 |
 | `SMISMEMBER key member [member ...]` | 6.2 | 一次判断多个集合成员 |
 | `ZMSCORE key member [member ...]` | 6.2 | 一次查询多个有序集合分数 |
+| `ZUNION numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM\|MIN\|MAX] [WITHSCORES]` | 6.2 | 多键有序集合并集，只返回结果不落库 |
+| `ZINTER numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM\|MIN\|MAX] [WITHSCORES]` | 6.2 | 多键有序集合交集 |
+| `ZDIFF numkeys key [key ...] [WITHSCORES]` | 6.2 | 第一个键减去其余键的差集 |
+| `ZDIFFSTORE destination numkeys key [key ...]` | 6.2 | 差集写入目标键 |
+| `COPY source destination [DB db] [REPLACE]` | 6.2 | 深拷贝任意类型的键；不带 REPLACE 时不覆盖已存在的目标 |
+| `RESET` | 6.2 | 连接回到 0 号库并清除客户端状态 |
+| `ACL SETUSER/DELUSER/LIST/WHOAMI`、`AUTH username password` | 6.0 | 用户、口令、命令分类与键通配符；见下方范围说明 |
 
 过期时间在秒数乘 1000、相对时间加当前时间之前做有符号 64 位溢出检查，非法值报错且不改动数据。
+
+ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`>password`、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`。没有 Redis 7 的多选择器（一个用户多套权限）和按键的读写权限位。配置了 `requirepass` 时，它仍然是 `default` 用户的口令，未认证的连接一律拒绝；不配置时连接直接以 `default` 用户身份进入，ACL 规则照常生效。
 
 命令语义参照 Redis `7.0.15`（BSD）手工适配，没有引入 Redis 8 的源码。完整说明见 [BACKPORT-RELEASE.md](BACKPORT-RELEASE.md)。
 
@@ -26,7 +35,8 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 以下能力不在本版中，调用会返回 `unknown command` 或沿用底座的旧行为：
 
 - RESP3、客户端缓存追踪（`CLIENT TRACKING`）、Redis Functions
-- ACL、TLS、线程化 I/O
+- Redis 7 的 ACL 选择器与按键权限位（本版 ACL 停在 Redis 6 的单权限集）
+- TLS、线程化 I/O
 - 多段 AOF（`appenddirname`）、新版 RDB 格式
 - 集群、Redis 8 的查询引擎
 
@@ -46,7 +56,7 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 
 ## 验证
 
-在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，22 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
+在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，25 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
 
 ```bash
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe

@@ -511,6 +511,219 @@ void existsCommand(client *c) {
     addReplyLongLong(c,count);
 }
 
+/* Deep copy of a non-string value. The inner structures of list, set, zset,
+ * hash and stream carry no refcount of their own, so the copy must own fresh
+ * storage: sharing the pointer would let deleting one key free the other's
+ * data. Module values have no copy method in this build and are refused. */
+static robj *dupCollectionObject(robj *src) {
+    robj *dst;
+
+    if (src->type == OBJ_LIST) {
+        listTypeIterator *li;
+        listTypeEntry entry;
+        quicklist *ql;
+        dst = createQuicklistObject();
+        ql = dst->ptr;
+        quicklistSetOptions(ql, server.list_max_ziplist_size,
+                            server.list_compress_depth);
+        li = listTypeInitIterator(src, 0, LIST_TAIL);
+        while (listTypeNext(li, &entry)) {
+            robj *ele = listTypeGet(&entry);
+            quicklistPushTail(ql, ele->ptr, sdslen(ele->ptr));
+            decrRefCount(ele);
+        }
+        listTypeReleaseIterator(li);
+        return dst;
+    }
+
+    if (src->type == OBJ_SET) {
+        setTypeIterator *si;
+        sds ele;
+        int64_t llele;
+        dst = (src->encoding == OBJ_ENCODING_INTSET)
+            ? createIntsetObject() : createSetObject();
+        si = setTypeInitIterator(src);
+        while (setTypeNext(si, &ele, &llele) != -1) {
+            sds value = ele ? sdsdup(ele) : sdsfromlonglong(llele);
+            setTypeAdd(dst, value);
+            sdsfree(value);
+        }
+        setTypeReleaseIterator(si);
+        return dst;
+    }
+
+    if (src->type == OBJ_ZSET) {
+        size_t maxelelen = 0, totelelen = 0;
+        if (src->encoding == OBJ_ENCODING_ZIPLIST) {
+            unsigned char *zl = src->ptr;
+            unsigned char *eptr = ziplistIndex(zl, 0);
+            unsigned char *sptr = ziplistNext(zl, eptr);
+            dst = createZsetZiplistObject();
+            while (eptr != NULL) {
+                unsigned char *vstr;
+                unsigned int vlen;
+                PORT_LONGLONG vlong;
+                sds ele;
+                double score = zzlGetScore(sptr);
+                ziplistGet(eptr, &vstr, &vlen, &vlong);
+                ele = vstr ? sdsnewlen(vstr, vlen) : sdsfromlonglong(vlong);
+                dst->ptr = zzlInsert(dst->ptr, ele, score);
+                if (sdslen(ele) > maxelelen) maxelelen = sdslen(ele);
+                totelelen += sdslen(ele);
+                sdsfree(ele);
+                zzlNext(zl, &eptr, &sptr);
+            }
+        } else if (src->encoding == OBJ_ENCODING_SKIPLIST) {
+            zset *zs = src->ptr;
+            zskiplistNode *node = zs->zsl->header->level[0].forward;
+            dst = createZsetObject();
+            while (node) {
+                int flags = ZADD_NONE;
+                zsetAdd(dst, node->score, node->ele, &flags, NULL);
+                if (sdslen(node->ele) > maxelelen) maxelelen = sdslen(node->ele);
+                totelelen += sdslen(node->ele);
+                node = node->level[0].forward;
+            }
+        } else {
+            serverPanic("Unknown sorted set encoding");
+        }
+        zsetConvertToZiplistIfNeeded(dst, maxelelen, totelelen);
+        return dst;
+    }
+
+    if (src->type == OBJ_HASH) {
+        hashTypeIterator *hi;
+        dst = createHashObject();
+        hi = hashTypeInitIterator(src);
+        while (hashTypeNext(hi) != C_ERR) {
+            sds field = hashTypeCurrentObjectNewSds(hi, OBJ_HASH_KEY);
+            sds value = hashTypeCurrentObjectNewSds(hi, OBJ_HASH_VALUE);
+            hashTypeSet(dst, field, value, HASH_SET_TAKE_FIELD|HASH_SET_TAKE_VALUE);
+        }
+        hashTypeReleaseIterator(hi);
+        return dst;
+    }
+
+    if (src->type == OBJ_STREAM) {
+        stream *os = src->ptr;
+        streamIterator si;
+        streamID id;
+        int64_t numfields, i;
+        dst = createStreamObject();
+        streamIteratorStart(&si, os, NULL, NULL, 0);
+        while (streamIteratorGetID(&si, &id, &numfields)) {
+            robj **fields = zmalloc(sizeof(robj*) * (size_t)numfields * 2);
+            for (i = 0; i < numfields; i++) {
+                unsigned char *f, *v;
+                int64_t flen, vlen;
+                streamIteratorGetField(&si, &f, &v, &flen, &vlen);
+                fields[i*2] = createStringObject((char*)f, (size_t)flen);
+                fields[i*2+1] = createStringObject((char*)v, (size_t)vlen);
+            }
+            if (streamAppendItem(dst->ptr, fields, numfields, NULL, &id) != C_OK)
+                serverPanic("stream copy failed to append an existing entry");
+            for (i = 0; i < numfields*2; i++) decrRefCount(fields[i]);
+            zfree(fields);
+        }
+        streamIteratorStop(&si);
+        /* Consumer groups live outside the entry radix tree, so copy them
+         * separately, including each group's pending entries. */
+        if (os->cgroups) {
+            raxIterator ri;
+            raxStart(&ri, os->cgroups);
+            raxSeek(&ri, "^", NULL, 0);
+            while (raxNext(&ri)) {
+                streamCG *cg = ri.data;
+                streamCG *ncg = streamCreateCG(dst->ptr, (char*)ri.key,
+                                                ri.key_len, &cg->last_id);
+                raxIterator pi;
+                raxStart(&pi, cg->pel);
+                raxSeek(&pi, "^", NULL, 0);
+                while (raxNext(&pi)) {
+                    streamNACK *nack = pi.data;
+                    streamConsumer *oc = nack->consumer;
+                    streamConsumer *nc = streamLookupConsumer(ncg, oc->name,
+                                            SLC_NOREFRESH);
+                    streamNACK *nn = streamCreateNACK(nc);
+                    nc->seen_time = oc->seen_time;
+                    nn->delivery_time = nack->delivery_time;
+                    nn->delivery_count = nack->delivery_count;
+                    raxInsert(ncg->pel, pi.key, pi.key_len, nn, NULL);
+                    raxInsert(nc->pel, pi.key, pi.key_len, nn, NULL);
+                }
+                raxStop(&pi);
+            }
+            raxStop(&ri);
+        }
+        return dst;
+    }
+
+    return NULL;
+}
+
+/* COPY source destination [DB destination-db] [REPLACE]
+ *
+ * Duplicates the value and, unless REPLACE is given, refuses to overwrite an
+ * existing destination. The destination keeps its own TTL, copied from the
+ * source, so expiring one key never expires the other. */
+void copyCommand(client *c) {
+    robj *src, *dst;
+    robj *srckey = c->argv[1], *dstkey = c->argv[2];
+    redisDb *dstdb = c->db;
+    int replace = 0, j;
+    PORT_LONGLONG ttl;
+
+    for (j = 3; j < c->argc; j++) {
+        if (!strcasecmp(c->argv[j]->ptr,"replace")) {
+            replace = 1;
+        } else if (!strcasecmp(c->argv[j]->ptr,"db") && j+1 < c->argc) {
+            PORT_LONG id;
+            if (getLongFromObjectOrReply(c,c->argv[++j],&id,
+                    "invalid DB index") != C_OK) return;
+            if (id < 0 || id >= server.dbnum) {
+                addReplyError(c,"DB index is out of range");
+                return;
+            }
+            dstdb = &server.db[id];
+        } else {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+    }
+
+    src = lookupKeyRead(c->db,srckey);
+    if (src == NULL) {
+        addReplyLongLong(c,0);
+        return;
+    }
+    if (c->db == dstdb && equalStringObjects(srckey,dstkey)) {
+        addReplyError(c,"source and destination objects are the same");
+        return;
+    }
+    if (!replace && lookupKeyWrite(dstdb,dstkey) != NULL) {
+        addReplyLongLong(c,0);
+        return;
+    }
+
+    if (src->type == OBJ_STRING) {
+        dst = dupStringObject(src);
+    } else {
+        dst = dupCollectionObject(src);
+        if (dst == NULL) {
+            addReplyError(c,"unsupported value type");
+            return;
+        }
+    }
+    setKey(dstdb,dstkey,dst);
+    decrRefCount(dst);
+    ttl = getExpire(c->db,srckey);
+    if (ttl != -1) setExpire(c,dstdb,dstkey,ttl);
+    signalModifiedKey(dstdb,dstkey);
+    notifyKeyspaceEvent(NOTIFY_GENERIC,"copy_to",dstkey,dstdb->id);
+    server.dirty++;
+    addReplyLongLong(c,1);
+}
+
 void selectCommand(client *c) {
     PORT_LONG id;
 
@@ -1276,27 +1489,29 @@ void getKeysFreeResult(int *result) {
  * ZINTERSTORE <destkey> <num-keys> <key> <key> ... <key> <options> */
 int *zunionInterGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys) {
     int i, num, *keys;
-    UNUSED(cmd);
+    /* The STORE forms put the destination at argv[1] and the count at
+     * argv[2]. The read-only forms start with the count at argv[1]. */
+    int storing = cmd->proc == zunionstoreCommand ||
+                  cmd->proc == zinterstoreCommand ||
+                  cmd->proc == zdiffstoreCommand;
+    int countidx = storing ? 2 : 1;
 
-    num = atoi(argv[2]->ptr);
+    num = atoi(argv[countidx]->ptr);
     /* Sanity check. Don't return any key if the command is going to
      * reply with syntax error. */
-    if (num < 1 || num > (argc-3)) {
+    if (num < 1 || num > (argc-countidx-1)) {
         *numkeys = 0;
         return NULL;
     }
 
-    /* Keys in z{union,inter}store come from two places:
-     * argv[1] = storage key,
-     * argv[3...n] = keys to intersect */
-    keys = zmalloc(sizeof(int)*((PORT_ULONG)num+1));  WIN_PORT_FIX /* cast (PORT_ULONG) */
+    keys = zmalloc(sizeof(int)*((PORT_ULONG)num+(storing?1:0)));  WIN_PORT_FIX /* cast (PORT_ULONG) */
 
-    /* Add all key positions for argv[3...n] to keys[] */
-    for (i = 0; i < num; i++) keys[i] = 3+i;
+    /* Input keys follow the count argument. */
+    for (i = 0; i < num; i++) keys[i] = countidx+1+i;
 
-    /* Finally add the argv[1] key position (the storage key target). */
-    keys[num] = 1;
-    *numkeys = num+1;  /* Total keys = {union,inter} keys + storage key */
+    /* The STORE forms also touch the destination key. */
+    if (storing) keys[num] = 1;
+    *numkeys = num+(storing?1:0);
     return keys;
 }
 

@@ -2187,6 +2187,12 @@ dictType setAccumulatorDictType = {
     NULL                       /* val destructor */
 };
 
+/* dstkey NULL means reply with the result instead of storing it, which is
+ * how ZUNION, ZINTER and ZDIFF differ from the STORE forms. The number of
+ * input keys then sits at argv[1] rather than argv[2].
+ *
+ * SET_OP_DIFF keeps every member of the first input that is absent from all
+ * the others, scored from the first input only. */
 void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
     int i, j;
     PORT_LONG setnum;
@@ -2199,9 +2205,11 @@ void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
     zset *dstzset;
     zskiplistNode *znode;
     int touched = 0;
+    int withscores = 0;
+    int setnumidx = dstkey ? 2 : 1;
 
     /* expect setnum input keys to be given */
-    if ((getLongFromObjectOrReply(c, c->argv[2], &setnum, NULL) != C_OK))
+    if ((getLongFromObjectOrReply(c, c->argv[setnumidx], &setnum, NULL) != C_OK))
         return;
 
     if (setnum < 1) {
@@ -2211,14 +2219,14 @@ void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
     }
 
     /* test if the expected number of keys would overflow */
-    if (setnum > c->argc-3) {
+    if (setnum > c->argc-(setnumidx+1)) {
         addReply(c,shared.syntaxerr);
         return;
     }
 
     /* read keys to be used for input */
     src = zcalloc(sizeof(zsetopsrc) * setnum);
-    for (i = 0, j = 3; i < setnum; i++, j++) {
+    for (i = 0, j = setnumidx+1; i < setnum; i++, j++) {
         robj *obj = lookupKeyWrite(c->db,c->argv[j]);
         if (obj != NULL) {
             if (obj->type != OBJ_ZSET && obj->type != OBJ_SET) {
@@ -2271,6 +2279,11 @@ void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
                     return;
                 }
                 j++; remaining--;
+            } else if (dstkey == NULL && remaining >= 1 &&
+                       !strcasecmp(c->argv[j]->ptr,"withscores"))
+            {
+                j++; remaining--;
+                withscores = 1;
             } else {
                 zfree(src);
                 addReply(c,shared.syntaxerr);
@@ -2280,8 +2293,10 @@ void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
     }
 
     /* sort sets from the smallest to largest, this will improve our
-     * algorithm's performance */
-    qsort(src,setnum,sizeof(zsetopsrc),zuiCompareByCardinality);
+     * algorithm's performance. The difference is defined against the first
+     * input, so its position has to stay put. */
+    if (op != SET_OP_DIFF)
+        qsort(src,setnum,sizeof(zsetopsrc),zuiCompareByCardinality);
 
     dstobj = createZsetObject();
     dstzset = dstobj->ptr;
@@ -2389,8 +2404,45 @@ void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
         }
         dictReleaseIterator(di);
         dictRelease(accumulator);
+    } else if (op == SET_OP_DIFF) {
+        /* Members of the first input that occur in none of the others.
+         * Scores come from the first input alone, so WEIGHTS and AGGREGATE
+         * do not apply and are rejected above by the option parser. */
+        if (zuiLength(&src[0]) > 0) {
+            zuiInitIterator(&src[0]);
+            while (zuiNext(&src[0],&zval)) {
+                double value;
+                for (j = 1; j < setnum; j++) {
+                    if (src[j].subject == src[0].subject) break;
+                    if (zuiFind(&src[j],&zval,&value)) break;
+                }
+                if (j != setnum) continue;
+                tmp = zuiNewSdsFromValue(&zval);
+                znode = zslInsert(dstzset->zsl,zval.score,tmp);
+                dictAdd(dstzset->dict,tmp,&znode->score);
+                totelelen += sdslen(tmp);
+                if (sdslen(tmp) > maxelelen) maxelelen = sdslen(tmp);
+            }
+            zuiClearIterator(&src[0]);
+        }
     } else {
         serverPanic("Unknown operator");
+    }
+
+    /* Read-only forms reply instead of writing a key. */
+    if (dstkey == NULL) {
+        zskiplistNode *cur;
+        zfree(src);
+        addReplyMultiBulkLen(c, withscores ? dstzset->zsl->length*2
+                                           : dstzset->zsl->length);
+        cur = dstzset->zsl->header->level[0].forward;
+        while (cur) {
+            addReplyBulkCBuffer(c,cur->ele,sdslen(cur->ele));
+            if (withscores) addReplyDouble(c,cur->score);
+            cur = cur->level[0].forward;
+        }
+        decrRefCount(dstobj);
+        return;
     }
 
     if (dbDelete(c->db,dstkey))
@@ -2401,7 +2453,8 @@ void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
         addReplyLongLong(c,zsetLength(dstobj));
         signalModifiedKey(c->db,dstkey);
         notifyKeyspaceEvent(NOTIFY_ZSET,
-            (op == SET_OP_UNION) ? "zunionstore" : "zinterstore",
+            op == SET_OP_UNION ? "zunionstore" :
+            op == SET_OP_DIFF ? "zdiffstore" : "zinterstore",
             dstkey,c->db->id);
         server.dirty++;
     } else {
@@ -2422,6 +2475,22 @@ void zunionstoreCommand(client *c) {
 
 void zinterstoreCommand(client *c) {
     zunionInterGenericCommand(c,c->argv[1], SET_OP_INTER);
+}
+
+void zdiffstoreCommand(client *c) {
+    zunionInterGenericCommand(c,c->argv[1], SET_OP_DIFF);
+}
+
+void zunionCommand(client *c) {
+    zunionInterGenericCommand(c,NULL, SET_OP_UNION);
+}
+
+void zinterCommand(client *c) {
+    zunionInterGenericCommand(c,NULL, SET_OP_INTER);
+}
+
+void zdiffCommand(client *c) {
+    zunionInterGenericCommand(c,NULL, SET_OP_DIFF);
 }
 
 void zrangeGenericCommand(client *c, int reverse) {

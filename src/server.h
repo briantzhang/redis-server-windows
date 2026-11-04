@@ -763,6 +763,7 @@ typedef struct client {
     time_t obuf_soft_limit_reached_time;
     int flags;              /* Client flags: CLIENT_* macros. */
     int authenticated;      /* When requirepass is non-NULL. */
+    void *user;             /* ACL user once authenticated, otherwise NULL. */
     int replstate;          /* Replication state if this is a slave. */
     int repl_put_online_on_ack; /* Install slave write handler on first ACK. */
     int repldbfd;           /* Replication DB file descriptor. */
@@ -1346,6 +1347,7 @@ struct redisCommand {
     int lastkey;  /* The last argument that's a key */
     int keystep;  /* The step between first and last key */
     PORT_LONGLONG microseconds, calls;
+    int id;       /* Position in the ACL command bitmap, assigned at startup. */
 };
 
 struct redisFunctionSym {
@@ -1990,7 +1992,16 @@ char *redisGitDirty(void);
 uint64_t redisBuildId(void);
 
 /* Commands prototypes */
+int time_independent_strcmp(char *a, char *b);
 void authCommand(client *c);
+void aclCommand(client *c);
+void ACLInit(void);
+void *ACLDefaultUser(void);
+int ACLCheckCommand(client *c);
+void ACLInitDefaultUser(void);
+void ACLAssignCommandIDs(void);
+void resetCommand(client *c);
+void copyCommand(client *c);
 void pingCommand(client *c);
 void echoCommand(client *c);
 void commandCommand(client *c);
@@ -2122,6 +2133,10 @@ void hstrlenCommand(client *c);
 void zremrangebyrankCommand(client *c);
 void zunionstoreCommand(client *c);
 void zinterstoreCommand(client *c);
+void zdiffstoreCommand(client *c);
+void zunionCommand(client *c);
+void zinterCommand(client *c);
+void zdiffCommand(client *c);
 void zscanCommand(client *c);
 void hkeysCommand(client *c);
 void hvalsCommand(client *c);

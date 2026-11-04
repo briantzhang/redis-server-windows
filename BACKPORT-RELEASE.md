@@ -15,7 +15,14 @@
 | `EXPIRETIME/PEXPIRETIME` | 7.0 | 查询绝对过期时间；不存在返回 -2，无 TTL 返回 -1 |
 | `SMISMEMBER key member ...` | 6.2 | 批量集合成员判断，减少请求次数，支持原有 intset/哈希表编码 |
 | `ZMSCORE key member ...` | 6.2 | 批量有序集合分数查询，RESP2 返回字符串分数和空值 |
+| `ZUNION` / `ZINTER` | 6.2 | 多键并集与交集，只返回不落库，支持 WEIGHTS 与 AGGREGATE |
+| `ZDIFF` / `ZDIFFSTORE` | 6.2 | 差集；STORE 形式写入目标键 |
+| `COPY` | 6.2 | 深拷贝字符串、列表、集合、有序集合、哈希和流，目标拥有独立存储与独立 TTL |
+| `RESET` | 6.2 | 连接回到 0 号库并清除客户端状态 |
+| ACL（`SETUSER`/`DELUSER`/`LIST`/`WHOAMI`，`AUTH user pass`） | 6.0 | 用户、口令、命令分类与键通配符；见下方范围说明 |
 | 过期时间边界检查 | 参考 7.0 实现 | 在秒乘 1000、相对时间加当前时间之前检查有符号 64 位溢出 |
+
+ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`。没有 Redis 7 的多选择器，也没有按键的读写权限位。`requirepass` 成为 `default` 用户的口令，设置后未认证连接被拒绝；不设置时连接以 `default` 用户进入。`ACL WHOAMI` 对任何已认证用户放行。
 
 代码参照 Redis `7.0.15`（BSD）中的相关命令语义，按旧版 API 手工适配；没有引入 Redis 8 的源码或模块。
 
@@ -25,7 +32,7 @@
 - 成功的带 TTL 的 SET 在 AOF 中记录为普通 SET + 绝对 PEXPIREAT；KEEPTTL 记录实际保留的截止时间。
 - GETEX 的写入记录为 PEXPIREAT、PERSIST 或 DEL/UNLINK；GETDEL 记录为 DEL。
 - 条件过期仅记录成功结果的绝对截止时间，恢复时不重新判断 NX/XX/GT/LT。
-- 不迁入新版 RDB 格式、多段 AOF、RESP3、线程 I/O、TLS、ACL、Functions 或集群功能。原底座已有功能保留，但本版没有对其做现代化升级。
+- 不迁入新版 RDB 格式、多段 AOF、RESP3、线程 I/O、TLS、Functions 或集群功能。ACL 只做到 Redis 6 的单权限集，没有 Redis 7 的选择器。原底座已有功能保留，但本版没有对其做现代化升级。
 - 网络/IOCP、Windows 服务与 fork 模拟层沿用底座代码。
 
 ## 性能预期
@@ -52,7 +59,7 @@
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-04 在 Windows 11、MSVC 14.44（v143）上用提交 a7544cf5 编出的 `redis-server.exe` 跑完，22 项全部通过，包括此前会崩溃的 AOF 重启。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-04 在 Windows 11、MSVC 14.44（v143）上跑完 25 项全部通过，包括此前会崩溃的 AOF 重启，以及新增的有序集合运算、COPY 深拷贝和 ACL 权限用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 

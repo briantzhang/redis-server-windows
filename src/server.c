@@ -201,6 +201,10 @@ struct redisCommand redisCommandTable[] = {
     {"zremrangebylex",zremrangebylexCommand,4,"w",0,NULL,1,1,1,0,0},
     {"zunionstore",zunionstoreCommand,-4,"wm",0,zunionInterGetKeys,0,0,0,0,0},
     {"zinterstore",zinterstoreCommand,-4,"wm",0,zunionInterGetKeys,0,0,0,0,0},
+    {"zdiffstore",zdiffstoreCommand,-4,"wm",0,zunionInterGetKeys,0,0,0,0,0},
+    {"zunion",zunionCommand,-3,"r",0,zunionInterGetKeys,0,0,0,0,0},
+    {"zinter",zinterCommand,-3,"r",0,zunionInterGetKeys,0,0,0,0,0},
+    {"zdiff",zdiffCommand,-3,"r",0,zunionInterGetKeys,0,0,0,0,0},
     {"zrange",zrangeCommand,-4,"r",0,NULL,1,1,1,0,0},
     {"zrangebyscore",zrangebyscoreCommand,-4,"r",0,NULL,1,1,1,0,0},
     {"zrevrangebyscore",zrevrangebyscoreCommand,-4,"r",0,NULL,1,1,1,0,0},
@@ -244,6 +248,7 @@ struct redisCommand redisCommandTable[] = {
     {"select",selectCommand,2,"lF",0,NULL,0,0,0,0,0},
     {"swapdb",swapdbCommand,3,"wF",0,NULL,0,0,0,0,0},
     {"move",moveCommand,3,"wF",0,NULL,1,1,1,0,0},
+    {"copy",copyCommand,-3,"wF",0,NULL,1,2,1,0,0},
     {"rename",renameCommand,3,"w",0,NULL,1,2,1,0,0},
     {"renamenx",renamenxCommand,3,"wF",0,NULL,1,2,1,0,0},
     {"expire",expireCommand,-3,"wF",0,NULL,1,1,1,0,0},
@@ -253,7 +258,9 @@ struct redisCommand redisCommandTable[] = {
     {"keys",keysCommand,2,"rS",0,NULL,0,0,0,0,0},
     {"scan",scanCommand,-2,"rR",0,NULL,0,0,0,0,0},
     {"dbsize",dbsizeCommand,1,"rF",0,NULL,0,0,0,0,0},
-    {"auth",authCommand,2,"sltMF",0,NULL,0,0,0,0,0},
+    {"auth",authCommand,-2,"sltMF",0,NULL,0,0,0,0,0},
+    {"acl",aclCommand,-2,"as",0,NULL,0,0,0,0,0},
+    {"reset",resetCommand,1,"as",0,NULL,0,0,0,0,0},
     {"ping",pingCommand,-1,"tF",0,NULL,0,0,0,0,0},
     {"echo",echoCommand,2,"F",0,NULL,0,0,0,0,0},
     {"save",saveCommand,1,"as",0,NULL,0,0,0,0,0},
@@ -1777,6 +1784,8 @@ void initServerConfig(void) {
     server.commands = dictCreate(&commandTableDictType,NULL);
     server.orig_commands = dictCreate(&commandTableDictType,NULL);
     populateCommandTable();
+    ACLInit();
+    ACLAssignCommandIDs();
     server.delCommand = lookupCommandByCString("del");
     server.multiCommand = lookupCommandByCString("multi");
     server.lpushCommand = lookupCommandByCString("lpush");
@@ -1791,6 +1800,8 @@ void initServerConfig(void) {
     server.pexpireatCommand = lookupCommandByCString("pexpireat");
     server.xclaimCommand = lookupCommandByCString("xclaim");
     server.xgroupCommand = lookupCommandByCString("xgroup");
+    /* requirepass has been parsed by now, so the default user can mirror it. */
+    ACLInitDefaultUser();
 
     /* Slow log */
     server.slowlog_log_slower_than = CONFIG_DEFAULT_SLOWLOG_LOG_SLOWER_THAN;
@@ -2706,11 +2717,16 @@ int processCommand(client *c) {
         return C_OK;
     }
 
-    /* Check if the user is authenticated */
+    /* Check if the user is authenticated. ACL is consulted only once a
+     * user is attached; until then requirepass keeps its old meaning. */
     if (server.requirepass && !c->authenticated && c->cmd->proc != authCommand)
     {
         flagTransaction(c);
         addReply(c,shared.noautherr);
+        return C_OK;
+    }
+    if (c->user && c->cmd->proc != authCommand && ACLCheckCommand(c) == C_ERR) {
+        flagTransaction(c);
         return C_OK;
     }
 
@@ -3046,17 +3062,6 @@ int time_independent_strcmp(char *a, char *b) {
     return diff; /* If zero strings are the same. */
 }
 
-void authCommand(client *c) {
-    if (!server.requirepass) {
-        addReplyError(c,"Client sent AUTH, but no password is set");
-    } else if (!time_independent_strcmp(c->argv[1]->ptr, server.requirepass)) {
-      c->authenticated = 1;
-      addReply(c,shared.ok);
-    } else {
-      c->authenticated = 0;
-      addReplyError(c,"invalid password");
-    }
-}
 
 /* The PING command. It works in a different way if the client is in
  * in Pub/Sub mode. */
