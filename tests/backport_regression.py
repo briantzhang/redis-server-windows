@@ -137,12 +137,14 @@ def reserve_port():
 
 
 class ManagedServer:
-    def __init__(self, executable, directory, timeout, startup_timeout, aof=False):
+    def __init__(self, executable, directory, timeout, startup_timeout, aof=False,
+                 requirepass=None):
         self.executable = executable
         self.directory = Path(directory)
         self.timeout = timeout
         self.startup_timeout = startup_timeout
         self.aof = aof
+        self.requirepass = requirepass
         self.port = reserve_port()
         self.process = None
         self.output = None
@@ -171,7 +173,9 @@ class ManagedServer:
             "logfile server.log\nloglevel notice\n"
             "appendonly %s\nappendfilename appendonly.aof\n"
             "appendfsync always\naof-use-rdb-preamble no\n"
-            "auto-aof-rewrite-percentage 0\n" % (self.port, "yes" if self.aof else "no"),
+            "auto-aof-rewrite-percentage 0\n%s" % (
+                self.port, "yes" if self.aof else "no",
+                "requirepass %s\n" % self.requirepass if self.requirepass else ""),
             encoding="ascii",
         )
         self.output = (self.directory / "stdout.log").open("ab", buffering=0)
@@ -186,7 +190,8 @@ class ManagedServer:
                 if self.process.poll() is not None:
                     break
                 try:
-                    with RESP2("127.0.0.1", self.port, min(self.timeout, 0.5)) as client:
+                    with RESP2("127.0.0.1", self.port, min(self.timeout, 0.5),
+                                self.requirepass) as client:
                         info = client.command("INFO", "server")
                         pid = next((line.split(b":", 1)[1] for line in info.splitlines()
                                     if line.startswith(b"process_id:")), None)
@@ -886,6 +891,118 @@ class BackportRegression(unittest.TestCase):
 
     def test_aof_restart(self):
         self.persistence_roundtrip(aof=True)
+
+    def test_zunion_zinter_zdiff(self):
+        self.cmd("DEL", "za", "zb", "out")
+        self.cmd("ZADD", "za", "1", "a", "2", "b")
+        self.cmd("ZADD", "zb", "3", "b", "4", "c")
+        union = self.cmd("ZUNION", "2", "za", "zb")
+        self.assertCountEqual(union, [b"a", b"b", b"c"])
+        scored = self.cmd("ZUNION", "2", "za", "zb", "WITHSCORES")
+        self.assertEqual(scored, [b"a", b"1", b"c", b"4", b"b", b"5"])
+        self.assertEqual(self.cmd("ZINTER", "2", "za", "zb", "WITHSCORES"),
+                         [b"b", b"5"])
+        self.assertEqual(self.cmd("ZDIFF", "2", "za", "zb"), [b"a"])
+        self.assertEqual(self.cmd("ZDIFF", "2", "zb", "za"), [b"c"])
+        # The read-only forms must not write anything.
+        self.assertEqual(self.cmd("EXISTS", "out"), 0)
+        self.assertEqual(self.cmd("ZDIFFSTORE", "out", "2", "za", "zb"), 1)
+        self.assertEqual(self.cmd("ZRANGE", "out", "0", "-1"), [b"a"])
+        self.cmd("SET", "plain", "x")
+        with self.assertRaises(RedisError):
+            self.cmd("ZUNION", "2", "za", "plain")
+
+    def test_copy_and_reset(self):
+        self.cmd("DEL", "src", "dst")
+        self.cmd("SET", "src", "value", "EX", "100")
+        self.assertEqual(self.cmd("COPY", "src", "dst"), 1)
+        self.assertEqual(self.cmd("GET", "dst"), b"value")
+        self.assertGreater(self.cmd("TTL", "dst"), 0)
+        # Without REPLACE an existing destination is left untouched.
+        self.cmd("SET", "dst", "kept")
+        self.assertEqual(self.cmd("COPY", "src", "dst"), 0)
+        self.assertEqual(self.cmd("GET", "dst"), b"kept")
+        self.assertEqual(self.cmd("COPY", "src", "dst", "REPLACE"), 1)
+        self.assertEqual(self.cmd("GET", "dst"), b"value")
+        self.assertEqual(self.cmd("COPY", "missing", "dst"), 0)
+        with self.assertRaises(RedisError):
+            self.cmd("COPY", "src", "src")
+        # Every non-string type is a real deep copy: deleting one key must
+        # leave the other intact, since those values share no refcount.
+        self.cmd("DEL", "src", "dst")
+        self.cmd("RPUSH", "src", "a", "b")
+        self.assertEqual(self.cmd("COPY", "src", "dst"), 1)
+        self.cmd("DEL", "src")
+        self.assertEqual(self.cmd("LRANGE", "dst", "0", "-1"), [b"a", b"b"])
+        self.cmd("DEL", "src", "dst")
+        self.cmd("SADD", "src", "1", "2")
+        self.assertEqual(self.cmd("COPY", "src", "dst"), 1)
+        self.cmd("DEL", "src")
+        self.assertEqual(sorted(self.cmd("SMEMBERS", "dst")), [b"1", b"2"])
+        self.cmd("DEL", "src", "dst")
+        self.cmd("ZADD", "src", "1", "a", "2", "b")
+        self.assertEqual(self.cmd("COPY", "src", "dst"), 1)
+        self.cmd("DEL", "src")
+        self.assertEqual(self.cmd("ZRANGE", "dst", "0", "-1", "WITHSCORES"),
+                         [b"a", b"1", b"b", b"2"])
+        self.cmd("DEL", "src", "dst")
+        self.cmd("HSET", "src", "f", "v")
+        self.assertEqual(self.cmd("COPY", "src", "dst"), 1)
+        self.cmd("DEL", "src")
+        self.assertEqual(self.cmd("HGETALL", "dst"), [b"f", b"v"])
+        self.cmd("DEL", "src", "dst")
+        self.cmd("XADD", "src", "1-0", "f", "v")
+        self.assertEqual(self.cmd("COPY", "src", "dst"), 1)
+        self.cmd("DEL", "src")
+        self.assertEqual(self.cmd("XRANGE", "dst", "-", "+"),
+                         [[b"1-0", [b"f", b"v"]]])
+        self.cmd("DEL", "dst")
+        # RESET returns to database 0 and drops the client name.
+        self.cmd("SELECT", "1")
+        self.cmd("CLIENT", "SETNAME", "worker")
+        self.assertEqual(self.cmd("RESET"), b"OK")
+        self.assertEqual(self.cmd("CLIENT", "GETNAME"), None)
+        self.cmd("SET", "after-reset", "1")
+        self.cmd("SELECT", "1")
+        self.assertIsNone(self.cmd("GET", "after-reset"))
+        self.cmd("SELECT", "0")
+        self.cmd("DEL", "after-reset")
+
+    def test_acl_users_commands_and_keys(self):
+        # requirepass is what makes an unauthenticated connection fail closed.
+        # Without it every connection is the default user and may run anything.
+        guarded_dir = Path(self.temp.name) / "acl"
+        guarded_dir.mkdir()
+        guarded = ManagedServer(OPTIONS.server, guarded_dir, OPTIONS.timeout,
+                                OPTIONS.startup_timeout, requirepass="admin")
+        self.addCleanup(guarded.close)
+        guarded.start()
+        admin = RESP2("127.0.0.1", guarded.port, OPTIONS.timeout, "admin")
+        self.addCleanup(admin.close)
+        self.addCleanup(admin.command, "ACL", "DELUSER", "reader")
+        self.assertEqual(admin.command("ACL", "SETUSER", "reader", "on", ">secret",
+                                  "resetkeys", "~cache:*", "-@all", "+get", "+ping"), b"OK")
+        # A fresh connection, so it does not share the default user's rights.
+        limited = RESP2("127.0.0.1", guarded.port, OPTIONS.timeout)
+        self.addCleanup(limited.close)
+        with self.assertRaises(RedisError):
+            limited.command("GET", "cache:1")
+        self.assertEqual(limited.command("AUTH", "reader", "secret"), b"OK")
+        self.assertEqual(limited.command("ACL", "WHOAMI"), b"reader")
+        admin.command("SET", "cache:1", "v")
+        admin.command("SET", "other", "v")
+        self.assertEqual(limited.command("GET", "cache:1"), b"v")
+        # The key pattern excludes this key, and SET is not in the command set.
+        with self.assertRaises(RedisError):
+            limited.command("GET", "other")
+        with self.assertRaises(RedisError):
+            limited.command("SET", "cache:1", "no")
+        self.assertEqual(limited.command("PING"), b"PONG")
+        limited.close()
+        denied = RESP2("127.0.0.1", guarded.port, OPTIONS.timeout)
+        self.addCleanup(denied.close)
+        with self.assertRaises(RedisError):
+            denied.command("AUTH", "reader", "wrong")
 
 
 def parse_args(argv):

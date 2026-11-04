@@ -137,6 +137,9 @@ client *createClient(int fd) {
     c->flags = 0;
     c->ctime = c->lastinteraction = server.unixtime;
     c->authenticated = 0;
+    /* With no requirepass the connection is open from the start, so it acts as
+     * the default user and ACL rules apply. requirepass keeps the old gate. */
+    c->user = server.requirepass ? NULL : ACLDefaultUser();
     c->replstate = REPL_STATE_NONE;
     c->repl_put_online_on_ack = 0;
     c->reploff = 0;
@@ -1814,6 +1817,41 @@ sds getAllClientsInfoString(int type) {
         o = sdscatlen(o,"\n",1);
     }
     return o;
+}
+
+/* RESET drops everything the connection accumulated: selected database,
+ * name, watched keys, a queued transaction, pub/sub subscriptions and the
+ * monitor role. The authentication state is kept, since resetting it would
+ * lock the client out of the connection it just cleared. */
+void resetCommand(client *c) {
+    if (c->name) {
+        decrRefCount(c->name);
+        c->name = NULL;
+    }
+    if (c->flags & CLIENT_MONITOR) {
+        listNode *ln;
+        listIter li;
+        listRewind(server.monitors,&li);
+        while ((ln = listNext(&li))) {
+            if (ln->value == c) {
+                listDelNode(server.monitors,ln);
+                break;
+            }
+        }
+        /* MONITOR also sets CLIENT_SLAVE so the connection is fed the
+         * command stream. Drop both, otherwise RESET would turn the client
+         * into a replica that receives nothing. */
+        c->flags &= ~(CLIENT_MONITOR|CLIENT_SLAVE);
+    }
+    c->flags &= ~(CLIENT_MULTI|CLIENT_DIRTY_CAS|CLIENT_DIRTY_EXEC|
+                  CLIENT_ASKING|CLIENT_REPLY_OFF|CLIENT_REPLY_SKIP|
+                  CLIENT_REPLY_SKIP_NEXT);
+    discardTransaction(c);
+    pubsubUnsubscribeAllChannels(c,0);
+    pubsubUnsubscribeAllPatterns(c,0);
+    c->flags &= ~CLIENT_PUBSUB;
+    selectDb(c,0);
+    addReply(c,shared.ok);
 }
 
 void clientCommand(client *c) {

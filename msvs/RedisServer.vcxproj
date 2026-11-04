@@ -267,6 +267,7 @@ copy /Y $(OutputPath)redis-server.pdb $(OutputPath)redis-check-aof.pdb</Command>
     <ClCompile Include="..\src\t_hash.c" />
     <ClCompile Include="..\src\t_list.c" />
     <ClCompile Include="..\src\t_set.c" />
+    <ClCompile Include="..\src\acl.c" />
     <ClCompile Include="..\src\t_stream.c" />
     <ClCompile Include="..\src\t_string.c" />
     <ClCompile Include="..\src\t_zset.c" />
