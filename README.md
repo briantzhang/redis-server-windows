@@ -42,6 +42,8 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 
 产物在 `msvs\x64\Release`：`redis-server.exe`、`redis-cli.exe`、`redis-benchmark.exe`。
 
+只有 Windows x64 这一个构建。底座的工程文件、Win32 网络层和 jemalloc 都按 x64 编写，没有 Windows ARM64 目标，改平台配置编不出来。需要 ARM64 时只能在 Linux 上编译官方源码，不在本仓库范围内。
+
 ## 验证
 
 在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，22 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
