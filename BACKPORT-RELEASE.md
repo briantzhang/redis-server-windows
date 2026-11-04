@@ -52,7 +52,7 @@
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。实际执行结果与构建工具信息将记录在发布包的验证报告中。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-04 在 Windows 11、MSVC 14.44（v143）上用提交 a7544cf5 编出的 `redis-server.exe` 跑完，22 项全部通过，包括此前会崩溃的 AOF 重启。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 
