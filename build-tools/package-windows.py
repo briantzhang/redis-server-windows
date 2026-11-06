@@ -139,7 +139,7 @@ Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；
             if rel and (ROOT/rel).is_file():
                 output.write(ROOT/rel, NAME+'-source/'+rel)
     sums = DIST/(NAME+'-archives.sha256')
-    sums.write_text(''.join(f'{digest(p)}  {p.name}\n' for p in [archive,sources]), encoding='ascii')
+    sums.write_text(''.join(f'{digest(p)}  {p.name}\n' for p in [archive,sources]), encoding='ascii', newline='\n')
     for p in [archive,sources,sums]:
         print(str(p), p.stat().st_size, flush=True)
 
