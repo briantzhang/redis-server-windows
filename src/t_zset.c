@@ -2493,6 +2493,109 @@ void zdiffCommand(client *c) {
     zunionInterGenericCommand(c,NULL, SET_OP_DIFF);
 }
 
+/* ZINTERCARD numkeys key [key ...] [LIMIT limit]
+ *
+ * Counts the intersection of sorted sets by member name; scores do not
+ * matter. The smallest set is iterated to keep the work proportional to it. */
+void zintercardCommand(client *c) {
+    PORT_LONG numkeys, limit = 0, j, card = 0;
+    robj **sets;
+    robj *smallest = NULL;
+    double score;
+
+    if (getLongFromObjectOrReply(c,c->argv[1],&numkeys,
+            "numkeys should be greater than 0") != C_OK) return;
+    if (numkeys <= 0) {
+        addReplyError(c,"numkeys should be greater than 0");
+        return;
+    }
+    if (numkeys > c->argc-2) {
+        addReplyError(c,"Number of keys can't be greater than number of args");
+        return;
+    }
+    for (j = 2+numkeys; j < c->argc; j++) {
+        if (!strcasecmp(c->argv[j]->ptr,"limit") && j+1 < c->argc) {
+            j++;
+            if (getLongFromObjectOrReply(c,c->argv[j],&limit,
+                    "LIMIT can't be negative") != C_OK) return;
+            if (limit < 0) {
+                addReplyError(c,"LIMIT can't be negative");
+                return;
+            }
+        } else {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+    }
+
+    sets = zmalloc(sizeof(robj*)*numkeys);
+    for (j = 0; j < numkeys; j++) {
+        sets[j] = lookupKeyRead(c->db,c->argv[2+j]);
+        if (sets[j] == NULL) {
+            zfree(sets);
+            addReplyLongLong(c,0);
+            return;
+        }
+        if (checkType(c,sets[j],OBJ_ZSET)) {
+            zfree(sets);
+            return;
+        }
+        if (smallest == NULL ||
+            zsetLength(sets[j]) < zsetLength(smallest)) smallest = sets[j];
+    }
+
+    if (smallest->encoding == OBJ_ENCODING_ZIPLIST) {
+        unsigned char *zl = smallest->ptr;
+        unsigned char *eptr = ziplistIndex(zl,0);
+        unsigned char *sptr = ziplistNext(zl,eptr);
+        while (eptr != NULL) {
+            unsigned char *vstr;
+            unsigned int vlen;
+            PORT_LONGLONG vlong;
+            sds ele;
+            int present = 1;
+
+            ziplistGet(eptr,&vstr,&vlen,&vlong);
+            ele = vstr ? sdsnewlen(vstr,vlen) : sdsfromlonglong(vlong);
+            for (j = 0; j < numkeys; j++) {
+                if (sets[j] == smallest) continue;
+                if (zsetScore(sets[j],ele,&score) != C_OK) {
+                    present = 0;
+                    break;
+                }
+            }
+            sdsfree(ele);
+            if (present) {
+                card++;
+                if (limit && card >= limit) break;
+            }
+            zzlNext(zl,&eptr,&sptr);
+        }
+    } else if (smallest->encoding == OBJ_ENCODING_SKIPLIST) {
+        zset *zs = smallest->ptr;
+        zskiplistNode *node = zs->zsl->header->level[0].forward;
+        while (node) {
+            int present = 1;
+            for (j = 0; j < numkeys; j++) {
+                if (sets[j] == smallest) continue;
+                if (zsetScore(sets[j],node->ele,&score) != C_OK) {
+                    present = 0;
+                    break;
+                }
+            }
+            if (present) {
+                card++;
+                if (limit && card >= limit) break;
+            }
+            node = node->level[0].forward;
+        }
+    } else {
+        serverPanic("Unknown sorted set encoding");
+    }
+    zfree(sets);
+    addReplyLongLong(c,card);
+}
+
 void zrangeGenericCommand(client *c, int reverse) {
     robj *key = c->argv[1];
     robj *zobj;

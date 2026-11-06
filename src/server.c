@@ -177,6 +177,8 @@ struct redisCommand redisCommandTable[] = {
     {"ltrim",ltrimCommand,4,"w",0,NULL,1,1,1,0,0},
     {"lrem",lremCommand,4,"w",0,NULL,1,1,1,0,0},
     {"rpoplpush",rpoplpushCommand,3,"wm",0,NULL,1,2,1,0,0},
+    {"lmove",lmoveCommand,-5,"wm",0,NULL,1,2,1,0,0},
+    {"lpos",lposCommand,-3,"r",0,NULL,1,1,1,0,0},
     {"sadd",saddCommand,-3,"wmF",0,NULL,1,1,1,0,0},
     {"srem",sremCommand,-3,"wF",0,NULL,1,1,1,0,0},
     {"smove",smoveCommand,4,"wF",0,NULL,1,2,1,0,0},
@@ -186,6 +188,7 @@ struct redisCommand redisCommandTable[] = {
     {"spop",spopCommand,-2,"wRF",0,NULL,1,1,1,0,0},
     {"srandmember",srandmemberCommand,-2,"rR",0,NULL,1,1,1,0,0},
     {"sinter",sinterCommand,-2,"rS",0,NULL,1,-1,1,0,0},
+    {"sintercard",sintercardCommand,-3,"r",0,zunionInterGetKeys,0,0,0,0,0},
     {"sinterstore",sinterstoreCommand,-3,"wm",0,NULL,1,-1,1,0,0},
     {"sunion",sunionCommand,-2,"rS",0,NULL,1,-1,1,0,0},
     {"sunionstore",sunionstoreCommand,-3,"wm",0,NULL,1,-1,1,0,0},
@@ -205,6 +208,7 @@ struct redisCommand redisCommandTable[] = {
     {"zunion",zunionCommand,-3,"r",0,zunionInterGetKeys,0,0,0,0,0},
     {"zinter",zinterCommand,-3,"r",0,zunionInterGetKeys,0,0,0,0,0},
     {"zdiff",zdiffCommand,-3,"r",0,zunionInterGetKeys,0,0,0,0,0},
+    {"zintercard",zintercardCommand,-3,"r",0,zunionInterGetKeys,0,0,0,0,0},
     {"zrange",zrangeCommand,-4,"r",0,NULL,1,1,1,0,0},
     {"zrangebyscore",zrangebyscoreCommand,-4,"r",0,NULL,1,1,1,0,0},
     {"zrevrangebyscore",zrevrangebyscoreCommand,-4,"r",0,NULL,1,1,1,0,0},
@@ -1722,6 +1726,8 @@ void initServerConfig(void) {
     server.lazyfree_lazy_eviction = CONFIG_DEFAULT_LAZYFREE_LAZY_EVICTION;
     server.lazyfree_lazy_expire = CONFIG_DEFAULT_LAZYFREE_LAZY_EXPIRE;
     server.lazyfree_lazy_server_del = CONFIG_DEFAULT_LAZYFREE_LAZY_SERVER_DEL;
+    server.lazyfree_lazy_user_del = CONFIG_DEFAULT_LAZYFREE_LAZY_USER_DEL;
+    server.lazyfree_lazy_user_flush = CONFIG_DEFAULT_LAZYFREE_LAZY_USER_FLUSH;
     server.always_show_logo = CONFIG_DEFAULT_ALWAYS_SHOW_LOGO;
     server.lua_time_limit = LUA_SCRIPT_TIME_LIMIT;
 

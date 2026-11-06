@@ -938,6 +938,80 @@ void sinterstoreCommand(client *c) {
     sinterGenericCommand(c,c->argv+2,c->argc-2,c->argv[1]);
 }
 
+/* SINTERCARD numkeys key [key ...] [LIMIT limit]
+ *
+ * Returns the cardinality of the intersection without building it. Iterating
+ * the smallest set keeps the work proportional to the smallest input. */
+void sintercardCommand(client *c) {
+    PORT_LONG numkeys, limit = 0, j, card = 0;
+    robj **sets;
+    robj *smallest = NULL;
+    setTypeIterator *si;
+    sds ele;
+
+    if (getLongFromObjectOrReply(c,c->argv[1],&numkeys,
+            "numkeys should be greater than 0") != C_OK) return;
+    if (numkeys <= 0) {
+        addReplyError(c,"numkeys should be greater than 0");
+        return;
+    }
+    if (numkeys > c->argc-2) {
+        addReplyError(c,"Number of keys can't be greater than number of args");
+        return;
+    }
+    for (j = 2+numkeys; j < c->argc; j++) {
+        if (!strcasecmp(c->argv[j]->ptr,"limit") && j+1 < c->argc) {
+            j++;
+            if (getLongFromObjectOrReply(c,c->argv[j],&limit,
+                    "LIMIT can't be negative") != C_OK) return;
+            if (limit < 0) {
+                addReplyError(c,"LIMIT can't be negative");
+                return;
+            }
+        } else {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+    }
+
+    sets = zmalloc(sizeof(robj*)*numkeys);
+    for (j = 0; j < numkeys; j++) {
+        sets[j] = lookupKeyRead(c->db,c->argv[2+j]);
+        if (sets[j] == NULL) {
+            /* A missing key makes the intersection empty. */
+            zfree(sets);
+            addReplyLongLong(c,0);
+            return;
+        }
+        if (checkType(c,sets[j],OBJ_SET)) {
+            zfree(sets);
+            return;
+        }
+        if (smallest == NULL ||
+            setTypeSize(sets[j]) < setTypeSize(smallest)) smallest = sets[j];
+    }
+
+    si = setTypeInitIterator(smallest);
+    while ((ele = setTypeNextObject(si)) != NULL) {
+        int present = 1;
+        for (j = 0; j < numkeys; j++) {
+            if (sets[j] == smallest) continue;
+            if (!setTypeIsMember(sets[j],ele)) {
+                present = 0;
+                break;
+            }
+        }
+        sdsfree(ele);
+        if (present) {
+            card++;
+            if (limit && card >= limit) break;
+        }
+    }
+    setTypeReleaseIterator(si);
+    zfree(sets);
+    addReplyLongLong(c,card);
+}
+
 #define SET_OP_UNION 0
 #define SET_OP_DIFF 1
 #define SET_OP_INTER 2

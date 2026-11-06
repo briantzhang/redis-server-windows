@@ -173,6 +173,8 @@ typedef PORT_LONGLONG ustime_t; /* microsecond time type. */
 #define CONFIG_DEFAULT_LAZYFREE_LAZY_EVICTION 0
 #define CONFIG_DEFAULT_LAZYFREE_LAZY_EXPIRE 0
 #define CONFIG_DEFAULT_LAZYFREE_LAZY_SERVER_DEL 0
+#define CONFIG_DEFAULT_LAZYFREE_LAZY_USER_DEL 0
+#define CONFIG_DEFAULT_LAZYFREE_LAZY_USER_FLUSH 0
 #define CONFIG_DEFAULT_ALWAYS_SHOW_LOGO 0
 #define CONFIG_DEFAULT_ACTIVE_DEFRAG 0
 #define CONFIG_DEFAULT_DEFRAG_THRESHOLD_LOWER 10 /* don't defrag when fragmentation is below 10% */
@@ -1303,6 +1305,8 @@ struct redisServer {
     int lazyfree_lazy_eviction;
     int lazyfree_lazy_expire;
     int lazyfree_lazy_server_del;
+    int lazyfree_lazy_user_del;
+    int lazyfree_lazy_user_flush;
     /* Latency monitor */
     PORT_LONGLONG latency_monitor_threshold;
     dict *latency_events;
@@ -2064,6 +2068,7 @@ void scardCommand(client *c);
 void spopCommand(client *c);
 void srandmemberCommand(client *c);
 void sinterCommand(client *c);
+void sintercardCommand(client *c);
 void sinterstoreCommand(client *c);
 void sunionCommand(client *c);
 void sunionstoreCommand(client *c);
@@ -2075,6 +2080,8 @@ void flushdbCommand(client *c);
 void flushallCommand(client *c);
 void sortCommand(client *c);
 void lremCommand(client *c);
+void lposCommand(client *c);
+void lmoveCommand(client *c);
 void rpoplpushCommand(client *c);
 void infoCommand(client *c);
 void mgetCommand(client *c);
@@ -2137,6 +2144,7 @@ void zdiffstoreCommand(client *c);
 void zunionCommand(client *c);
 void zinterCommand(client *c);
 void zdiffCommand(client *c);
+void zintercardCommand(client *c);
 void zscanCommand(client *c);
 void hkeysCommand(client *c);
 void hvalsCommand(client *c);

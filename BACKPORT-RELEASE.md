@@ -19,6 +19,10 @@
 | `ZDIFF` / `ZDIFFSTORE` | 6.2 | 差集；STORE 形式写入目标键 |
 | `COPY` | 6.2 | 深拷贝字符串、列表、集合、有序集合、哈希和流，目标拥有独立存储与独立 TTL |
 | `RESET` | 6.2 | 连接回到 0 号库并清除客户端状态 |
+| `LPOS` | 6.0 | 查找列表元素下标，支持 RANK、COUNT、MAXLEN |
+| `LMOVE` | 6.2 | 原子地在两个列表间移动元素，源和目标可相同 |
+| `SINTERCARD` / `ZINTERCARD` | 7.0 | 只计算交集基数，支持 LIMIT 提前结束 |
+| `lazyfree-lazy-user-del` / `lazyfree-lazy-user-flush` | 6.0 / 6.2 | 让 DEL 与 FLUSHDB/FLUSHALL 默认走异步释放，避免大键删除阻塞事件循环 |
 | ACL（`SETUSER`/`DELUSER`/`LIST`/`WHOAMI`，`AUTH user pass`） | 6.0 | 用户、口令、命令分类与键通配符；见下方范围说明 |
 | 过期时间边界检查 | 参考 7.0 实现 | 在秒乘 1000、相对时间加当前时间之前检查有符号 64 位溢出 |
 
@@ -59,7 +63,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-04 在 Windows 11、MSVC 14.44（v143）上跑完 25 项全部通过，包括此前会崩溃的 AOF 重启，以及新增的有序集合运算、COPY 深拷贝和 ACL 权限用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-06 在 Windows 11、MSVC 14.44（v143）上跑完 27 项全部通过，包括此前会崩溃的 AOF 重启，以及新增的有序集合运算、COPY 深拷贝、ACL 权限、列表查找移动和交集基数用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 

@@ -428,6 +428,9 @@ int getFlushCommandFlags(client *c, int *flags) {
             return C_ERR;
         }
         *flags = EMPTYDB_ASYNC;
+    } else if (c->argc == 1) {
+        *flags = server.lazyfree_lazy_user_flush ? EMPTYDB_ASYNC
+                                                 : EMPTYDB_NO_FLAGS;
     } else {
         *flags = EMPTYDB_NO_FLAGS;
     }
@@ -492,7 +495,7 @@ void delGenericCommand(client *c, int lazy) {
 }
 
 void delCommand(client *c) {
-    delGenericCommand(c,0);
+    delGenericCommand(c,server.lazyfree_lazy_user_del);
 }
 
 void unlinkCommand(client *c) {
