@@ -100,7 +100,11 @@ Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；
 
 检查版本：redis-server.exe --version
 测试连接：redis-cli.exe -h 127.0.0.1 -p 6379 PING
-新命令示例：redis-cli.exe SET demo value KEEPTTL
+新命令示例：
+  redis-cli.exe SET demo value KEEPTTL
+  redis-cli.exe ZUNION 2 z1 z2 WITHSCORES
+  redis-cli.exe COPY src dst REPLACE
+  redis-cli.exe ACL SETUSER reader on ">secret" "~cache:*" -@all +get +ping
 
 本包不自动创建 Windows 服务、不开防火墙、不覆盖已有数据。部署为服务时可使用底座原有
 --service-install 功能，并明确提供配置文件绝对路径及 --dir 数据目录绝对路径；先在目标机验证。
@@ -112,7 +116,9 @@ Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；
         'version': VERSION, 'platform': 'windows-x64',
         'base_tag': 'v5.0.14.1',
         'base_commit': subprocess.check_output(['git','-C',str(ROOT),'rev-parse','HEAD'],text=True).strip(),
-        'working_tree_has_uncommitted_backport': True,
+        'tracked_files_modified':
+            bool(subprocess.check_output(['git','-C',str(ROOT),'diff','--name-only','HEAD'],
+                                         text=True).strip()),
         'server_version': version.strip(),
     }, indent=2)+'\n', encoding='utf-8')
     records = [f'{digest(p)}  {p.relative_to(PKG).as_posix()}'
