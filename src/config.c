@@ -501,6 +501,14 @@ void loadServerConfigFromString(char* config) {
             if ((server.lazyfree_lazy_server_del = yesnotoi(argv[1])) == -1) {
                 err = "argument must be 'yes' or 'no'"; goto loaderr;
             }
+        } else if (!strcasecmp(argv[0],"lazyfree-lazy-user-del") && argc == 2){
+            if ((server.lazyfree_lazy_user_del = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"lazyfree-lazy-user-flush") && argc == 2){
+            if ((server.lazyfree_lazy_user_flush = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
         } else if ((!strcasecmp(argv[0],"slave-lazy-flush") ||
                     !strcasecmp(argv[0],"replica-lazy-flush")) && argc == 2)
         {
@@ -1236,6 +1244,10 @@ void configSetCommand(client *c) {
     } config_set_bool_field(
       "lazyfree-lazy-server-del",server.lazyfree_lazy_server_del) {
     } config_set_bool_field(
+      "lazyfree-lazy-user-del",server.lazyfree_lazy_user_del) {
+    } config_set_bool_field(
+      "lazyfree-lazy-user-flush",server.lazyfree_lazy_user_flush) {
+    } config_set_bool_field(
       "slave-lazy-flush",server.repl_slave_lazy_flush) {
     } config_set_bool_field(
       "replica-lazy-flush",server.repl_slave_lazy_flush) {
@@ -1578,6 +1590,10 @@ void configGetCommand(client *c) {
             server.lazyfree_lazy_expire);
     config_get_bool_field("lazyfree-lazy-server-del",
             server.lazyfree_lazy_server_del);
+    config_get_bool_field("lazyfree-lazy-user-del",
+            server.lazyfree_lazy_user_del);
+    config_get_bool_field("lazyfree-lazy-user-flush",
+            server.lazyfree_lazy_user_flush);
     config_get_bool_field("slave-lazy-flush",
             server.repl_slave_lazy_flush);
     config_get_bool_field("replica-lazy-flush",
@@ -2340,6 +2356,8 @@ int rewriteConfig(char *path) {
     rewriteConfigYesNoOption(state,"lazyfree-lazy-eviction",server.lazyfree_lazy_eviction,CONFIG_DEFAULT_LAZYFREE_LAZY_EVICTION);
     rewriteConfigYesNoOption(state,"lazyfree-lazy-expire",server.lazyfree_lazy_expire,CONFIG_DEFAULT_LAZYFREE_LAZY_EXPIRE);
     rewriteConfigYesNoOption(state,"lazyfree-lazy-server-del",server.lazyfree_lazy_server_del,CONFIG_DEFAULT_LAZYFREE_LAZY_SERVER_DEL);
+    rewriteConfigYesNoOption(state,"lazyfree-lazy-user-del",server.lazyfree_lazy_user_del,CONFIG_DEFAULT_LAZYFREE_LAZY_USER_DEL);
+    rewriteConfigYesNoOption(state,"lazyfree-lazy-user-flush",server.lazyfree_lazy_user_flush,CONFIG_DEFAULT_LAZYFREE_LAZY_USER_FLUSH);
     rewriteConfigYesNoOption(state,"replica-lazy-flush",server.repl_slave_lazy_flush,CONFIG_DEFAULT_SLAVE_LAZY_FLUSH);
     rewriteConfigYesNoOption(state,"dynamic-hz",server.dynamic_hz,CONFIG_DEFAULT_DYNAMIC_HZ);
 

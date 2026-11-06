@@ -22,6 +22,10 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `ZDIFFSTORE destination numkeys key [key ...]` | 6.2 | 差集写入目标键 |
 | `COPY source destination [DB db] [REPLACE]` | 6.2 | 深拷贝任意类型的键；不带 REPLACE 时不覆盖已存在的目标 |
 | `RESET` | 6.2 | 连接回到 0 号库并清除客户端状态 |
+| `LPOS key element [RANK r] [COUNT n] [MAXLEN m]` | 6.0 | 查找元素下标，可从尾部查找、限制返回个数与扫描长度 |
+| `LMOVE source destination LEFT\|RIGHT LEFT\|RIGHT` | 6.2 | 原子地在两个列表间移动元素，源和目标可以是同一个列表 |
+| `SINTERCARD numkeys key [key ...] [LIMIT n]` | 7.0 | 只返回交集基数，不构建结果集 |
+| `ZINTERCARD numkeys key [key ...] [LIMIT n]` | 7.0 | 只返回有序集合交集基数 |
 | `ACL SETUSER/DELUSER/LIST/WHOAMI`、`AUTH username password` | 6.0 | 用户、口令、命令分类与键通配符；见下方范围说明 |
 
 过期时间在秒数乘 1000、相对时间加当前时间之前做有符号 64 位溢出检查，非法值报错且不改动数据。
@@ -56,7 +60,7 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 
 ## 验证
 
-在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，25 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
+在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，27 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
 
 ```bash
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe

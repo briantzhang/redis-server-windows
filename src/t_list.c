@@ -556,6 +556,110 @@ void lremCommand(client *c) {
     addReplyLongLong(c,removed);
 }
 
+/* LPOS key element [RANK rank] [COUNT num-matches] [MAXLEN len]
+ *
+ * Returns the index of matching elements. A negative RANK searches from the
+ * tail. With COUNT the reply is an array of up to that many indexes; without
+ * it the reply is a single index or nil. */
+void lposCommand(client *c) {
+    robj *o, *ele = c->argv[2];
+    int direction = LIST_TAIL;
+    PORT_LONG rank = 1, count = -1, maxlen = 0;
+    int j;
+
+    if (sdslen(ele->ptr) > LIST_MAX_ITEM_SIZE) {
+        addReplyError(c, "Element too large");
+        return;
+    }
+
+    for (j = 3; j < c->argc; j++) {
+        char *opt = c->argv[j]->ptr;
+        int moreargs = (c->argc-1)-j;
+
+        if (!strcasecmp(opt,"RANK") && moreargs) {
+            j++;
+            if (getLongFromObjectOrReply(c,c->argv[j],&rank,NULL) != C_OK)
+                return;
+            if (rank == 0) {
+                addReplyError(c,"RANK can't be zero: use 1 to start from "
+                                "the first match, 2 from the second, ...");
+                return;
+            }
+        } else if (!strcasecmp(opt,"COUNT") && moreargs) {
+            j++;
+            if (getLongFromObjectOrReply(c,c->argv[j],&count,
+                    "COUNT can't be negative") != C_OK) return;
+            if (count < 0) {
+                addReplyError(c,"COUNT can't be negative");
+                return;
+            }
+        } else if (!strcasecmp(opt,"MAXLEN") && moreargs) {
+            j++;
+            if (getLongFromObjectOrReply(c,c->argv[j],&maxlen,
+                    "MAXLEN can't be negative") != C_OK) return;
+            if (maxlen < 0) {
+                addReplyError(c,"MAXLEN can't be negative");
+                return;
+            }
+        } else {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+    }
+
+    /* A negative rank means start from the tail. */
+    if (rank < 0) {
+        rank = -rank;
+        direction = LIST_HEAD;
+    }
+
+    if ((o = lookupKeyRead(c->db,c->argv[1])) == NULL) {
+        if (count != -1)
+            addReplyMultiBulkLen(c,0);
+        else
+            addReply(c,shared.nullbulk);
+        return;
+    }
+    if (checkType(c,o,OBJ_LIST)) return;
+
+    void *arraylenptr = NULL;
+    if (count != -1) arraylenptr = addDeferredMultiBulkLength(c);
+
+    listTypeIterator *li = listTypeInitIterator(o,
+        direction == LIST_TAIL ? 0 : -1, direction);
+    listTypeEntry entry;
+    PORT_LONG llen = (PORT_LONG)listTypeLength(o);
+    PORT_LONG index = 0, matches = 0, matchindex = -1, arraylen = 0;
+
+    while (listTypeNext(li,&entry) && (maxlen == 0 || index < maxlen)) {
+        if (listTypeEqual(&entry,ele)) {
+            matches++;
+            matchindex = (direction == LIST_TAIL) ? index : llen - index - 1;
+            if (matches >= rank) {
+                if (arraylenptr) {
+                    arraylen++;
+                    addReplyLongLong(c,matchindex);
+                    if (count && matches-rank+1 >= count) break;
+                } else {
+                    break;
+                }
+            }
+        }
+        index++;
+        matchindex = -1;
+    }
+    listTypeReleaseIterator(li);
+
+    if (arraylenptr != NULL) {
+        setDeferredMultiBulkLength(c,arraylenptr,arraylen);
+    } else {
+        if (matchindex != -1)
+            addReplyLongLong(c,matchindex);
+        else
+            addReply(c,shared.nullbulk);
+    }
+}
+
 /* This is the semantic of this command:
  *  RPOPLPUSH srclist dstlist:
  *    IF LLEN(srclist) > 0
@@ -625,6 +729,79 @@ void rpoplpushCommand(client *c) {
             rewriteClientCommandVector(c,3,shared.rpoplpush,c->argv[1],c->argv[2]);
         }
     }
+}
+
+/* Parse a LEFT/RIGHT argument into LIST_HEAD or LIST_TAIL. */
+static int getListPositionFromObjectOrReply(client *c, robj *arg,
+                                            int *position) {
+    if (!strcasecmp(arg->ptr,"right")) {
+        *position = LIST_TAIL;
+    } else if (!strcasecmp(arg->ptr,"left")) {
+        *position = LIST_HEAD;
+    } else {
+        addReply(c,shared.syntaxerr);
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+/* Push 'value' on the destination list and reply with it. */
+static void lmoveHandlePush(client *c, robj *dstkey, robj *dstobj,
+                            robj *value, int where) {
+    if (!dstobj) {
+        dstobj = createQuicklistObject();
+        quicklistSetOptions(dstobj->ptr, server.list_max_ziplist_size,
+                            server.list_compress_depth);
+        dbAdd(c->db,dstkey,dstobj);
+    }
+    signalModifiedKey(c->db,dstkey);
+    listTypePush(dstobj,value,where);
+    notifyKeyspaceEvent(NOTIFY_LIST,
+        where == LIST_HEAD ? "lpush" : "rpush", dstkey, c->db->id);
+    addReplyBulk(c,value);
+}
+
+/* LMOVE source destination LEFT|RIGHT LEFT|RIGHT
+ *
+ * Atomically moves one element between two lists. Unlike RPOPLPUSH it can
+ * take from either end and push to either end. */
+void lmoveCommand(client *c) {
+    int wherefrom, whereto;
+    robj *sobj, *value;
+
+    if (getListPositionFromObjectOrReply(c,c->argv[3],&wherefrom) != C_OK)
+        return;
+    if (getListPositionFromObjectOrReply(c,c->argv[4],&whereto) != C_OK)
+        return;
+
+    if ((sobj = lookupKeyWriteOrReply(c,c->argv[1],shared.nullbulk)) == NULL ||
+        checkType(c,sobj,OBJ_LIST)) return;
+
+    if (listTypeLength(sobj) == 0) {
+        addReply(c,shared.nullbulk);
+        return;
+    }
+
+    robj *dobj = lookupKeyWrite(c->db,c->argv[2]);
+    robj *touchedkey = c->argv[1];
+
+    if (dobj && checkType(c,dobj,OBJ_LIST)) return;
+    value = listTypePop(sobj,wherefrom);
+    serverAssert(value);
+
+    incrRefCount(touchedkey);
+    lmoveHandlePush(c,c->argv[2],dobj,value,whereto);
+    decrRefCount(value);
+
+    notifyKeyspaceEvent(NOTIFY_LIST,
+        wherefrom == LIST_TAIL ? "rpop" : "lpop", touchedkey, c->db->id);
+    if (listTypeLength(sobj) == 0) {
+        dbDelete(c->db,touchedkey);
+        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",touchedkey,c->db->id);
+    }
+    signalModifiedKey(c->db,touchedkey);
+    decrRefCount(touchedkey);
+    server.dirty++;
 }
 
 /*-----------------------------------------------------------------------------

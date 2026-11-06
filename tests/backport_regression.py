@@ -912,6 +912,97 @@ class BackportRegression(unittest.TestCase):
         with self.assertRaises(RedisError):
             self.cmd("ZUNION", "2", "za", "plain")
 
+    def test_intercard_and_lazyfree_options(self):
+        self.cmd("DEL", "sa", "sb", "sc", "za", "zb", "zc", "lz")
+        self.cmd("SADD", "sa", "a", "b", "c")
+        self.cmd("SADD", "sb", "b", "c", "d")
+        self.assertEqual(self.cmd("SINTERCARD", "2", "sa", "sb"), 2)
+        self.assertEqual(self.cmd("SINTERCARD", "2", "sa", "sb", "LIMIT", "1"), 1)
+        self.assertEqual(self.cmd("SINTERCARD", "3", "sa", "sb", "sc"), 0)
+        self.assertEqual(self.cmd("SINTERCARD", "2", "sa", "missing"), 0)
+        with self.assertRaises(RedisError):
+            self.cmd("SINTERCARD", "0")
+        with self.assertRaises(RedisError):
+            self.cmd("SINTERCARD", "3", "sa", "sb")
+        with self.assertRaises(RedisError):
+            self.cmd("SINTERCARD", "2", "sa", "sb", "LIMIT", "-1")
+        self.cmd("SET", "lz", "x")
+        with self.assertRaises(RedisError):
+            self.cmd("SINTERCARD", "2", "sa", "lz")
+
+        self.cmd("ZADD", "za", "1", "a", "2", "b", "3", "c")
+        self.cmd("ZADD", "zb", "9", "b", "8", "c", "7", "d")
+        self.assertEqual(self.cmd("ZINTERCARD", "2", "za", "zb"), 2)
+        self.assertEqual(self.cmd("ZINTERCARD", "2", "za", "zb", "LIMIT", "1"), 1)
+        self.assertEqual(self.cmd("ZINTERCARD", "2", "za", "missing"), 0)
+        with self.assertRaises(RedisError):
+            self.cmd("ZINTERCARD", "2", "za", "lz")
+
+        # The two Redis 6 lazyfree options apply to DEL and FLUSHDB.
+        self.assertEqual(self.cmd("CONFIG", "SET", "lazyfree-lazy-user-del", "yes"),
+                         b"OK")
+        self.assertEqual(self.cmd("CONFIG", "GET", "lazyfree-lazy-user-del"),
+                         [b"lazyfree-lazy-user-del", b"yes"])
+        self.cmd("DEL", "lz")
+        self.cmd("RPUSH", "lz", "a", "b", "c")
+        self.assertEqual(self.cmd("DEL", "lz"), 1)
+        self.assertEqual(self.cmd("EXISTS", "lz"), 0)
+        self.cmd("CONFIG", "SET", "lazyfree-lazy-user-del", "no")
+
+        self.assertEqual(self.cmd("CONFIG", "SET", "lazyfree-lazy-user-flush", "yes"),
+                         b"OK")
+        self.assertEqual(self.cmd("CONFIG", "GET", "lazyfree-lazy-user-flush"),
+                         [b"lazyfree-lazy-user-flush", b"yes"])
+        self.cmd("SET", "fl", "v")
+        self.assertEqual(self.cmd("FLUSHDB"), b"OK")
+        self.assertEqual(self.cmd("DBSIZE"), 0)
+        self.cmd("CONFIG", "SET", "lazyfree-lazy-user-flush", "no")
+
+    def test_lpos_and_lmove(self):
+        self.cmd("DEL", "lpos", "lsrc", "ldst", "lplain")
+        self.cmd("RPUSH", "lpos", "a", "b", "c", "b", "a")
+        self.assertEqual(self.cmd("LPOS", "lpos", "b"), 1)
+        self.assertEqual(self.cmd("LPOS", "lpos", "b", "RANK", "-1"), 3)
+        self.assertEqual(self.cmd("LPOS", "lpos", "b", "COUNT", "0"), [1, 3])
+        self.assertEqual(self.cmd("LPOS", "lpos", "b", "COUNT", "1"), [1])
+        self.assertEqual(self.cmd("LPOS", "lpos", "b", "RANK", "-1", "COUNT", "1"),
+                         [3])
+        # MAXLEN bounds how many elements are examined from the chosen end.
+        self.assertIsNone(self.cmd("LPOS", "lpos", "b", "MAXLEN", "1"))
+        self.assertEqual(self.cmd("LPOS", "lpos", "b", "MAXLEN", "2"), 1)
+        self.assertIsNone(self.cmd("LPOS", "lpos", "missing"))
+        self.assertEqual(self.cmd("LPOS", "lpos", "missing", "COUNT", "0"), [])
+        self.assertIsNone(self.cmd("LPOS", "lpos", "zzz"))
+        self.assertEqual(self.cmd("LPOS", "lpos", "zzz", "COUNT", "0"), [])
+        with self.assertRaises(RedisError):
+            self.cmd("LPOS", "lpos", "b", "RANK", "0")
+        with self.assertRaises(RedisError):
+            self.cmd("LPOS", "lpos", "b", "COUNT", "-1")
+        with self.assertRaises(RedisError):
+            self.cmd("LPOS", "lpos", "b", "MAXLEN", "-1")
+
+        self.cmd("RPUSH", "lsrc", "a", "b", "c")
+        self.assertEqual(self.cmd("LMOVE", "lsrc", "ldst", "LEFT", "RIGHT"), b"a")
+        self.assertEqual(self.cmd("LRANGE", "lsrc", "0", "-1"), [b"b", b"c"])
+        self.assertEqual(self.cmd("LRANGE", "ldst", "0", "-1"), [b"a"])
+        self.assertEqual(self.cmd("LMOVE", "lsrc", "ldst", "RIGHT", "LEFT"), b"c")
+        self.assertEqual(self.cmd("LRANGE", "ldst", "0", "-1"), [b"c", b"a"])
+        # Source and destination may be the same list.
+        self.cmd("DEL", "lrot")
+        self.cmd("RPUSH", "lrot", "1", "2", "3")
+        self.assertEqual(self.cmd("LMOVE", "lrot", "lrot", "LEFT", "RIGHT"), b"1")
+        self.assertEqual(self.cmd("LRANGE", "lrot", "0", "-1"),
+                         [b"2", b"3", b"1"])
+        self.assertIsNone(self.cmd("LMOVE", "missing", "ldst", "LEFT", "RIGHT"))
+        with self.assertRaises(RedisError):
+            self.cmd("LMOVE", "lsrc", "ldst", "MIDDLE", "RIGHT")
+        self.cmd("SET", "lplain", "x")
+        with self.assertRaises(RedisError):
+            self.cmd("LPOS", "lplain", "x")
+        with self.assertRaises(RedisError):
+            self.cmd("LMOVE", "lplain", "ldst", "LEFT", "RIGHT")
+        self.cmd("DEL", "lpos", "lsrc", "ldst", "lrot", "lplain")
+
     def test_copy_and_reset(self):
         self.cmd("DEL", "src", "dst")
         self.cmd("SET", "src", "value", "EX", "100")
@@ -981,7 +1072,8 @@ class BackportRegression(unittest.TestCase):
         self.addCleanup(admin.close)
         self.addCleanup(admin.command, "ACL", "DELUSER", "reader")
         self.assertEqual(admin.command("ACL", "SETUSER", "reader", "on", ">secret",
-                                  "resetkeys", "~cache:*", "-@all", "+get", "+ping"), b"OK")
+                                  "resetkeys", "~cache:*", "-@all", "+get", "+ping",
+                                  "+sintercard"), b"OK")
         # A fresh connection, so it does not share the default user's rights.
         limited = RESP2("127.0.0.1", guarded.port, OPTIONS.timeout)
         self.addCleanup(limited.close)
@@ -997,6 +1089,11 @@ class BackportRegression(unittest.TestCase):
             limited.command("GET", "other")
         with self.assertRaises(RedisError):
             limited.command("SET", "cache:1", "no")
+        # A numkeys command must have all of its keys checked, not just the
+        # first one or the count argument.
+        self.assertEqual(limited.command("SINTERCARD", "2", "cache:3", "cache:4"), 0)
+        with self.assertRaises(RedisError):
+            limited.command("SINTERCARD", "2", "cache:1", "other")
         self.assertEqual(limited.command("PING"), b"PONG")
         limited.close()
         denied = RESP2("127.0.0.1", guarded.port, OPTIONS.timeout)

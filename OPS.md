@@ -125,6 +125,17 @@ ACL WHOAMI
 - 配置了 `requirepass` 时，未认证连接收到 `NOAUTH`；没有配置时，连接以 `default` 用户进入，`default` 默认拥有全部权限。
 - `ACL DELUSER default` 会被拒绝。删掉一个用户后，仍以该用户身份在线的连接会在下一条命令上失败。
 
+### 大键删除与清库
+
+`DEL` 和 `FLUSHDB`/`FLUSHALL` 默认在主线程同步释放内存，删除几百万元素的键时会卡住事件循环。本版补了 Redis 6 的两个开关：
+
+```conf
+lazyfree-lazy-user-del yes
+lazyfree-lazy-user-flush yes
+```
+
+打开后 `DEL` 等价于 `UNLINK`，不带 `ASYNC` 的清库也走后台释放。代价是内存不会立刻归还，`INFO memory` 里的 `lazyfree_pending_objects` 会短暂大于 0。也可以不改配置，只在具体命令上使用 `UNLINK` 和 `FLUSHDB ASYNC`。
+
 ## 4. 新增命令怎么用
 
 这些命令是本版相对底座新增的，语义按 Redis 7.0 单机行为实现。
@@ -138,6 +149,28 @@ TTL session:1
 ```
 
 第二次写入后剩余时间应与第一次接近，而不是被清掉。不带 `KEEPTTL` 的 `SET` 会清除原有过期时间，这是底座的原行为。
+
+列表查找与原子移动：
+
+```text
+RPUSH queue a b c b
+LPOS queue b                  -- 1
+LPOS queue b COUNT 0          -- 1 3
+LPOS queue b RANK -1          -- 3
+LMOVE queue other LEFT RIGHT  -- 取出 a 放到 other 尾部
+```
+
+`LPOS` 的 `MAXLEN` 限制最多扫描多少个元素，适合在大列表上做有界查找。`LMOVE` 的源和目标可以是同一个列表，用来做轮转。
+
+只算交集大小，不返回元素：
+
+```text
+SINTERCARD 2 set:a set:b
+SINTERCARD 2 set:a set:b LIMIT 100
+ZINTERCARD 2 zset:a zset:b
+```
+
+`LIMIT` 只影响何时提前结束，不影响结果值：命中数达到上限就立即返回该上限。
 
 原子取出旧值并写入：
 
