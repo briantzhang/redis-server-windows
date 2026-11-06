@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp1
+# Redis for Windows 5.0.14.1-bp2
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.0 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
