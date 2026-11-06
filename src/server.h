@@ -1694,6 +1694,8 @@ int hasActiveChildProcess();
 #define ZADD_INCR (1<<0)    /* Increment the score instead of setting it. */
 #define ZADD_NX (1<<1)      /* Don't touch elements not already existing. */
 #define ZADD_XX (1<<2)      /* Only touch elements already existing. */
+#define ZADD_GT (1<<7)      /* Only update when the new score is greater. */
+#define ZADD_LT (1<<8)      /* Only update when the new score is lower. */
 
 /* Output flags. */
 #define ZADD_NOP (1<<3)     /* Operation not performed because of conditionals.*/
@@ -2020,6 +2022,7 @@ void expiretimeCommand(client *c);
 void pexpiretimeCommand(client *c);
 void smismemberCommand(client *c);
 void zmscoreCommand(client *c);
+void zrandmemberCommand(client *c);
 void delCommand(client *c);
 void unlinkCommand(client *c);
 void existsCommand(client *c);
@@ -2137,6 +2140,7 @@ void hmgetCommand(client *c);
 void hdelCommand(client *c);
 void hlenCommand(client *c);
 void hstrlenCommand(client *c);
+void hrandfieldCommand(client *c);
 void zremrangebyrankCommand(client *c);
 void zunionstoreCommand(client *c);
 void zinterstoreCommand(client *c);

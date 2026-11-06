@@ -823,6 +823,150 @@ void hexistsCommand(client *c) {
     addReply(c, hashTypeExists(o,c->argv[2]->ptr) ? shared.cone : shared.czero);
 }
 
+/* Return a random field (and optionally its value) from a hash object.
+ * Both returned strings are newly allocated SDS values owned by the caller. */
+static sds hrandfieldRandomEntry(robj *o, sds *value) {
+    if (o->encoding == OBJ_ENCODING_ZIPLIST) {
+        PORT_ULONG idx = random() % hashTypeLength(o);
+        unsigned char *fptr = ziplistIndex(o->ptr, idx*2);
+        unsigned char *vptr = ziplistNext(o->ptr, fptr);
+        unsigned char *str;
+        unsigned int len;
+        PORT_LONGLONG ll;
+        sds field;
+
+        ziplistGet(fptr, &str, &len, &ll);
+        field = str ? sdsnewlen(str, len) : sdsfromlonglong(ll);
+        if (value) {
+            ziplistGet(vptr, &str, &len, &ll);
+            *value = str ? sdsnewlen(str, len) : sdsfromlonglong(ll);
+        }
+        return field;
+    } else if (o->encoding == OBJ_ENCODING_HT) {
+        dictEntry *de = dictGetRandomKey(o->ptr);
+        sds field = sdsdup(dictGetKey(de));
+        if (value) *value = sdsdup(dictGetVal(de));
+        return field;
+    } else {
+        serverPanic("Unknown hash encoding");
+    }
+    return NULL;
+}
+
+static void hrandfieldWithCountCommand(client *c, PORT_LONG l, int withvalues) {
+    unsigned long count, size;
+    int uniq = 1;
+    robj *o;
+
+    o = lookupKeyRead(c->db, c->argv[1]);
+    if (o == NULL) {
+        addReplyMultiBulkLen(c, 0);
+        return;
+    }
+    if (checkType(c, o, OBJ_HASH)) return;
+
+    size = hashTypeLength(o);
+    if (l >= 0) {
+        count = (unsigned long) l;
+    } else {
+        count = (unsigned long)(-(l+1)) + 1;
+        uniq = 0;
+    }
+
+    if (count == 0) {
+        addReplyMultiBulkLen(c, 0);
+        return;
+    }
+
+    /* Negative count: sample with repetition. */
+    if (!uniq) {
+        addReplyMultiBulkLen(c, (PORT_LONG)(count * (withvalues ? 2 : 1)));
+        while (count--) {
+            sds value = NULL;
+            sds field = hrandfieldRandomEntry(o, withvalues ? &value : NULL);
+            addReplyBulkCBuffer(c, field, sdslen(field));
+            if (withvalues) addReplyBulkCBuffer(c, value, sdslen(value));
+            sdsfree(field);
+            if (value) sdsfree(value);
+        }
+        return;
+    }
+
+    /* Positive count greater than or equal to the hash size: return all. */
+    if (count >= size) {
+        hashTypeIterator *hi = hashTypeInitIterator(o);
+        addReplyMultiBulkLen(c, (PORT_LONG)(size * (withvalues ? 2 : 1)));
+        while (hashTypeNext(hi) != C_ERR) {
+            sds field = hashTypeCurrentObjectNewSds(hi, OBJ_HASH_KEY);
+            addReplyBulkCBuffer(c, field, sdslen(field));
+            sdsfree(field);
+            if (withvalues) {
+                sds val = hashTypeCurrentObjectNewSds(hi, OBJ_HASH_VALUE);
+                addReplyBulkCBuffer(c, val, sdslen(val));
+                sdsfree(val);
+            }
+        }
+        hashTypeReleaseIterator(hi);
+        return;
+    }
+
+    /* Positive count smaller than the hash size: collect unique fields. */
+    {
+        dict *seen = dictCreate(&setDictType, NULL);
+        dictIterator *di;
+        dictEntry *de;
+
+        addReplyMultiBulkLen(c, (PORT_LONG)(count * (withvalues ? 2 : 1)));
+        while (dictSize(seen) < count) {
+            sds field = hrandfieldRandomEntry(o, NULL);
+            if (dictAdd(seen, field, NULL) != DICT_OK) sdsfree(field);
+        }
+        di = dictGetIterator(seen);
+        while ((de = dictNext(di)) != NULL) {
+            sds field = dictGetKey(de);
+            addReplyBulkCBuffer(c, field, sdslen(field));
+            if (withvalues) {
+                robj *value = hashTypeGetValueObject(o, field);
+                addReplyBulk(c, value);
+                decrRefCount(value);
+            }
+        }
+        dictReleaseIterator(di);
+        dictRelease(seen);
+    }
+}
+
+void hrandfieldCommand(client *c) {
+    PORT_LONG l;
+    int withvalues = 0;
+    robj *o;
+    sds field;
+
+    if (c->argc >= 3) {
+        if (getLongFromObjectOrReply(c, c->argv[2], &l, NULL) != C_OK) return;
+        if (c->argc > 4 || (c->argc == 4 && strcasecmp(c->argv[3]->ptr, "withvalues"))) {
+            addReply(c, shared.syntaxerr);
+            return;
+        } else if (c->argc == 4) {
+            withvalues = 1;
+        }
+        hrandfieldWithCountCommand(c, l, withvalues);
+        return;
+    }
+
+    if (c->argc != 2) {
+        addReply(c, shared.syntaxerr);
+        return;
+    }
+
+    if ((o = lookupKeyReadOrReply(c, c->argv[1], shared.nullbulk)) == NULL ||
+        checkType(c, o, OBJ_HASH)) return;
+
+    field = hrandfieldRandomEntry(o, NULL);
+    addReplyBulkCBuffer(c, field, sdslen(field));
+    sdsfree(field);
+}
+
 void hscanCommand(client *c) {
     robj *o;
     PORT_ULONG cursor;

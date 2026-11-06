@@ -1,6 +1,6 @@
 # 运维手册
 
-适用版本：Redis for Windows `5.0.14.1-bp2`，仅 Windows x64，单机、非集群。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
+适用版本：Redis for Windows `5.0.14.1-bp3`，仅 Windows x64，单机、非集群。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
 
 本文只覆盖这一个可执行文件的日常操作。它不包含 TLS、多段 AOF 和集群，那些配置项写进 `redis.conf` 也不会生效，启动时会报未知配置。ACL 已按 Redis 6 的范围实现，见第 3 节。
 
@@ -38,7 +38,7 @@
 .\redis-server.exe --version
 ```
 
-应看到 `v=5.0.14.1-bp2`。如果不是这个版本号，说明运行的不是这份回移。
+应看到 `v=5.0.14.1-bp3`。如果不是这个版本号，说明运行的不是这份回移。
 
 另开一个窗口检查存活：
 
@@ -172,6 +172,19 @@ ZINTERCARD 2 zset:a zset:b
 
 `LIMIT` 只影响何时提前结束，不影响结果值：命中数达到上限就立即返回该上限。
 
+条件更新分数与随机取样：
+
+```text
+ZADD board GT CH 15 amy
+ZADD board INCR GT 5 amy
+HRANDFIELD profile 3 WITHVALUES
+HRANDFIELD profile -10
+ZRANDMEMBER board 2 WITHSCORES
+ZRANDMEMBER board -5
+```
+
+`GT`/`LT` 只约束已有成员的分数更新，新成员照常加入；与 `NX` 或彼此同时出现会报错。`INCR` 在条件不满足时返回空。`HRANDFIELD`/`ZRANDMEMBER` 的 `count` 为正数时返回不重复的元素，超过集合大小时返回全部；为负数时允许重复，绝对值是返回个数；不带 `count` 时返回单个元素。
+
 原子取出旧值并写入：
 
 ```text
@@ -277,7 +290,7 @@ BGREWRITEAOF
 
 等 `INFO persistence` 里两次后台任务的状态都变成 `ok`，再复制 `dir` 下的 `dump.rdb` 和 `appendonly.aof`。复制过程中不要 `SHUTDOWN`，也不要再手动触发保存。
 
-备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp2-20261106.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
+备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp3-20261106.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
 
 ## 7. 排查
 
@@ -296,7 +309,7 @@ BGREWRITEAOF
 AOF 启动失败：
 
 - 保留现场后，用底座自带的方式检查：`redis-check-aof --fix` 会截掉文件末尾不完整的最后一条命令。只在确认丢失末尾这一条可以接受时使用，并先备份原文件。
-- 本版已修复一处 AOF 写入崩溃：带过期参数的 `SET`（如 `SET k v PX 180000`）在旧二进制上会触发访问冲突。确认 `redis-server --version` 是 `5.0.14.1-bp1` 或 `5.0.14.1-bp2`，且构建提交为 `a7544cf5` 之后的版本。
+- 本版已修复一处 AOF 写入崩溃：带过期参数的 `SET`（如 `SET k v PX 180000`）在旧二进制上会触发访问冲突。确认 `redis-server --version` 是 `5.0.14.1-bp1` 或之后的版本，且构建提交为 `a7544cf5` 之后的版本。
 
 内存涨个不停：
 

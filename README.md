@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp2
+# Redis for Windows 5.0.14.1-bp3
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.0 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp2`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp3`。
 
 ## 这个版本新增了什么
 
@@ -26,6 +26,9 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `LMOVE source destination LEFT\|RIGHT LEFT\|RIGHT` | 6.2 | 原子地在两个列表间移动元素，源和目标可以是同一个列表 |
 | `SINTERCARD numkeys key [key ...] [LIMIT n]` | 7.0 | 只返回交集基数，不构建结果集 |
 | `ZINTERCARD numkeys key [key ...] [LIMIT n]` | 7.0 | 只返回有序集合交集基数 |
+| `ZADD key [NX\|XX] [GT\|LT] [CH] [INCR] score member ...` 的 `GT\|LT` | 6.2 | 只在新分数严格大于/小于当前分数时更新已有成员 |
+| `HRANDFIELD key [count [WITHVALUES]]` | 6.2 | 随机返回字段；正数去重、负数可重复、可带值 |
+| `ZRANDMEMBER key [count [WITHSCORES]]` | 6.2 | 随机返回成员；正数去重、负数可重复、可带分数 |
 | `ACL SETUSER/DELUSER/LIST/WHOAMI`、`AUTH username password` | 6.0 | 用户、口令、命令分类与键通配符；见下方范围说明 |
 
 过期时间在秒数乘 1000、相对时间加当前时间之前做有符号 64 位溢出检查，非法值报错且不改动数据。
@@ -60,7 +63,7 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 
 ## 验证
 
-在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，27 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
+在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，28 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
 
 ```bash
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
