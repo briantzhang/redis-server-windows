@@ -65,7 +65,7 @@
 
 #include "server.h"
 
-int serveClientBlockedOnList(client *receiver, robj *key, robj *dstkey, redisDb *db, robj *value, int where);
+int serveClientBlockedOnList(client *receiver, robj *key, robj *dstkey, redisDb *db, robj *value, int wherefrom, int whereto);
 
 /* This structure represents the blocked key information that we store
  * in the client structure. Each client blocked on keys, has a
@@ -93,19 +93,30 @@ typedef struct bkinfo {
 int getTimeoutFromObjectOrReply(client *c, robj *object, mstime_t *timeout, int unit) {
     PORT_LONGLONG tval;
 
-    if (getLongLongFromObjectOrReply(c,object,&tval,
-        "timeout is not an integer or out of range") != C_OK)
-        return C_ERR;
+    if (unit == UNIT_SECONDS) {
+        PORT_LONGDOUBLE ftval;
+
+        if (getLongDoubleFromObjectOrReply(c,object,&ftval,
+            "timeout is not a float or out of range") != C_OK)
+            return C_ERR;
+        ftval *= 1000.0;
+        if (ftval > (PORT_LONGDOUBLE)LLONG_MAX) {
+            addReplyError(c,"timeout is out of range");
+            return C_ERR;
+        }
+        tval = (PORT_LONGLONG)ftval;
+    } else {
+        if (getLongLongFromObjectOrReply(c,object,&tval,
+            "timeout is not an integer or out of range") != C_OK)
+            return C_ERR;
+    }
 
     if (tval < 0) {
         addReplyError(c,"timeout is negative");
         return C_ERR;
     }
 
-    if (tval > 0) {
-        if (unit == UNIT_SECONDS) tval *= 1000;
-        tval += mstime();
-    }
+    if (tval > 0) tval += mstime();
     *timeout = tval;
 
     return C_OK;
@@ -311,10 +322,9 @@ void handleClientsBlockedOnKeys(void) {
                         }
 
                         robj *dstkey = receiver->bpop.target;
-                        int where = (receiver->lastcmd &&
-                                     receiver->lastcmd->proc == blpopCommand) ?
-                                     LIST_HEAD : LIST_TAIL;
-                        robj *value = listTypePop(o,where);
+                        int wherefrom = receiver->bpop.listpos.wherefrom;
+                        int whereto = receiver->bpop.listpos.whereto;
+                        robj *value = listTypePop(o,wherefrom);
 
                         if (value) {
                             /* Protect receiver->bpop.target, that will be
@@ -325,11 +335,11 @@ void handleClientsBlockedOnKeys(void) {
 
                             if (serveClientBlockedOnList(receiver,
                                 rl->key,dstkey,rl->db,value,
-                                where) == C_ERR)
+                                wherefrom,whereto) == C_ERR)
                             {
                                 /* If we failed serving the client we need
                                  * to also undo the POP operation. */
-                                listTypePush(o,value,where);
+                                listTypePush(o,value,wherefrom);
                             }
 
                             if (dstkey) decrRefCount(dstkey);
@@ -519,13 +529,19 @@ void handleClientsBlockedOnKeys(void) {
  * stream keys, we also provide an array of streamID structures: clients will
  * be unblocked only when items with an ID greater or equal to the specified
  * one is appended to the stream. */
-void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeout, robj *target, streamID *ids) {
+void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeout, robj *target, struct listPos *listpos, streamID *ids) {
     dictEntry *de;
     list *l;
     int j;
 
     c->bpop.timeout = timeout;
     c->bpop.target = target;
+    if (listpos) {
+        c->bpop.listpos = *listpos;
+    } else {
+        c->bpop.listpos.wherefrom = LIST_HEAD;
+        c->bpop.listpos.whereto = LIST_HEAD;
+    }
 
     if (target != NULL) incrRefCount(target);
 

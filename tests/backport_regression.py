@@ -1101,6 +1101,114 @@ class BackportRegression(unittest.TestCase):
             self.assertEqual(score, member.split(b":")[1])
         self.cmd("DEL", "zgt", "zplain", "hr", "hrbig", "zr", "zrbig")
 
+    def test_lpop_count_and_blmove(self):
+        self.cmd("DEL", "lc", "blsrc", "bldst", "blstr")
+        self.cmd("RPUSH", "lc", "a", "b", "c", "d")
+        self.assertEqual(self.cmd("LPOP", "lc", "2"), [b"a", b"b"])
+        self.assertEqual(self.cmd("LRANGE", "lc", "0", "-1"), [b"c", b"d"])
+        self.assertEqual(self.cmd("RPOP", "lc", "5"), [b"d", b"c"])
+        self.assertEqual(self.cmd("EXISTS", "lc"), 0)
+        self.assertIsNone(self.cmd("LPOP", "missing", "2"))
+        with self.assertRaises(RedisError):
+            self.cmd("LPOP", "lc", "-1")
+        self.cmd("RPUSH", "lc", "x")
+        self.assertEqual(self.cmd("LPOP", "lc", "0"), [])
+        self.assertEqual(self.cmd("LRANGE", "lc", "0", "-1"), [b"x"])
+        self.assertEqual(self.cmd("LPOP", "lc", "1"), [b"x"])
+        self.assertEqual(self.cmd("EXISTS", "lc"), 0)
+
+        self.cmd("RPUSH", "blsrc", "a", "b")
+        self.assertEqual(self.cmd("BLMOVE", "blsrc", "bldst", "LEFT", "RIGHT", "0"),
+                         b"a")
+        self.assertEqual(self.cmd("LRANGE", "bldst", "0", "-1"), [b"a"])
+        self.assertEqual(self.cmd("BLMOVE", "blsrc", "bldst", "RIGHT", "LEFT", "0"),
+                         b"b")
+        self.assertEqual(self.cmd("LRANGE", "bldst", "0", "-1"), [b"b", b"a"])
+
+        blocked = self.connect()
+        try:
+            blocked.sock.sendall(blocked.encode(
+                ("BLMOVE", "blsrc", "bldst", "LEFT", "RIGHT", "5")))
+            time.sleep(0.2)
+            self.cmd("RPUSH", "blsrc", "wake")
+            self.assertEqual(blocked._read(), b"wake")
+        finally:
+            blocked.close()
+        self.assertEqual(self.cmd("LRANGE", "bldst", "0", "-1"),
+                         [b"b", b"a", b"wake"])
+        self.assertIsNone(self.cmd("BLMOVE", "missing", "bldst", "LEFT", "RIGHT",
+                                   "0.1"))
+        self.cmd("SET", "blstr", "x")
+        with self.assertRaises(RedisError):
+            self.cmd("BLMOVE", "bldst", "blstr", "LEFT", "RIGHT", "0")
+        self.assertEqual(self.cmd("LLEN", "bldst"), 3)
+        self.assertEqual(self.cmd("BRPOPLPUSH", "bldst", "blsrc", "0"), b"wake")
+        self.assertEqual(self.cmd("LRANGE", "blsrc", "0", "-1"), [b"wake"])
+        self.cmd("DEL", "lc", "blsrc", "bldst", "blstr")
+
+    def test_unified_zrange_and_zrangestore(self):
+        self.cmd("DEL", "zr", "zd", "zplain")
+        self.cmd("ZADD", "zr", "1", "a", "2", "b", "3", "c", "4", "d")
+        self.assertEqual(self.cmd("ZRANGE", "zr", "0", "-1"),
+                         [b"a", b"b", b"c", b"d"])
+        self.assertEqual(self.cmd("ZRANGE", "zr", "1", "2"), [b"b", b"c"])
+        self.assertEqual(self.cmd("ZRANGE", "zr", "0", "-1", "REV"),
+                         [b"d", b"c", b"b", b"a"])
+        self.assertEqual(self.cmd("ZRANGE", "zr", "0", "1", "WITHSCORES"),
+                         [b"a", b"1", b"b", b"2"])
+        self.assertEqual(self.cmd("ZRANGE", "zr", "(1", "3", "BYSCORE"),
+                         [b"b", b"c"])
+        self.assertEqual(self.cmd("ZRANGE", "zr", "3", "(1", "BYSCORE", "REV"),
+                         [b"c", b"b"])
+        self.assertEqual(self.cmd("ZRANGE", "zr", "-inf", "+inf", "BYSCORE",
+                                  "LIMIT", "1", "2"), [b"b", b"c"])
+        self.assertEqual(self.cmd("ZRANGE", "zr", "(a", "[c", "BYLEX"),
+                         [b"b", b"c"])
+        self.assertEqual(self.cmd("ZRANGE", "zr", "[c", "(a", "BYLEX", "REV"),
+                         [b"c", b"b"])
+        self.assertEqual(self.cmd("ZRANGE", "zr", "-", "+", "BYLEX", "LIMIT",
+                                  "1", "2"), [b"b", b"c"])
+        with self.assertRaises(RedisError):
+            self.cmd("ZRANGE", "zr", "0", "-1", "LIMIT", "0", "1")
+        with self.assertRaises(RedisError):
+            self.cmd("ZRANGE", "zr", "-", "+", "BYLEX", "WITHSCORES")
+        with self.assertRaises(RedisError):
+            self.cmd("ZRANGE", "zr", "0", "-1", "NOPE")
+        self.assertEqual(self.cmd("ZRANGE", "missing", "0", "-1"), [])
+
+        self.assertEqual(self.cmd("ZRANGESTORE", "zd", "zr", "0", "-1"), 4)
+        self.assertEqual(self.cmd("ZRANGE", "zd", "0", "-1"),
+                         [b"a", b"b", b"c", b"d"])
+        self.assertEqual(self.cmd("ZRANGESTORE", "zd", "zr", "2", "3",
+                                  "BYSCORE"), 2)
+        self.assertEqual(self.cmd("ZRANGE", "zd", "0", "-1", "WITHSCORES"),
+                         [b"b", b"2", b"c", b"3"])
+        self.assertEqual(self.cmd("ZRANGESTORE", "zd", "zr", "5", "10",
+                                  "BYSCORE"), 0)
+        self.assertEqual(self.cmd("EXISTS", "zd"), 0)
+        self.assertEqual(self.cmd("ZRANGESTORE", "zd", "missing", "0", "-1"), 0)
+        self.assertEqual(self.cmd("EXISTS", "zd"), 0)
+        self.assertEqual(self.cmd("ZRANGESTORE", "zd", "zr", "(a", "[c",
+                                  "BYLEX"), 2)
+        self.assertEqual(self.cmd("ZRANGE", "zd", "0", "-1"), [b"b", b"c"])
+        with self.assertRaises(RedisError):
+            self.cmd("ZRANGESTORE", "zd", "zr", "0", "-1", "WITHSCORES")
+        self.cmd("SET", "zplain", "x")
+        with self.assertRaises(RedisError):
+            self.cmd("ZRANGESTORE", "zd", "zplain", "0", "-1")
+
+        self.assertEqual(self.cmd("ZREVRANGE", "zr", "0", "-1"),
+                         [b"d", b"c", b"b", b"a"])
+        self.assertEqual(self.cmd("ZRANGEBYSCORE", "zr", "2", "3"), [b"b", b"c"])
+        self.assertEqual(self.cmd("ZREVRANGEBYSCORE", "zr", "3", "2",
+                                  "WITHSCORES"),
+                         [b"c", b"3", b"b", b"2"])
+        self.assertEqual(self.cmd("ZRANGEBYLEX", "zr", "-", "+", "LIMIT", "0",
+                                  "2"), [b"a", b"b"])
+        self.assertEqual(self.cmd("ZCOUNT", "zr", "2", "3"), 2)
+        self.assertEqual(self.cmd("ZLEXCOUNT", "zr", "-", "+"), 4)
+        self.cmd("DEL", "zr", "zd", "zplain")
+
     def test_copy_and_reset(self):
         self.cmd("DEL", "src", "dst")
         self.cmd("SET", "src", "value", "EX", "100")

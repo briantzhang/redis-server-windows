@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp3
+# Redis for Windows 5.0.14.1-bp4
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.0 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp3`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp4`。
 
 ## 这个版本新增了什么
 
@@ -29,6 +29,10 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `ZADD key [NX\|XX] [GT\|LT] [CH] [INCR] score member ...` 的 `GT\|LT` | 6.2 | 只在新分数严格大于/小于当前分数时更新已有成员 |
 | `HRANDFIELD key [count [WITHVALUES]]` | 6.2 | 随机返回字段；正数去重、负数可重复、可带值 |
 | `ZRANDMEMBER key [count [WITHSCORES]]` | 6.2 | 随机返回成员；正数去重、负数可重复、可带分数 |
+| `LPOP key [count]` / `RPOP key [count]` | 6.2 | 批量弹出；不带 count 时仍是单元素回复 |
+| `BLMOVE source destination LEFT\|RIGHT LEFT\|RIGHT timeout` | 6.2 | LMOVE 的阻塞版本，支持小数秒超时 |
+| `ZRANGE key start stop [BYSCORE\|BYLEX] [REV] [LIMIT o c] [WITHSCORES]` | 6.2 | 统一的范围查询，旧命令仍可用 |
+| `ZRANGESTORE dst src start stop [BYSCORE\|BYLEX] [REV] [LIMIT o c]` | 6.2 | 把范围结果写入目标键 |
 | `ACL SETUSER/DELUSER/LIST/WHOAMI`、`AUTH username password` | 6.0 | 用户、口令、命令分类与键通配符；见下方范围说明 |
 
 过期时间在秒数乘 1000、相对时间加当前时间之前做有符号 64 位溢出检查，非法值报错且不改动数据。
@@ -63,7 +67,7 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 
 ## 验证
 
-在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，28 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
+在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，30 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
 
 ```bash
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe

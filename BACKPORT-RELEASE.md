@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp3
+# Redis for Windows 5.0.14.1-bp4
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.0 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -24,6 +24,9 @@
 | `SINTERCARD` / `ZINTERCARD` | 7.0 | 只计算交集基数，支持 LIMIT 提前结束 |
 | `ZADD ... GT\|LT` | 6.2 | 条件更新分数，新成员仍然直接加入 |
 | `HRANDFIELD` / `ZRANDMEMBER` | 6.2 | 随机取样，支持正负 count 与 WITHVALUES/WITHSCORES |
+| `LPOP` / `RPOP` 的 `count` | 6.2 | 批量弹出 |
+| `BLMOVE` | 6.2 | 阻塞式原子移动 |
+| 统一 `ZRANGE` / `ZRANGESTORE` | 6.2 | BYSCORE/BYLEX/REV/LIMIT，旧范围命令走同一实现 |
 | `lazyfree-lazy-user-del` / `lazyfree-lazy-user-flush` | 6.0 / 6.2 | 让 DEL 与 FLUSHDB/FLUSHALL 默认走异步释放，避免大键删除阻塞事件循环 |
 | ACL（`SETUSER`/`DELUSER`/`LIST`/`WHOAMI`，`AUTH user pass`） | 6.0 | 用户、口令、命令分类与键通配符；见下方范围说明 |
 | 过期时间边界检查 | 参考 7.0 实现 | 在秒乘 1000、相对时间加当前时间之前检查有符号 64 位溢出 |
@@ -65,7 +68,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-06 在 Windows 11、MSVC 14.44（v143）上跑完 28 项全部通过，包括此前会崩溃的 AOF 重启，以及新增的有序集合运算、COPY 深拷贝、ACL 权限、列表查找移动、交集基数、条件分数更新和随机取样用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-09 在 Windows 11、MSVC 14.44（v143）上跑完 30 项全部通过，包括此前会崩溃的 AOF 重启，以及新增的有序集合运算、COPY 深拷贝、ACL 权限、列表查找移动、交集基数、条件分数更新、随机取样、批量弹出、阻塞移动和统一范围查询用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 

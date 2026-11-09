@@ -692,6 +692,12 @@ typedef struct multiState {
 
 /* This structure holds the blocking operation state for a client.
  * The fields used depend on client->btype. */
+/* Where a blocking list operation takes elements from and pushes them to. */
+struct listPos {
+    int wherefrom;  /* LIST_HEAD or LIST_TAIL. */
+    int whereto;    /* LIST_HEAD or LIST_TAIL. */
+};
+
 typedef struct blockingState {
     /* Generic fields. */
     mstime_t timeout;       /* Blocking operation timeout. If UNIX current time
@@ -702,6 +708,7 @@ typedef struct blockingState {
                              * operation such as BLPOP or XREAD. Or NULL. */
     robj *target;           /* The key that should receive the element,
                              * for BRPOPLPUSH. */
+    struct listPos listpos; /* Source and destination side for BLMOVE. */
 
     /* BLOCK_STREAM */
     size_t xread_count;     /* XREAD COUNT option. */
@@ -818,7 +825,8 @@ struct sharedObjectsStruct {
     *masterdownerr, *roslaveerr, *execaborterr, *noautherr, *noreplicaserr,
     *busykeyerr, *oomerr, *plus, *messagebulk, *pmessagebulk, *subscribebulk,
     *unsubscribebulk, *psubscribebulk, *punsubscribebulk, *del, *unlink,
-    *rpop, *lpop, *lpush, *rpoplpush, *zpopmin, *zpopmax, *emptyscan,
+    *rpop, *lpop, *lpush, *rpoplpush, *lmove, *left, *right,
+    *zpopmin, *zpopmax, *emptyscan,
     *set, *pxat, *pexpireat, *persist,
     *select[PROTO_SHARED_SELECT_CMDS],
     *integers[OBJ_SHARED_INTEGERS],
@@ -1027,7 +1035,8 @@ struct redisServer {
     off_t loading_process_events_interval_bytes;
     /* Fast pointers to often looked up command */
     struct redisCommand *delCommand, *multiCommand, *lpushCommand,
-                        *lpopCommand, *rpopCommand, *zpopminCommand,
+                        *lpopCommand, *rpopCommand, *rpoplpushCommand,
+                        *lmoveCommand, *zpopminCommand,
                         *zpopmaxCommand, *sremCommand, *execCommand,
                         *expireCommand, *pexpireCommand, *pexpireatCommand,
                         *xclaimCommand,
@@ -1971,7 +1980,7 @@ int getTimeoutFromObjectOrReply(client *c, robj *object, mstime_t *timeout, int 
 void disconnectAllBlockedClients(void);
 void handleClientsBlockedOnKeys(void);
 void signalKeyAsReady(redisDb *db, robj *key);
-void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeout, robj *target, streamID *ids);
+void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeout, robj *target, struct listPos *listpos, streamID *ids);
 
 /* expire.c -- Handling of expired keys */
 void activeExpireCycle(int type);
@@ -2085,6 +2094,7 @@ void sortCommand(client *c);
 void lremCommand(client *c);
 void lposCommand(client *c);
 void lmoveCommand(client *c);
+void blmoveCommand(client *c);
 void rpoplpushCommand(client *c);
 void infoCommand(client *c);
 void mgetCommand(client *c);
@@ -2106,6 +2116,7 @@ void msetnxCommand(client *c);
 void zaddCommand(client *c);
 void zincrbyCommand(client *c);
 void zrangeCommand(client *c);
+void zrangestoreCommand(client *c);
 void zrangebyscoreCommand(client *c);
 void zrevrangebyscoreCommand(client *c);
 void zrangebylexCommand(client *c);
@@ -2128,6 +2139,7 @@ void discardCommand(client *c);
 void blpopCommand(client *c);
 void brpopCommand(client *c);
 void brpoplpushCommand(client *c);
+int serveClientBlockedOnList(client *receiver, robj *key, robj *dstkey, redisDb *db, robj *value, int wherefrom, int whereto);
 void appendCommand(client *c);
 void strlenCommand(client *c);
 void zrankCommand(client *c);

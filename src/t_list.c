@@ -385,25 +385,70 @@ void lsetCommand(client *c) {
 }
 
 void popGenericCommand(client *c, int where) {
-    robj *o = lookupKeyWriteOrReply(c,c->argv[1],shared.nullbulk);
+    int hascount = (c->argc == 3);
+    PORT_LONG count = 0;
+    robj *value;
+
+    if (c->argc > 3) {
+        addReplyErrorFormat(c,"wrong number of arguments for '%s' command",
+                            c->cmd->name);
+        return;
+    } else if (hascount) {
+        if (getLongFromObjectOrReply(c,c->argv[2],&count,NULL) != C_OK)
+            return;
+        if (count < 0) {
+            addReplyError(c,"value is out of range, must be positive");
+            return;
+        }
+    }
+
+    robj *o = lookupKeyWriteOrReply(c,c->argv[1],
+        hascount ? shared.nullmultibulk : shared.nullbulk);
     if (o == NULL || checkType(c,o,OBJ_LIST)) return;
 
-    robj *value = listTypePop(o,where);
-    if (value == NULL) {
-        addReply(c,shared.nullbulk);
+    if (hascount && count == 0) {
+        addReply(c,shared.emptymultibulk);
+        return;
+    }
+
+    if (!hascount) {
+        value = listTypePop(o,where);
+        if (value == NULL) {
+            addReply(c,shared.nullbulk);
+        } else {
+            char *event = (where == LIST_HEAD) ? "lpop" : "rpop";
+
+            addReplyBulk(c,value);
+            decrRefCount(value);
+            notifyKeyspaceEvent(NOTIFY_LIST,event,c->argv[1],c->db->id);
+            if (listTypeLength(o) == 0) {
+                notifyKeyspaceEvent(NOTIFY_GENERIC,"del",
+                                    c->argv[1],c->db->id);
+                dbDelete(c->db,c->argv[1]);
+            }
+            signalModifiedKey(c->db,c->argv[1]);
+            server.dirty++;
+        }
     } else {
+        PORT_LONG llen = listTypeLength(o);
+        PORT_LONG rangelen = (count > llen) ? llen : count;
+        PORT_LONG popped = rangelen;
         char *event = (where == LIST_HEAD) ? "lpop" : "rpop";
 
-        addReplyBulk(c,value);
-        decrRefCount(value);
+        addReplyMultiBulkLen(c,rangelen);
+        while (rangelen--) {
+            value = listTypePop(o,where);
+            serverAssert(value != NULL);
+            addReplyBulk(c,value);
+            decrRefCount(value);
+        }
         notifyKeyspaceEvent(NOTIFY_LIST,event,c->argv[1],c->db->id);
         if (listTypeLength(o) == 0) {
-            notifyKeyspaceEvent(NOTIFY_GENERIC,"del",
-                                c->argv[1],c->db->id);
+            notifyKeyspaceEvent(NOTIFY_GENERIC,"del",c->argv[1],c->db->id);
             dbDelete(c->db,c->argv[1]);
         }
         signalModifiedKey(c->db,c->argv[1]);
-        server.dirty++;
+        server.dirty += popped;
     }
 }
 
@@ -745,6 +790,12 @@ static int getListPositionFromObjectOrReply(client *c, robj *arg,
     return C_OK;
 }
 
+/* Return the shared LEFT/RIGHT object for a list position, used when
+ * propagating a blocking move as LMOVE. */
+static robj *getStringObjectFromListPosition(int position) {
+    return position == LIST_HEAD ? shared.left : shared.right;
+}
+
 /* Push 'value' on the destination list and reply with it. */
 static void lmoveHandlePush(client *c, robj *dstkey, robj *dstobj,
                             robj *value, int where) {
@@ -765,14 +816,8 @@ static void lmoveHandlePush(client *c, robj *dstkey, robj *dstobj,
  *
  * Atomically moves one element between two lists. Unlike RPOPLPUSH it can
  * take from either end and push to either end. */
-void lmoveCommand(client *c) {
-    int wherefrom, whereto;
+static void lmoveGenericCommand(client *c, int wherefrom, int whereto) {
     robj *sobj, *value;
-
-    if (getListPositionFromObjectOrReply(c,c->argv[3],&wherefrom) != C_OK)
-        return;
-    if (getListPositionFromObjectOrReply(c,c->argv[4],&whereto) != C_OK)
-        return;
 
     if ((sobj = lookupKeyWriteOrReply(c,c->argv[1],shared.nullbulk)) == NULL ||
         checkType(c,sobj,OBJ_LIST)) return;
@@ -804,6 +849,16 @@ void lmoveCommand(client *c) {
     server.dirty++;
 }
 
+void lmoveCommand(client *c) {
+    int wherefrom, whereto;
+
+    if (getListPositionFromObjectOrReply(c,c->argv[3],&wherefrom) != C_OK)
+        return;
+    if (getListPositionFromObjectOrReply(c,c->argv[4],&whereto) != C_OK)
+        return;
+    lmoveGenericCommand(c,wherefrom,whereto);
+}
+
 /*-----------------------------------------------------------------------------
  * Blocking POP operations
  *----------------------------------------------------------------------------*/
@@ -827,16 +882,16 @@ void lmoveCommand(client *c) {
  * should be undone as the client was not served: This only happens for
  * BRPOPLPUSH that fails to push the value to the destination key as it is
  * of the wrong type. */
-int serveClientBlockedOnList(client *receiver, robj *key, robj *dstkey, redisDb *db, robj *value, int where)
+int serveClientBlockedOnList(client *receiver, robj *key, robj *dstkey, redisDb *db, robj *value, int wherefrom, int whereto)
 {
-    robj *argv[3];
+    robj *argv[5];
 
     if (dstkey == NULL) {
         /* Propagate the [LR]POP operation. */
-        argv[0] = (where == LIST_HEAD) ? shared.lpop :
-                                          shared.rpop;
+        argv[0] = (wherefrom == LIST_HEAD) ? shared.lpop :
+                                             shared.rpop;
         argv[1] = key;
-        propagate((where == LIST_HEAD) ?
+        propagate((wherefrom == LIST_HEAD) ?
             server.lpopCommand : server.rpopCommand,
             db->id,argv,2,PROPAGATE_AOF|PROPAGATE_REPL);
 
@@ -844,40 +899,40 @@ int serveClientBlockedOnList(client *receiver, robj *key, robj *dstkey, redisDb 
         addReplyMultiBulkLen(receiver,2);
         addReplyBulk(receiver,key);
         addReplyBulk(receiver,value);
-        
+
         /* Notify event. */
-        char *event = (where == LIST_HEAD) ? "lpop" : "rpop";
+        char *event = (wherefrom == LIST_HEAD) ? "lpop" : "rpop";
         notifyKeyspaceEvent(NOTIFY_LIST,event,key,receiver->db->id);
     } else {
-        /* BRPOPLPUSH */
+        /* BRPOPLPUSH / BLMOVE */
         robj *dstobj =
             lookupKeyWrite(receiver->db,dstkey);
         if (!(dstobj &&
              checkType(receiver,dstobj,OBJ_LIST)))
         {
-            /* Propagate the RPOP operation. */
-            argv[0] = shared.rpop;
+            int isbrpoplpush = (receiver->lastcmd &&
+                                receiver->lastcmd->proc == brpoplpushCommand);
+
+            /* Propagate the LMOVE or RPOPLPUSH operation. */
+            argv[0] = isbrpoplpush ? shared.rpoplpush : shared.lmove;
             argv[1] = key;
-            propagate(server.rpopCommand,
-                db->id,argv,2,
-                PROPAGATE_AOF|
-                PROPAGATE_REPL);
-            rpoplpushHandlePush(receiver,dstkey,dstobj,
-                value);
-            /* Propagate the LPUSH operation. */
-            argv[0] = shared.lpush;
-            argv[1] = dstkey;
-            argv[2] = value;
-            propagate(server.lpushCommand,
-                db->id,argv,3,
+            argv[2] = dstkey;
+            argv[3] = getStringObjectFromListPosition(wherefrom);
+            argv[4] = getStringObjectFromListPosition(whereto);
+            propagate(isbrpoplpush ? server.rpoplpushCommand :
+                                     server.lmoveCommand,
+                db->id,argv,(isbrpoplpush ? 3 : 5),
                 PROPAGATE_AOF|
                 PROPAGATE_REPL);
 
-            /* Notify event ("lpush" was notified by rpoplpushHandlePush). */
-            notifyKeyspaceEvent(NOTIFY_LIST,"rpop",key,receiver->db->id);
+            lmoveHandlePush(receiver,dstkey,dstobj,value,whereto);
+
+            /* Notify event ("lpush"/"rpush" was notified by lmoveHandlePush). */
+            notifyKeyspaceEvent(NOTIFY_LIST,
+                wherefrom == LIST_TAIL ? "rpop" : "lpop",
+                key,receiver->db->id);
         } else {
-            /* BRPOPLPUSH failed because of wrong
-             * destination type. */
+            /* The move failed because of the wrong destination type. */
             return C_ERR;
         }
     }
@@ -938,7 +993,10 @@ void blockingPopGenericCommand(client *c, int where) {
     }
 
     /* If the list is empty or the key does not exists we must block */
-    blockForKeys(c,BLOCKED_LIST,c->argv + 1,c->argc - 2,timeout,NULL,NULL);
+    {
+        struct listPos pos = {where, LIST_HEAD};
+        blockForKeys(c,BLOCKED_LIST,c->argv + 1,c->argc - 2,timeout,NULL,&pos,NULL);
+    }
 }
 
 void blpopCommand(client *c) {
@@ -964,7 +1022,10 @@ void brpoplpushCommand(client *c) {
             addReply(c, shared.nullbulk);
         } else {
             /* The list is empty and the client blocks. */
-            blockForKeys(c,BLOCKED_LIST,c->argv + 1,1,timeout,c->argv[2],NULL);
+            {
+                struct listPos pos = {LIST_TAIL, LIST_HEAD};
+                blockForKeys(c,BLOCKED_LIST,c->argv + 1,1,timeout,c->argv[2],&pos,NULL);
+            }
         }
     } else {
         if (key->type != OBJ_LIST) {
@@ -976,4 +1037,41 @@ void brpoplpushCommand(client *c) {
             rpoplpushCommand(c);
         }
     }
+}
+
+/* BLMOVE source destination LEFT|RIGHT LEFT|RIGHT timeout
+ *
+ * Blocking variant of LMOVE. When the source has elements it behaves exactly
+ * like LMOVE, otherwise the client waits for an element to be pushed. */
+static void blmoveGenericCommand(client *c, int wherefrom, int whereto,
+                                 mstime_t timeout) {
+    robj *key = lookupKeyWrite(c->db, c->argv[1]);
+    if (key && checkType(c,key,OBJ_LIST)) return;
+
+    if (key == NULL || listTypeLength(key) == 0) {
+        if (c->flags & CLIENT_MULTI) {
+            /* Blocking against an empty list in a multi state
+             * returns immediately. */
+            addReply(c, shared.nullbulk);
+        } else {
+            struct listPos pos = {wherefrom, whereto};
+            blockForKeys(c,BLOCKED_LIST,c->argv + 1,1,timeout,c->argv[2],
+                         &pos,NULL);
+        }
+    } else {
+        lmoveGenericCommand(c,wherefrom,whereto);
+    }
+}
+
+void blmoveCommand(client *c) {
+    mstime_t timeout;
+    int wherefrom, whereto;
+
+    if (getListPositionFromObjectOrReply(c,c->argv[3],&wherefrom) != C_OK)
+        return;
+    if (getListPositionFromObjectOrReply(c,c->argv[4],&whereto) != C_OK)
+        return;
+    if (getTimeoutFromObjectOrReply(c,c->argv[5],&timeout,UNIT_SECONDS)
+        != C_OK) return;
+    blmoveGenericCommand(c,wherefrom,whereto,timeout);
 }
