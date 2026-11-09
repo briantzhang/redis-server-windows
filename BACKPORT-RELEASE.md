@@ -1,6 +1,6 @@
-# Redis for Windows 5.0.14.1-bp4
+# Redis for Windows 5.0.14.1-bp5
 
-本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.0 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
+本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
 ## 本次范围
 
@@ -27,13 +27,17 @@
 | `LPOP` / `RPOP` 的 `count` | 6.2 | 批量弹出 |
 | `BLMOVE` | 6.2 | 阻塞式原子移动 |
 | 统一 `ZRANGE` / `ZRANGESTORE` | 6.2 | BYSCORE/BYLEX/REV/LIMIT，旧范围命令走同一实现 |
+| `LMPOP` / `BLMPOP` | 7.0 | 从多个列表中选第一个非空键批量弹出，阻塞版本支持小数秒超时 |
+| `ZMPOP` / `BZMPOP` | 7.0 | 从多个有序集合中选第一个非空键批量弹出，返回成员与分数对 |
+| `CLIENT NO-EVICT` | 7.0 | 接受并记录标志；本版没有客户端内存驱逐，因此不会产生实际驱逐效果 |
+| `CLIENT NO-TOUCH` | 7.2 | 该连接访问键时不更新 LRU/LFU，TOUCH 命令仍更新 |
 | `lazyfree-lazy-user-del` / `lazyfree-lazy-user-flush` | 6.0 / 6.2 | 让 DEL 与 FLUSHDB/FLUSHALL 默认走异步释放，避免大键删除阻塞事件循环 |
 | ACL（`SETUSER`/`DELUSER`/`LIST`/`WHOAMI`，`AUTH user pass`） | 6.0 | 用户、口令、命令分类与键通配符；见下方范围说明 |
 | 过期时间边界检查 | 参考 7.0 实现 | 在秒乘 1000、相对时间加当前时间之前检查有符号 64 位溢出 |
 
 ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`。没有 Redis 7 的多选择器，也没有按键的读写权限位。`requirepass` 成为 `default` 用户的口令，设置后未认证连接被拒绝；不设置时连接以 `default` 用户进入。`ACL WHOAMI` 对任何已认证用户放行。
 
-代码参照 Redis `7.0.15`（BSD）中的相关命令语义，按旧版 API 手工适配；没有引入 Redis 8 的源码或模块。
+代码参照 Redis `7.0.15` 与 `7.2.5`（BSD）中的相关命令语义，按旧版 API 手工适配；没有引入 Redis 8 的源码或模块。
 
 ## 持久化适配
 
@@ -42,6 +46,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 - GETEX 的写入记录为 PEXPIREAT、PERSIST 或 DEL/UNLINK；GETDEL 记录为 DEL。
 - 条件过期仅记录成功结果的绝对截止时间，恢复时不重新判断 NX/XX/GT/LT。
 - 不迁入新版 RDB 格式、多段 AOF、RESP3、线程 I/O、TLS、Functions 或集群功能。ACL 只做到 Redis 6 的单权限集，没有 Redis 7 的选择器。原底座已有功能保留，但本版没有对其做现代化升级。
+- 没有实现 Redis 7 的客户端内存驱逐（`maxmemory-clients`）。`CLIENT NO-EVICT` 只为客户端兼容而接受并记录标志，内存压力下不会据此保留连接。
 - 网络/IOCP、Windows 服务与 fork 模拟层沿用底座代码。
 
 ## 性能预期
@@ -68,7 +73,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-09 在 Windows 11、MSVC 14.44（v143）上跑完 30 项全部通过，包括此前会崩溃的 AOF 重启，以及新增的有序集合运算、COPY 深拷贝、ACL 权限、列表查找移动、交集基数、条件分数更新、随机取样、批量弹出、阻塞移动和统一范围查询用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-09 在 Windows 11、MSVC 14.44（v143）上跑完 33 项全部通过，包括此前会崩溃的 AOF 重启，以及新增的有序集合运算、COPY 深拷贝、ACL 权限、列表查找移动、交集基数、条件分数更新、随机取样、批量弹出、阻塞移动、统一范围查询、多键弹出和 CLIENT 标志用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 

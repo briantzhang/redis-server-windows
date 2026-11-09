@@ -1307,6 +1307,198 @@ class BackportRegression(unittest.TestCase):
         with self.assertRaises(RedisError):
             denied.command("AUTH", "reader", "wrong")
 
+    def test_lmpop_and_blmpop(self):
+        lkey = self.key("lmpop:list")
+        lkey2 = self.key("lmpop:other")
+        missing = self.key("lmpop:missing")
+        plain = self.key("lmpop:string")
+        self.cmd("DEL", lkey, lkey2, missing, plain)
+        self.cmd("RPUSH", lkey, "a", "b", "c", "d", "e")
+
+        # LMPOP replies with [key, [elements...]] and skips missing keys.
+        self.assertEqual(self.cmd("LMPOP", "2", missing, lkey, "LEFT", "COUNT", "2"),
+                         [lkey, [b"a", b"b"]])
+        self.assertEqual(self.cmd("LRANGE", lkey, "0", "-1"), [b"c", b"d", b"e"])
+        # COUNT defaults to one and is capped by the list length.
+        self.assertEqual(self.cmd("LMPOP", "1", lkey, "RIGHT"), [lkey, [b"e"]])
+        self.assertEqual(self.cmd("LMPOP", "1", lkey, "RIGHT", "COUNT", "10"),
+                         [lkey, [b"d", b"c"]])
+        self.assertEqual(self.cmd("EXISTS", lkey), 0)
+        # No key had elements: a null array, not an empty one.
+        self.assertIsNone(self.cmd("LMPOP", "1", missing, "LEFT"))
+        self.assertIsNone(self.cmd("LMPOP", "2", missing, lkey, "LEFT"))
+
+        with self.assertRaises(RedisError):
+            self.cmd("LMPOP", "0", lkey, "LEFT")
+        with self.assertRaises(RedisError):
+            self.cmd("LMPOP", "99999", lkey, "LEFT")
+        with self.assertRaises(RedisError):
+            self.cmd("LMPOP", "9223372036854775807", lkey, "LEFT")
+        with self.assertRaises(RedisError):
+            self.cmd("LMPOP", "1", lkey, "LEFT", "COUNT", "0")
+        with self.assertRaises(RedisError):
+            self.cmd("LMPOP", "1", lkey, "SIDEWAYS")
+        with self.assertRaises(RedisError):
+            self.cmd("LMPOP", "1", lkey, "LEFT", "COUNT")
+        with self.assertRaises(RedisError):
+            self.cmd("LMPOP", "1", lkey, "LEFT", "COUNT", "1", "COUNT", "2")
+        self.cmd("SET", plain, "x")
+        with self.assertRaises(RedisError):
+            self.cmd("LMPOP", "1", plain, "LEFT")
+
+        # BLMPOP serves an already non-empty list immediately.
+        self.cmd("RPUSH", lkey2, "a", "b", "c")
+        self.assertEqual(self.cmd("BLMPOP", "0", "1", lkey2, "RIGHT", "COUNT", "2"),
+                         [lkey2, [b"c", b"b"]])
+        self.assertEqual(self.cmd("LRANGE", lkey2, "0", "-1"), [b"a"])
+
+        # BLMPOP waits for a push on any of its keys.
+        blkey = self.key("lmpop:block")
+        self.cmd("DEL", blkey)
+        blocked = self.connect()
+        try:
+            blocked.sock.sendall(blocked.encode(
+                ("BLMPOP", "5", "2", missing, blkey, "LEFT", "COUNT", "2")))
+            time.sleep(0.2)
+            self.cmd("RPUSH", blkey, "w", "x", "y")
+            self.assertEqual(blocked._read(), [blkey, [b"w", b"x"]])
+        finally:
+            blocked.close()
+        self.assertEqual(self.cmd("LRANGE", blkey, "0", "-1"), [b"y"])
+
+        # A blocking pop that empties the list deletes the key.
+        blocked = self.connect()
+        try:
+            blocked.sock.sendall(blocked.encode(
+                ("BLMPOP", "5", "1", blkey, "RIGHT", "COUNT", "5")))
+            time.sleep(0.2)
+            self.assertEqual(blocked._read(), [blkey, [b"y"]])
+        finally:
+            blocked.close()
+        self.assertEqual(self.cmd("EXISTS", blkey), 0)
+
+        # Timeout and MULTI/EXEC both reply with a null array.
+        self.assertIsNone(self.cmd("BLMPOP", "0.1", "1", missing, "LEFT"))
+        self.assertEqual(self.cmd("MULTI"), b"OK")
+        self.assertEqual(self.cmd("BLMPOP", "0", "1", missing, "LEFT"), b"QUEUED")
+        self.assertEqual(self.cmd("EXEC"), [None])
+
+    def test_zmpop_and_bzmpop(self):
+        zkey = self.key("zmpop:zset")
+        zkey2 = self.key("zmpop:other")
+        missing = self.key("zmpop:missing")
+        plain = self.key("zmpop:string")
+        self.cmd("DEL", zkey, zkey2, missing, plain)
+        self.cmd("ZADD", zkey, "1", "a", "2", "b", "3", "c")
+
+        # ZMPOP replies with [key, [[member, score], ...]].
+        self.assertEqual(self.cmd("ZMPOP", "2", missing, zkey, "MIN", "COUNT", "2"),
+                         [zkey, [[b"a", b"1"], [b"b", b"2"]]])
+        self.assertEqual(self.cmd("ZRANGE", zkey, "0", "-1", "WITHSCORES"),
+                         [b"c", b"3"])
+        self.assertEqual(self.cmd("ZMPOP", "1", zkey, "MAX", "COUNT", "5"),
+                         [zkey, [[b"c", b"3"]]])
+        self.assertEqual(self.cmd("EXISTS", zkey), 0)
+        self.assertIsNone(self.cmd("ZMPOP", "1", missing, "MIN"))
+        self.assertIsNone(self.cmd("ZMPOP", "2", missing, zkey, "MIN"))
+
+        with self.assertRaises(RedisError):
+            self.cmd("ZMPOP", "0", zkey, "MIN")
+        with self.assertRaises(RedisError):
+            self.cmd("ZMPOP", "99999", zkey, "MIN")
+        with self.assertRaises(RedisError):
+            self.cmd("ZMPOP", "9223372036854775807", zkey, "MIN")
+        with self.assertRaises(RedisError):
+            self.cmd("ZMPOP", "1", zkey, "MIDDLE")
+        with self.assertRaises(RedisError):
+            self.cmd("ZMPOP", "1", zkey, "MIN", "COUNT", "0")
+        with self.assertRaises(RedisError):
+            self.cmd("ZMPOP", "1", zkey, "MIN", "LIMIT", "1")
+        with self.assertRaises(RedisError):
+            self.cmd("ZMPOP", "1", zkey, "MIN", "COUNT", "1", "COUNT", "2")
+        self.cmd("SET", plain, "x")
+        with self.assertRaises(RedisError):
+            self.cmd("ZMPOP", "1", plain, "MIN")
+
+        # ZPOPMIN/ZPOPMAX share the parser and validate COUNT.
+        self.cmd("ZADD", zkey, "1", "a", "2", "b", "3", "c")
+        self.assertEqual(self.cmd("ZPOPMIN", zkey, "0"), [])
+        self.assertEqual(self.cmd("ZPOPMAX", zkey, "2"), [b"c", b"3", b"b", b"2"])
+        with self.assertRaises(RedisError):
+            self.cmd("ZPOPMIN", zkey, "-1")
+        self.assertEqual(self.cmd("ZPOPMIN", zkey), [b"a", b"1"])
+        self.assertEqual(self.cmd("EXISTS", zkey), 0)
+
+        # BZMPOP serves an already non-empty zset immediately.
+        self.cmd("ZADD", zkey2, "1", "a", "2", "b")
+        self.assertEqual(self.cmd("BZMPOP", "0", "1", zkey2, "MAX", "COUNT", "1"),
+                         [zkey2, [[b"b", b"2"]]])
+
+        # BZMPOP waits for a ZADD on any of its keys.
+        bzkey = self.key("zmpop:block")
+        self.cmd("DEL", bzkey)
+        blocked = self.connect()
+        try:
+            blocked.sock.sendall(blocked.encode(
+                ("BZMPOP", "5", "2", missing, bzkey, "MIN", "COUNT", "2")))
+            time.sleep(0.2)
+            self.cmd("ZADD", bzkey, "1", "a", "3", "c", "4", "d")
+            self.assertEqual(blocked._read(), [bzkey, [[b"a", b"1"], [b"c", b"3"]]])
+        finally:
+            blocked.close()
+        self.assertEqual(self.cmd("ZRANGE", bzkey, "0", "-1", "WITHSCORES"),
+                         [b"d", b"4"])
+
+        # A blocking pop that empties the zset deletes the key.
+        blocked = self.connect()
+        try:
+            blocked.sock.sendall(blocked.encode(
+                ("BZMPOP", "5", "1", bzkey, "MAX", "COUNT", "5")))
+            time.sleep(0.2)
+            self.assertEqual(blocked._read(), [bzkey, [[b"d", b"4"]]])
+        finally:
+            blocked.close()
+        self.assertEqual(self.cmd("EXISTS", bzkey), 0)
+
+        self.assertIsNone(self.cmd("BZMPOP", "0.1", "1", missing, "MIN"))
+        self.assertEqual(self.cmd("MULTI"), b"OK")
+        self.assertEqual(self.cmd("BZMPOP", "0", "1", missing, "MIN"), b"QUEUED")
+        self.assertEqual(self.cmd("EXEC"), [None])
+
+    def test_client_no_touch_and_no_evict(self):
+        key = self.key("client:flags")
+        self.cmd("DEL", key)
+
+        self.assertEqual(self.cmd("CLIENT", "NO-EVICT", "on"), b"OK")
+        self.assertIn(b"flags=e", self.cmd("CLIENT", "LIST"))
+        self.assertEqual(self.cmd("CLIENT", "NO-EVICT", "off"), b"OK")
+        with self.assertRaises(RedisError):
+            self.cmd("CLIENT", "NO-EVICT", "maybe")
+        with self.assertRaises(RedisError):
+            self.cmd("CLIENT", "NO-EVICT")
+
+        # CLIENT NO-TOUCH suppresses the LRU update, except for TOUCH itself.
+        self.cmd("SET", key, "v")
+        time.sleep(1.1)
+        self.assertGreaterEqual(self.cmd("OBJECT", "IDLETIME", key), 1)
+        self.assertEqual(self.cmd("CLIENT", "NO-TOUCH", "on"), b"OK")
+        self.assertIn(b"flags=T", self.cmd("CLIENT", "LIST"))
+        self.assertEqual(self.cmd("GET", key), b"v")
+        time.sleep(1.1)
+        self.assertGreaterEqual(self.cmd("OBJECT", "IDLETIME", key), 2)
+        self.assertEqual(self.cmd("TOUCH", key), 1)
+        self.assertLessEqual(self.cmd("OBJECT", "IDLETIME", key), 1)
+        self.assertEqual(self.cmd("CLIENT", "NO-TOUCH", "off"), b"OK")
+        self.assertEqual(self.cmd("GET", key), b"v")
+        self.assertLessEqual(self.cmd("OBJECT", "IDLETIME", key), 1)
+        with self.assertRaises(RedisError):
+            self.cmd("CLIENT", "NO-TOUCH", "maybe")
+
+        # RESET clears both flags.
+        self.assertEqual(self.cmd("CLIENT", "NO-EVICT", "on"), b"OK")
+        self.assertEqual(self.cmd("RESET"), b"OK")
+        self.assertNotIn(b"flags=e", self.cmd("CLIENT", "LIST"))
+
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__,

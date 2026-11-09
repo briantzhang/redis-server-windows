@@ -1,6 +1,6 @@
 # 运维手册
 
-适用版本：Redis for Windows `5.0.14.1-bp4`，仅 Windows x64，单机、非集群。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
+适用版本：Redis for Windows `5.0.14.1-bp5`，仅 Windows x64，单机、非集群。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
 
 本文只覆盖这一个可执行文件的日常操作。它不包含 TLS、多段 AOF 和集群，那些配置项写进 `redis.conf` 也不会生效，启动时会报未知配置。ACL 已按 Redis 6 的范围实现，见第 3 节。
 
@@ -38,7 +38,7 @@
 .\redis-server.exe --version
 ```
 
-应看到 `v=5.0.14.1-bp4`。如果不是这个版本号，说明运行的不是这份回移。
+应看到 `v=5.0.14.1-bp5`。如果不是这个版本号，说明运行的不是这份回移。
 
 另开一个窗口检查存活：
 
@@ -208,6 +208,27 @@ ZRANGESTORE top10 board 0 9 REV
 
 `BYSCORE` 的区间支持 `(` 开区间和 `-inf`/`+inf`，`BYLEX` 使用 `[`、`(`、`-`、`+`；`LIMIT` 只能和 `BYSCORE`/`BYLEX` 一起用，`WITHSCORES` 不能和 `BYLEX` 一起用。`ZRANGESTORE` 没有 `WITHSCORES`，结果为空时会删除目标键并返回 0。原来的 `ZRANGEBYSCORE`、`ZREVRANGEBYLEX` 等命令保持不变，内部走同一套实现。
 
+多键批量弹出：
+
+```text
+LMPOP 2 queue:high queue:low LEFT COUNT 10
+BLMPOP 5 2 queue:high queue:low RIGHT COUNT 10
+ZMPOP 2 board:hot board:cold MAX COUNT 5
+BZMPOP 5 2 board:hot board:cold MIN COUNT 5
+```
+
+`LMPOP`/`BLMPOP` 依次检查键，从第一个非空列表弹出，返回 `[键, [元素 ...]]`；所有键都为空时返回空数组。`ZMPOP`/`BZMPOP` 同理，返回 `[键, [[成员, 分数], ...]]`。`COUNT` 必须大于 0，缺省为 1；弹出后列表或有序集合为空会删除键。阻塞版本的超时支持小数秒，在 `MULTI/EXEC` 中不阻塞、立即返回空。复制和 AOF 里记录的是 `LPOP`/`RPOP`/`ZPOPMIN`/`ZPOPMAX` 加 `COUNT`，不是原来的多键命令。
+
+客户端标志：
+
+```text
+CLIENT NO-TOUCH on
+CLIENT NO-TOUCH off
+CLIENT NO-EVICT on
+```
+
+`CLIENT NO-TOUCH` 让这个连接后续读取键时不再更新 LRU/LFU，`TOUCH` 命令本身仍会更新；`OBJECT IDLETIME`/`OBJECT FREQ` 可以用来核对。`CLIENT NO-EVICT` 只记录标志：本版没有实现 Redis 7 的客户端内存驱逐（`maxmemory-clients`），因此不会真的因为内存压力保留或驱逐某个连接。`RESET` 会清除这两个标志。
+
 原子取出旧值并写入：
 
 ```text
@@ -313,7 +334,7 @@ BGREWRITEAOF
 
 等 `INFO persistence` 里两次后台任务的状态都变成 `ok`，再复制 `dir` 下的 `dump.rdb` 和 `appendonly.aof`。复制过程中不要 `SHUTDOWN`，也不要再手动触发保存。
 
-备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp4-20261109.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
+备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp5-20261109.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
 
 ## 7. 排查
 
