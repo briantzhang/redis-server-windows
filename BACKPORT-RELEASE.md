@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp5
+# Redis for Windows 5.0.14.1-bp6
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -34,6 +34,13 @@
 | `lazyfree-lazy-user-del` / `lazyfree-lazy-user-flush` | 6.0 / 6.2 | 让 DEL 与 FLUSHDB/FLUSHALL 默认走异步释放，避免大键删除阻塞事件循环 |
 | ACL（`SETUSER`/`DELUSER`/`LIST`/`WHOAMI`，`AUTH user pass`） | 6.0 | 用户、口令、命令分类与键通配符；见下方范围说明 |
 | 过期时间边界检查 | 参考 7.0 实现 | 在秒乘 1000、相对时间加当前时间之前检查有符号 64 位溢出 |
+| `XADD ... [NOMKSTREAM] [MAXLEN\|MINID [~\|=] threshold [LIMIT n]]` | 6.2 | 追加时按长度或最小 ID 裁剪；`NOMKSTREAM` 在键不存在时返回空而不建键 |
+| `XTRIM key MAXLEN\|MINID [~\|=] threshold [LIMIT n]` | 6.2 | 按最小 ID 裁剪；`LIMIT` 限制单次删除的工作量，只能与 `~` 一起使用 |
+| `XGROUP CREATECONSUMER` | 6.2 | 显式创建消费者；`XREADGROUP ... NOACK` 创建的消费者通过传播该命令同步到 AOF 和副本 |
+| `XSETID key id [ENTRIESADDED n] [MAXDELETEDID id]` | 6.2 / 7.0 | 校正 `entries-added` 与 `max-deleted-entry-id`，并做单调性校验 |
+| `XPENDING key group [IDLE ms] start end count [consumer]` | 6.2 | 按空闲时间过滤待处理消息 |
+| `XAUTOCLAIM key group consumer min-idle start [COUNT n] [JUSTID]` | 6.2 | 批量转移待处理消息；返回下一游标；流条目已删除的 PEL 记录会被清理并在第三项返回 |
+| `XINFO STREAM key [FULL [COUNT n]]` | 6.2 / 7.0 | `FULL` 输出条目、组、消费者及 PEL；摘要新增 `max-deleted-entry-id`、`entries-added`、`recorded-first-entry-id` |
 
 ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`。没有 Redis 7 的多选择器，也没有按键的读写权限位。`requirepass` 成为 `default` 用户的口令，设置后未认证连接被拒绝；不设置时连接以 `default` 用户进入。`ACL WHOAMI` 对任何已认证用户放行。
 
@@ -42,6 +49,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 ## 持久化适配
 
 - 保留原有 RDB 格式、单文件 AOF、Windows 后台保存机制。
+- 流的 RDB 仍使用旧格式，`entries-added` 与 `max-deleted-entry-id` 不落快照：RDB 恢复后前者等于当前长度、后者归零；AOF 重放和重写通过带 `ENTRIESADDED`/`MAXDELETEDID` 的 `XSETID` 保留这两个计数。
 - 成功的带 TTL 的 SET 在 AOF 中记录为普通 SET + 绝对 PEXPIREAT；KEEPTTL 记录实际保留的截止时间。
 - GETEX 的写入记录为 PEXPIREAT、PERSIST 或 DEL/UNLINK；GETDEL 记录为 DEL。
 - 条件过期仅记录成功结果的绝对截止时间，恢复时不重新判断 NX/XX/GT/LT。
@@ -73,7 +81,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-09 在 Windows 11、MSVC 14.44（v143）上跑完 33 项全部通过，包括此前会崩溃的 AOF 重启，以及新增的有序集合运算、COPY 深拷贝、ACL 权限、列表查找移动、交集基数、条件分数更新、随机取样、批量弹出、阻塞移动、统一范围查询、多键弹出和 CLIENT 标志用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-09 在 Windows 11、MSVC 14.44（v143）上跑完 41 项全部通过，包括此前会崩溃的 AOF 重启，以及新增的有序集合运算、COPY 深拷贝、ACL 权限、列表查找移动、交集基数、条件分数更新、随机取样、批量弹出、阻塞移动、统一范围查询、多键弹出、CLIENT 标志，以及流的 MINID/LIMIT 裁剪、NOMKSTREAM、CREATECONSUMER、XPENDING IDLE、XAUTOCLAIM、XSETID 计数、XINFO STREAM FULL、AOF 计数保留和 NOACK 消费者恢复用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 

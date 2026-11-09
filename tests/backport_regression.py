@@ -340,6 +340,11 @@ class BackportRegression(unittest.TestCase):
         self.client = self.connect()
         self.addCleanup(self.client.close)
 
+    @staticmethod
+    def flat_map(reply):
+        """Convert a flat RESP2 map (field, value, field, value, ...) to a dict."""
+        return {reply[i]: reply[i + 1] for i in range(0, len(reply), 2)}
+
     def race(self, commands):
         barrier = threading.Barrier(len(commands))
 
@@ -1498,6 +1503,323 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("CLIENT", "NO-EVICT", "on"), b"OK")
         self.assertEqual(self.cmd("RESET"), b"OK")
         self.assertNotIn(b"flags=e", self.cmd("CLIENT", "LIST"))
+
+    def test_stream_xtrim_minid_and_limit(self):
+        key = self.key("xtrim:minid")
+        for ms in range(1, 7):
+            self.assertEqual(self.cmd("XADD", key, "%d-1" % ms, "f", ms),
+                             ("%d-1" % ms).encode())
+
+        self.assertEqual(self.cmd("XTRIM", key, "MINID", "3-1"), 2)
+        self.assertEqual(self.cmd("XLEN", key), 4)
+        self.assertEqual(self.cmd("XRANGE", key, "-", "+")[0],
+                         [b"3-1", [b"f", b"3"]])
+
+        # '=' is accepted as the explicit form of MINID.
+        self.assertEqual(self.cmd("XTRIM", key, "MINID", "=", "6-1"), 3)
+        self.assertEqual(self.cmd("XLEN", key), 1)
+
+        # Approximate trimming only removes whole radix tree nodes.
+        self.assertEqual(self.cmd("XTRIM", key, "MINID", "~", "6-1"), 0)
+        self.assertEqual(self.cmd("XLEN", key), 1)
+        self.assertEqual(self.cmd("XTRIM", key, "MINID", "~", "7-1"), 1)
+        self.assertEqual(self.cmd("XLEN", key), 0)
+        self.assertEqual(self.cmd("XRANGE", key, "-", "+"), [])
+        self.assertEqual(self.flat_map(self.cmd("XINFO", "STREAM", key))
+                         [b"recorded-first-entry-id"], b"0-0")
+
+        # Exact MINID trimming crosses listpack nodes (100 entries each).
+        key = self.key("xtrim:minid:multi")
+        for ms in range(1, 201):
+            self.cmd("XADD", key, "%d-1" % ms, "f", ms)
+        self.assertEqual(self.cmd("XTRIM", key, "MINID", "150-1"), 149)
+        self.assertEqual(self.cmd("XLEN", key), 51)
+        self.assertEqual(self.cmd("XRANGE", key, "-", "+", "COUNT", 1)[0][0],
+                         b"150-1")
+
+        # LIMIT is only valid together with the approximate form.
+        with self.assertRaises(RedisError):
+            self.cmd("XTRIM", key, "MAXLEN", "1", "LIMIT", "10")
+        with self.assertRaises(RedisError):
+            self.cmd("XTRIM", key, "MAXLEN", "~", "1", "LIMIT", "-1")
+        with self.assertRaises(RedisError):
+            self.cmd("XTRIM", key, "MAXLEN", "1", "MINID", "2-2")
+        with self.assertRaises(RedisError):
+            self.cmd("XTRIM", key)
+        self.assertEqual(self.cmd("XTRIM", self.key("xtrim:missing"),
+                                  "MINID", "1-1"), 0)
+
+        # XADD accepts the same trimming options, including LIMIT.
+        key = self.key("xadd:minid")
+        for ms in range(1, 6):
+            self.cmd("XADD", key, "MINID", "3-1", "%d-1" % ms, "f", ms)
+        self.assertEqual(self.cmd("XLEN", key), 3)
+
+        key = self.key("xadd:minid:limit")
+        for ms in range(1, 201):
+            self.cmd("XADD", key, "%d-1" % ms, "f", ms)
+        self.assertEqual(self.cmd("XADD", key, "MINID", "~", "150-1",
+                                  "LIMIT", "100", "201-1", "f", 201), b"201-1")
+        self.assertEqual(self.cmd("XLEN", key), 101)
+
+        with self.assertRaises(RedisError):
+            self.cmd("XADD", key, "LIMIT", "10", "*", "f", "v")
+        with self.assertRaises(RedisError):
+            self.cmd("XADD", key, "MAXLEN", "5", "LIMIT", "10", "*", "f", "v")
+        with self.assertRaises(RedisError):
+            self.cmd("XADD", key, "MAXLEN", "5", "MINID", "1-1", "*", "f", "v")
+
+    def test_stream_xadd_nomkstream(self):
+        missing = self.key("xadd:nomk")
+        self.cmd("DEL", missing)
+        self.assertIsNone(self.cmd("XADD", missing, "NOMKSTREAM", "*", "f", "v"))
+        self.assertEqual(self.cmd("EXISTS", missing), 0)
+        self.assertIsNone(self.cmd("XADD", missing, "MAXLEN", "5",
+                                   "NOMKSTREAM", "*", "f", "v"))
+        self.assertEqual(self.cmd("EXISTS", missing), 0)
+
+        key = self.key("xadd:nomk:exists")
+        self.assertEqual(self.cmd("XADD", key, "1-1", "f", "v"), b"1-1")
+        self.assertEqual(self.cmd("XADD", key, "NOMKSTREAM", "2-1", "f", "v"),
+                         b"2-1")
+        self.assertEqual(self.cmd("XADD", key, "MAXLEN", "10", "NOMKSTREAM",
+                                  "3-1", "f", "v"), b"3-1")
+        self.assertEqual(self.cmd("XLEN", key), 3)
+
+        string = self.key("xadd:nomk:str")
+        self.cmd("SET", string, "x")
+        with self.assertRaises(RedisError):
+            self.cmd("XADD", string, "NOMKSTREAM", "*", "f", "v")
+
+    def test_stream_xsetid_options(self):
+        key = self.key("xsetid")
+        self.cmd("XADD", key, "1-1", "f", "v")
+        self.assertEqual(self.cmd("XSETID", key, "5-5"), b"OK")
+        info = self.flat_map(self.cmd("XINFO", "STREAM", key))
+        self.assertEqual(info[b"last-generated-id"], b"5-5")
+        self.assertEqual(info[b"entries-added"], 1)
+        self.assertEqual(info[b"max-deleted-entry-id"], b"0-0")
+
+        self.assertEqual(self.cmd("XSETID", key, "9-9", "ENTRIESADDED", "100",
+                                  "MAXDELETEDID", "8-8"), b"OK")
+        info = self.flat_map(self.cmd("XINFO", "STREAM", key))
+        self.assertEqual(info[b"last-generated-id"], b"9-9")
+        self.assertEqual(info[b"entries-added"], 100)
+        self.assertEqual(info[b"max-deleted-entry-id"], b"8-8")
+
+        for args in (("0-9",),
+                     ("9-9", "ENTRIESADDED", "0"),
+                     ("9-9", "ENTRIESADDED", "-1"),
+                     ("9-9", "MAXDELETEDID", "10-10"),
+                     ("9-9", "BOGUS", "1"),
+                     ("not-an-id",)):
+            with self.assertRaises(RedisError):
+                self.cmd("XSETID", key, *args)
+        info = self.flat_map(self.cmd("XINFO", "STREAM", key))
+        self.assertEqual(info[b"last-generated-id"], b"9-9")
+        self.assertEqual(info[b"entries-added"], 100)
+        self.assertEqual(info[b"max-deleted-entry-id"], b"8-8")
+
+        with self.assertRaises(RedisError):
+            self.cmd("XSETID", self.key("xsetid:missing"), "1-1")
+
+    def test_stream_xgroup_createconsumer_and_pending_idle(self):
+        key = self.key("xgroup:consumer")
+        self.cmd("XADD", key, "1-1", "f", "v")
+        self.cmd("XADD", key, "2-1", "f", "v")
+        self.assertEqual(self.cmd("XGROUP", "CREATE", key, "g", "0"), b"OK")
+
+        self.assertEqual(self.cmd("XGROUP", "CREATECONSUMER", key, "g", "c1"), 1)
+        self.assertEqual(self.cmd("XGROUP", "CREATECONSUMER", key, "g", "c1"), 0)
+        consumers = self.cmd("XINFO", "CONSUMERS", key, "g")
+        self.assertEqual([self.flat_map(c)[b"name"] for c in consumers], [b"c1"])
+
+        with self.assertRaises(RedisError):
+            self.cmd("XGROUP", "CREATECONSUMER", key, "missing", "c1")
+        with self.assertRaises(RedisError):
+            self.cmd("XGROUP", "CREATECONSUMER", self.key("xgroup:missing"),
+                     "g", "c1")
+
+        read = self.cmd("XREADGROUP", "GROUP", "g", "c2", "COUNT", "2",
+                        "STREAMS", key, ">")
+        self.assertEqual(len(read[0][1]), 2)
+
+        # Backdate one pending entry so the IDLE filter can tell them apart.
+        old = self.now_ms() - 60000
+        self.assertEqual(self.cmd("XCLAIM", key, "g", "c2", "0", "1-1",
+                                  "TIME", old, "JUSTID"), [b"1-1"])
+
+        pending = self.cmd("XPENDING", key, "g", "IDLE", "30000", "-", "+", "10")
+        self.assertEqual([row[0] for row in pending], [b"1-1"])
+        pending = self.cmd("XPENDING", key, "g", "IDLE", "0", "-", "+", "10")
+        self.assertEqual([row[0] for row in pending], [b"1-1", b"2-1"])
+        pending = self.cmd("XPENDING", key, "g", "IDLE", "30000",
+                           "-", "+", "10", "c2")
+        self.assertEqual([row[0] for row in pending], [b"1-1"])
+        self.assertEqual(self.cmd("XPENDING", key, "g", "IDLE", "30000",
+                                  "-", "+", "10", "c1"), [])
+
+        with self.assertRaises(RedisError):
+            self.cmd("XPENDING", key, "g", "IDLE", "0", "-", "+")
+        with self.assertRaises(RedisError):
+            self.cmd("XPENDING", key, "g", "IDLE", "not-a-number",
+                     "-", "+", "10")
+
+    def test_stream_xautoclaim(self):
+        key = self.key("xautoclaim")
+        for ms in range(1, 6):
+            self.cmd("XADD", key, "%d-1" % ms, "f", ms)
+        self.assertEqual(self.cmd("XGROUP", "CREATE", key, "g", "0"), b"OK")
+        self.assertEqual(len(self.cmd("XREADGROUP", "GROUP", "g", "c1",
+                                      "COUNT", "5", "STREAMS", key, ">")[0][1]),
+                         5)
+
+        reply = self.cmd("XAUTOCLAIM", key, "g", "c2", "0", "0-0", "COUNT", "2")
+        self.assertEqual(len(reply), 3)
+        self.assertEqual(reply[0], b"3-1")
+        self.assertEqual([entry[0] for entry in reply[1]], [b"1-1", b"2-1"])
+        self.assertEqual(reply[1][0], [b"1-1", [b"f", b"1"]])
+        self.assertEqual(reply[2], [])
+
+        reply = self.cmd("XAUTOCLAIM", key, "g", "c2", "0", "3-1", "COUNT", "10")
+        self.assertEqual(reply[0], b"0-0")
+        self.assertEqual([entry[0] for entry in reply[1]],
+                         [b"3-1", b"4-1", b"5-1"])
+        pending = self.cmd("XPENDING", key, "g", "-", "+", "10")
+        self.assertEqual({row[1] for row in pending}, {b"c2"})
+
+        # JUSTID returns IDs only and does not bump the delivery counter.
+        before = {row[0]: row[3] for row in
+                  self.cmd("XPENDING", key, "g", "-", "+", "10")}
+        reply = self.cmd("XAUTOCLAIM", key, "g", "c3", "0", "0-0", "JUSTID")
+        self.assertEqual(reply[0], b"0-0")
+        self.assertEqual(reply[1], [b"1-1", b"2-1", b"3-1", b"4-1", b"5-1"])
+        self.assertEqual(reply[2], [])
+        after = {row[0]: row[3] for row in
+                 self.cmd("XPENDING", key, "g", "-", "+", "10")}
+        self.assertEqual(after, before)
+        self.assertEqual({row[1] for row in
+                          self.cmd("XPENDING", key, "g", "-", "+", "10")}, {b"c3"})
+
+        # PEL entries whose stream entry was deleted are dropped and reported.
+        self.assertEqual(self.cmd("XDEL", key, "1-1"), 1)
+        reply = self.cmd("XAUTOCLAIM", key, "g", "c4", "0", "0-0", "COUNT", "10")
+        self.assertEqual(reply[0], b"0-0")
+        self.assertEqual(reply[2], [b"1-1"])
+        pending = self.cmd("XPENDING", key, "g", "-", "+", "10")
+        self.assertNotIn(b"1-1", [row[0] for row in pending])
+        self.assertEqual({row[1] for row in pending}, {b"c4"})
+
+        # An exclusive start ID is honored.
+        reply = self.cmd("XAUTOCLAIM", key, "g", "c5", "0", "(2-1", "JUSTID")
+        self.assertEqual(reply[1], [b"3-1", b"4-1", b"5-1"])
+
+        for args in (("COUNT", "0"), ("COUNT", "not-a-number")):
+            with self.assertRaises(RedisError):
+                self.cmd("XAUTOCLAIM", key, "g", "c5", "0", "0-0", *args)
+        with self.assertRaises(RedisError):
+            self.cmd("XAUTOCLAIM", key, "g", "c5", "0", "bad-id")
+        with self.assertRaises(RedisError):
+            self.cmd("XAUTOCLAIM", key, "g", "c5", "0",
+                     "(18446744073709551615-18446744073709551615")
+        with self.assertRaises(RedisError):
+            self.cmd("XAUTOCLAIM", self.key("xautoclaim:missing"), "g", "c",
+                     "0", "0-0")
+        with self.assertRaises(RedisError):
+            self.cmd("XAUTOCLAIM", key, "missing", "c", "0", "0-0")
+
+    def test_stream_xinfo_full(self):
+        key = self.key("xinfo:full")
+        for ms in range(1, 6):
+            self.cmd("XADD", key, "%d-1" % ms, "f", ms)
+        self.cmd("XGROUP", "CREATE", key, "g", "0")
+        self.cmd("XREADGROUP", "GROUP", "g", "c1", "COUNT", "3",
+                 "STREAMS", key, ">")
+        self.assertEqual(self.cmd("XDEL", key, "1-1"), 1)
+
+        info = self.flat_map(self.cmd("XINFO", "STREAM", key))
+        self.assertEqual(info[b"length"], 4)
+        self.assertEqual(info[b"entries-added"], 5)
+        self.assertEqual(info[b"max-deleted-entry-id"], b"1-1")
+        self.assertEqual(info[b"recorded-first-entry-id"], b"2-1")
+        self.assertEqual(info[b"groups"], 1)
+        self.assertEqual(info[b"first-entry"], [b"2-1", [b"f", b"2"]])
+        self.assertEqual(info[b"last-entry"], [b"5-1", [b"f", b"5"]])
+        self.assertNotIn(b"entries", info)
+
+        full = self.flat_map(self.cmd("XINFO", "STREAM", key, "FULL", "COUNT", "2"))
+        self.assertEqual([entry[0] for entry in full[b"entries"]],
+                         [b"2-1", b"3-1"])
+        self.assertNotIn(b"first-entry", full)
+        self.assertEqual(len(full[b"groups"]), 1)
+        group = self.flat_map(full[b"groups"][0])
+        self.assertEqual(group[b"name"], b"g")
+        self.assertEqual(group[b"pel-count"], 3)
+        # COUNT also caps the pending entries lists (1-1 is still pending
+        # even though its stream entry was deleted).
+        self.assertEqual([row[0] for row in group[b"pending"]],
+                         [b"1-1", b"2-1"])
+        consumers = [self.flat_map(consumer) for consumer in group[b"consumers"]]
+        self.assertEqual([c[b"name"] for c in consumers], [b"c1"])
+        self.assertEqual(consumers[0][b"pel-count"], 3)
+        self.assertEqual(len(consumers[0][b"pending"]), 2)
+
+        # COUNT 0 means no limit, a negative COUNT falls back to the default.
+        full = self.flat_map(self.cmd("XINFO", "STREAM", key, "FULL", "COUNT", "0"))
+        self.assertEqual(len(full[b"entries"]), 4)
+        full = self.flat_map(self.cmd("XINFO", "STREAM", key, "FULL", "COUNT", "-1"))
+        self.assertEqual(len(full[b"entries"]), 4)
+
+        with self.assertRaises(RedisError):
+            self.cmd("XINFO", "STREAM", key, "BOGUS")
+        with self.assertRaises(RedisError):
+            self.cmd("XINFO", "STREAM", key, "FULL", "COUNT")
+
+    def test_stream_aof_noack_consumer(self):
+        if self.server is None:
+            self.skipTest("AOF replay test requires --server")
+        key = self.key("stream:aof:noack")
+        self.cmd("XADD", key, "1-1", "f", "v")
+        self.assertEqual(self.cmd("XGROUP", "CREATE", key, "g", "0"), b"OK")
+        self.assertEqual(len(self.cmd("XREADGROUP", "GROUP", "g", "c1",
+                                      "NOACK", "STREAMS", key, ">")[0][1]), 1)
+        self.assertEqual(self.cmd("XPENDING", key, "g"), [0, None, None, None])
+        self.assertEqual([self.flat_map(consumer)[b"name"] for consumer in
+                          self.cmd("XINFO", "CONSUMERS", key, "g")], [b"c1"])
+
+        # The consumer has no PEL entry, so only a propagated
+        # XGROUP CREATECONSUMER can recreate it when the AOF is replayed.
+        self.restart()
+        self.assertEqual([self.flat_map(consumer)[b"name"] for consumer in
+                          self.cmd("XINFO", "CONSUMERS", key, "g")], [b"c1"])
+
+    def test_stream_aof_rewrite_counters(self):
+        if self.server is None:
+            self.skipTest("AOF rewrite test requires --server")
+        key = self.key("stream:aof:rewrite")
+        for ms in range(1, 4):
+            self.cmd("XADD", key, "%d-1" % ms, "f", ms)
+        self.assertEqual(self.cmd("XDEL", key, "1-1"), 1)
+        self.assertEqual(self.cmd("XSETID", key, "9-9", "ENTRIESADDED", "42",
+                                  "MAXDELETEDID", "1-1"), b"OK")
+
+        self.assertEqual(self.cmd("BGREWRITEAOF"), b"Background append only file rewriting started")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            info = self.cmd("INFO", "persistence")
+            if (b"aof_rewrite_in_progress:0" in info and
+                    b"aof_rewrite_scheduled:0" in info):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("AOF rewrite did not finish")
+
+        self.restart()
+        info = self.flat_map(self.cmd("XINFO", "STREAM", key))
+        self.assertEqual(info[b"length"], 2)
+        self.assertEqual(info[b"last-generated-id"], b"9-9")
+        self.assertEqual(info[b"entries-added"], 42)
+        self.assertEqual(info[b"max-deleted-entry-id"], b"1-1")
 
 
 def parse_args(argv):

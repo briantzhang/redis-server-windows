@@ -1782,6 +1782,11 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, robj *key) {
         /* Load the last entry ID. */
         s->last_id.ms = rdbLoadLen(rdb,NULL);
         s->last_id.seq = rdbLoadLen(rdb,NULL);
+        /* The legacy stream RDB format does not store the counters added in
+         * 6.2, so after a snapshot reload the number of added entries is
+         * the current length and no deleted entry ID is remembered. AOF
+         * replay restores both via XSETID. */
+        s->entries_added = s->length;
 
         /* Consumer groups loading */
         size_t cgroups_count = rdbLoadLen(rdb,NULL);

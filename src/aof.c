@@ -1244,11 +1244,16 @@ int rewriteStreamObject(rio *r, robj *key, robj *o) {
     }
 
     /* Append XSETID after XADD, make sure lastid is correct,
-     * in case of XDEL lastid. */
-    if (rioWriteBulkCount(r,'*',3) == 0) return 0;
+     * in case of XDEL lastid. Also preserve the entry counters that the
+     * legacy stream RDB format cannot store. */
+    if (rioWriteBulkCount(r,'*',7) == 0) return 0;
     if (rioWriteBulkString(r,"XSETID",6) == 0) return 0;
     if (rioWriteBulkObject(r,key) == 0) return 0;
     if (rioWriteBulkStreamID(r,&s->last_id) == 0) return 0;
+    if (rioWriteBulkString(r,"ENTRIESADDED",12) == 0) return 0;
+    if (rioWriteBulkLongLong(r,s->entries_added) == 0) return 0;
+    if (rioWriteBulkString(r,"MAXDELETEDID",12) == 0) return 0;
+    if (rioWriteBulkStreamID(r,&s->max_deleted_entry_id) == 0) return 0;
 
 
     /* Create all the stream consumer groups. */

@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp5
+# Redis for Windows 5.0.14.1-bp6
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp5`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp6`。
 
 ## 这个版本新增了什么
 
@@ -40,6 +40,13 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `CLIENT NO-EVICT on\|off` | 7.0 | 记录“不参与客户端驱逐”的标志；本版没有客户端驱逐，见范围说明 |
 | `CLIENT NO-TOUCH on\|off` | 7.2 | 该连接访问键时不更新 LRU/LFU；`TOUCH` 仍会更新 |
 | `ACL SETUSER/DELUSER/LIST/WHOAMI`、`AUTH username password` | 6.0 | 用户、口令、命令分类与键通配符；见下方范围说明 |
+| `XADD ... [NOMKSTREAM] [MAXLEN\|MINID [~\|=] threshold [LIMIT n]]` | 6.2 | 追加时按长度或最小 ID 裁剪，支持近似裁剪与工作量上限；`NOMKSTREAM` 不自动建键 |
+| `XTRIM key MAXLEN\|MINID [~\|=] threshold [LIMIT n]` | 6.2 | 按长度或最小 ID 裁剪；`LIMIT` 只能与 `~` 一起使用 |
+| `XGROUP CREATECONSUMER key group consumer` | 6.2 | 显式创建消费者；`XREADGROUP ... NOACK` 创建的消费者也会同步到 AOF 和副本 |
+| `XSETID key id [ENTRIESADDED n] [MAXDELETEDID id]` | 6.2 / 7.0 | 校正流计数；AOF 重写会保留这些计数 |
+| `XPENDING key group [IDLE ms] start end count [consumer]` | 6.2 | 只返回空闲时间达到阈值的待处理消息 |
+| `XAUTOCLAIM key group consumer min-idle start [COUNT n] [JUSTID]` | 6.2 | 批量转移待处理消息，返回游标，并清理流条目已删除的 PEL 记录 |
+| `XINFO STREAM key [FULL [COUNT n]]` | 6.2 / 7.0 | `FULL` 输出条目、组、消费者与 PEL；摘要新增 `max-deleted-entry-id`、`entries-added`、`recorded-first-entry-id` |
 
 过期时间在秒数乘 1000、相对时间加当前时间之前做有符号 64 位溢出检查，非法值报错且不改动数据。
 
@@ -58,7 +65,7 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 - 多段 AOF（`appenddirname`）、新版 RDB 格式
 - 集群、Redis 8 的查询引擎
 
-持久化仍是底座的单文件 AOF 和原有 RDB。带 TTL 的写入在 AOF 里记成普通 `SET` 加一条绝对时间的 `PEXPIREAT`，重放时不会把相对过期时间再算一遍。
+持久化仍是底座的单文件 AOF 和原有 RDB。流的 RDB 格式没有升级，`entries-added` 与 `max-deleted-entry-id` 不写入 RDB 快照：重启后前者按当前长度恢复、后者归零；AOF（含重写）会保留这两个计数。带 TTL 的写入在 AOF 里记成普通 `SET` 加一条绝对时间的 `PEXPIREAT`，重放时不会把相对过期时间再算一遍。
 
 ## 构建
 
@@ -74,13 +81,13 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 
 ## 验证
 
-在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，33 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
+在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，41 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
 
 ```bash
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮新增 LMPOP/BLMPOP、ZMPOP/BZMPOP 和 CLIENT 标志用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮新增流命令用例：XADD/XTRIM 的 MINID 与 LIMIT、NOMKSTREAM、XGROUP CREATECONSUMER、XPENDING IDLE、XAUTOCLAIM、XSETID 计数选项、XINFO STREAM FULL，以及 AOF 重放和重写后的计数与 NOACK 消费者。
 
 这轮验证不等于已合入上游全部安全补丁，也没有做生产压力测试。
 
