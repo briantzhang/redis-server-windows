@@ -1003,6 +1003,104 @@ class BackportRegression(unittest.TestCase):
             self.cmd("LMOVE", "lplain", "ldst", "LEFT", "RIGHT")
         self.cmd("DEL", "lpos", "lsrc", "ldst", "lrot", "lplain")
 
+    def test_zadd_gt_lt_and_random_members(self):
+        self.cmd("DEL", "zgt", "zplain", "hr", "hrbig", "zr", "zrbig")
+        self.cmd("ZADD", "zgt", "10", "a", "20", "b")
+        # GT/LT never create a missing element differently: new elements are
+        # always added, the option only filters updates of existing ones.
+        self.assertEqual(self.cmd("ZADD", "zgt", "GT", "30", "new"), 1)
+        self.assertEqual(self.cmd("ZADD", "zgt", "LT", "1", "new2"), 1)
+        self.assertEqual(self.cmd("ZADD", "zgt", "GT", "5", "a"), 0)
+        self.assertEqual(self.cmd("ZSCORE", "zgt", "a"), b"10")
+        self.assertEqual(self.cmd("ZADD", "zgt", "GT", "CH", "15", "a"), 1)
+        self.assertEqual(self.cmd("ZSCORE", "zgt", "a"), b"15")
+        self.assertEqual(self.cmd("ZADD", "zgt", "GT", "CH", "15", "a"), 0)
+        self.assertEqual(self.cmd("ZADD", "zgt", "LT", "CH", "20", "a"), 0)
+        self.assertEqual(self.cmd("ZSCORE", "zgt", "a"), b"15")
+        self.assertEqual(self.cmd("ZADD", "zgt", "LT", "CH", "5", "a"), 1)
+        self.assertEqual(self.cmd("ZSCORE", "zgt", "a"), b"5")
+        # INCR returns nil when GT/LT rejects the resulting score.
+        self.assertIsNone(self.cmd("ZADD", "zgt", "INCR", "GT", "-1", "a"))
+        self.assertEqual(self.cmd("ZSCORE", "zgt", "a"), b"5")
+        self.assertEqual(self.cmd("ZADD", "zgt", "INCR", "GT", "10", "a"),
+                         b"15")
+        with self.assertRaises(RedisError):
+            self.cmd("ZADD", "zgt", "GT", "LT", "1", "a")
+        with self.assertRaises(RedisError):
+            self.cmd("ZADD", "zgt", "GT", "NX", "1", "a")
+        with self.assertRaises(RedisError):
+            self.cmd("ZADD", "zgt", "LT", "NX", "1", "a")
+        self.cmd("SET", "zplain", "x")
+        with self.assertRaises(RedisError):
+            self.cmd("ZADD", "zplain", "GT", "1", "a")
+
+        # HRANDFIELD: single, unique count, repetition and WITHVALUES.
+        self.cmd("HSET", "hr", "f1", "v1", "f2", "v2", "f3", "v3")
+        self.assertIn(self.cmd("HRANDFIELD", "hr"), (b"f1", b"f2", b"f3"))
+        sampled = self.cmd("HRANDFIELD", "hr", "2")
+        self.assertEqual(len(sampled), 2)
+        self.assertEqual(len(set(sampled)), 2)
+        pairs = self.cmd("HRANDFIELD", "hr", "2", "WITHVALUES")
+        self.assertEqual(len(pairs), 4)
+        self.assertEqual(len(set(pairs[0::2])), 2)
+        for field, value in zip(pairs[0::2], pairs[1::2]):
+            self.assertEqual(value, b"v" + field[1:])
+        self.assertEqual(len(self.cmd("HRANDFIELD", "hr", "-5")), 5)
+        self.assertEqual(self.cmd("HRANDFIELD", "hr", "0"), [])
+        self.assertCountEqual(self.cmd("HRANDFIELD", "hr", "10"),
+                              [b"f1", b"f2", b"f3"])
+        self.assertEqual(len(self.cmd("HRANDFIELD", "hr", "10", "WITHVALUES")), 6)
+        self.assertIsNone(self.cmd("HRANDFIELD", "missing"))
+        self.assertEqual(self.cmd("HRANDFIELD", "missing", "3"), [])
+        with self.assertRaises(RedisError):
+            self.cmd("HRANDFIELD", "hr", "1", "WITHSCORES")
+        with self.assertRaises(RedisError):
+            self.cmd("HRANDFIELD", "zplain")
+
+        # Hashes above hash-max-ziplist-entries use the hash table encoding.
+        for i in range(600):
+            self.cmd("HSET", "hrbig", "field:%d" % i, "value:%d" % i)
+        big = self.cmd("HRANDFIELD", "hrbig", "50")
+        self.assertEqual(len(big), 50)
+        self.assertEqual(len(set(big)), 50)
+        bigpairs = self.cmd("HRANDFIELD", "hrbig", "50", "WITHVALUES")
+        for field, value in zip(bigpairs[0::2], bigpairs[1::2]):
+            self.assertEqual(value, field.replace(b"field:", b"value:", 1))
+
+        # ZRANDMEMBER: same count semantics plus WITHSCORES.
+        self.cmd("ZADD", "zr", "1", "a", "2", "b", "3", "c")
+        self.assertIn(self.cmd("ZRANDMEMBER", "zr"), (b"a", b"b", b"c"))
+        sampled = self.cmd("ZRANDMEMBER", "zr", "2")
+        self.assertEqual(len(sampled), 2)
+        self.assertEqual(len(set(sampled)), 2)
+        scored = self.cmd("ZRANDMEMBER", "zr", "2", "WITHSCORES")
+        self.assertEqual(len(scored), 4)
+        expected = {b"a": b"1", b"b": b"2", b"c": b"3"}
+        for member, score in zip(scored[0::2], scored[1::2]):
+            self.assertEqual(score, expected[member])
+        self.assertEqual(len(self.cmd("ZRANDMEMBER", "zr", "-4")), 4)
+        self.assertEqual(self.cmd("ZRANDMEMBER", "zr", "0"), [])
+        self.assertCountEqual(self.cmd("ZRANDMEMBER", "zr", "9"),
+                              [b"a", b"b", b"c"])
+        self.assertEqual(len(self.cmd("ZRANDMEMBER", "zr", "9", "WITHSCORES")), 6)
+        self.assertIsNone(self.cmd("ZRANDMEMBER", "missing"))
+        self.assertEqual(self.cmd("ZRANDMEMBER", "missing", "2"), [])
+        with self.assertRaises(RedisError):
+            self.cmd("ZRANDMEMBER", "zr", "1", "WITHVALUES")
+        with self.assertRaises(RedisError):
+            self.cmd("ZRANDMEMBER", "zplain")
+
+        # Sorted sets above zset-max-ziplist-entries use the skiplist encoding.
+        for i in range(200):
+            self.cmd("ZADD", "zrbig", str(i), "member:%d" % i)
+        big = self.cmd("ZRANDMEMBER", "zrbig", "50", "WITHSCORES")
+        self.assertEqual(len(big), 100)
+        members = big[0::2]
+        self.assertEqual(len(set(members)), 50)
+        for member, score in zip(members, big[1::2]):
+            self.assertEqual(score, member.split(b":")[1])
+        self.cmd("DEL", "zgt", "zplain", "hr", "hrbig", "zr", "zrbig")
+
     def test_copy_and_reset(self):
         self.cmd("DEL", "src", "dst")
         self.cmd("SET", "src", "value", "EX", "100")

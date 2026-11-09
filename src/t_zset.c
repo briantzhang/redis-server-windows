@@ -1323,6 +1323,8 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
     int incr = (*flags & ZADD_INCR) != 0;
     int nx = (*flags & ZADD_NX) != 0;
     int xx = (*flags & ZADD_XX) != 0;
+    int gt = (*flags & ZADD_GT) != 0;
+    int lt = (*flags & ZADD_LT) != 0;
     *flags = 0; /* We'll return our response flags. */
     double curscore;
 
@@ -1352,6 +1354,14 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
                 }
                 if (newscore) *newscore = score;
             }
+
+            /* GT/LT only update an existing element when the new score is
+             * strictly greater or lower than the current one. */
+            if ((lt && score >= curscore) || (gt && score <= curscore)) {
+                *flags |= ZADD_NOP;
+                return 1;
+            }
+            if (newscore) *newscore = score;
 
             /* Remove and re-insert when score changed. */
             if (score != curscore) {
@@ -1405,6 +1415,14 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
                 }
                 if (newscore) *newscore = score;
             }
+
+            /* GT/LT only update an existing element when the new score is
+             * strictly greater or lower than the current one. */
+            if ((lt && score >= curscore) || (gt && score <= curscore)) {
+                *flags |= ZADD_NOP;
+                return 1;
+            }
+            if (newscore) *newscore = score;
 
             /* Remove and re-insert when score changes. */
             if (score != curscore) {
@@ -1569,6 +1587,8 @@ void zaddGenericCommand(client *c, int flags) {
         else if (!strcasecmp(opt,"xx")) flags |= ZADD_XX;
         else if (!strcasecmp(opt,"ch")) flags |= ZADD_CH;
         else if (!strcasecmp(opt,"incr")) flags |= ZADD_INCR;
+        else if (!strcasecmp(opt,"gt")) flags |= ZADD_GT;
+        else if (!strcasecmp(opt,"lt")) flags |= ZADD_LT;
         else break;
         scoreidx++;
     }
@@ -1577,6 +1597,8 @@ void zaddGenericCommand(client *c, int flags) {
     int incr = (flags & ZADD_INCR) != 0;
     int nx = (flags & ZADD_NX) != 0;
     int xx = (flags & ZADD_XX) != 0;
+    int gt = (flags & ZADD_GT) != 0;
+    int lt = (flags & ZADD_LT) != 0;
     int ch = (flags & ZADD_CH) != 0;
 
     /* After the options, we expect to have an even number of args, since
@@ -1592,6 +1614,12 @@ void zaddGenericCommand(client *c, int flags) {
     if (nx && xx) {
         addReplyError(c,
             "XX and NX options at the same time are not compatible");
+        return;
+    }
+
+    if ((gt && nx) || (lt && nx) || (gt && lt)) {
+        addReplyError(c,
+            "GT, LT, and/or NX options at the same time are not compatible");
         return;
     }
 
@@ -3287,6 +3315,165 @@ void zmscoreCommand(client *c) {
         else
             addReplyDouble(c,score);
     }
+}
+
+/* Return a random member (and optionally its score) from a sorted set object.
+ * The returned member is a newly allocated SDS string owned by the caller. */
+static sds zrandmemberRandomEntry(robj *o, double *score) {
+    if (o->encoding == OBJ_ENCODING_ZIPLIST) {
+        unsigned char *zl = o->ptr;
+        PORT_ULONG idx = random() % zsetLength(o);
+        unsigned char *eptr = ziplistIndex(zl, idx*2);
+        unsigned char *sptr = ziplistNext(zl, eptr);
+        unsigned char *str;
+        unsigned int len;
+        PORT_LONGLONG ll;
+        sds ele;
+
+        ziplistGet(eptr, &str, &len, &ll);
+        ele = str ? sdsnewlen(str, len) : sdsfromlonglong(ll);
+        if (score) *score = zzlGetScore(sptr);
+        return ele;
+    } else if (o->encoding == OBJ_ENCODING_SKIPLIST) {
+        zset *zs = o->ptr;
+        dictEntry *de = dictGetRandomKey(zs->dict);
+        sds ele = sdsdup(dictGetKey(de));
+        if (score) *score = *(double*)dictGetVal(de);
+        return ele;
+    } else {
+        serverPanic("Unknown sorted set encoding");
+    }
+    return NULL;
+}
+
+/* Append every member of the sorted set, in rank order, to the reply. */
+static void zrandmemberReplyAll(client *c, robj *o, int withscores) {
+    if (o->encoding == OBJ_ENCODING_ZIPLIST) {
+        unsigned char *zl = o->ptr;
+        unsigned char *eptr = ziplistIndex(zl, 0);
+        while (eptr != NULL) {
+            unsigned char *sptr = ziplistNext(zl, eptr);
+            unsigned char *str;
+            unsigned int len;
+            PORT_LONGLONG ll;
+
+            ziplistGet(eptr, &str, &len, &ll);
+            if (str) addReplyBulkCBuffer(c, str, len);
+            else addReplyBulkLongLong(c, ll);
+            if (withscores) addReplyDouble(c, zzlGetScore(sptr));
+            eptr = ziplistNext(zl, sptr);
+        }
+    } else {
+        zset *zs = o->ptr;
+        zskiplistNode *ln = zs->zsl->header->level[0].forward;
+        while (ln != NULL) {
+            addReplyBulkCBuffer(c, ln->ele, sdslen(ln->ele));
+            if (withscores) addReplyDouble(c, ln->score);
+            ln = ln->level[0].forward;
+        }
+    }
+}
+
+static void zrandmemberWithCountCommand(client *c, PORT_LONG l, int withscores) {
+    unsigned long count, size;
+    int uniq = 1;
+    robj *o;
+
+    o = lookupKeyRead(c->db, c->argv[1]);
+    if (o == NULL) {
+        addReplyMultiBulkLen(c, 0);
+        return;
+    }
+    if (checkType(c, o, OBJ_ZSET)) return;
+
+    size = zsetLength(o);
+    if (l >= 0) {
+        count = (unsigned long) l;
+    } else {
+        count = (unsigned long)(-(l+1)) + 1;
+        uniq = 0;
+    }
+
+    if (count == 0) {
+        addReplyMultiBulkLen(c, 0);
+        return;
+    }
+
+    /* Negative count: sample with repetition. */
+    if (!uniq) {
+        addReplyMultiBulkLen(c, (PORT_LONG)(count * (withscores ? 2 : 1)));
+        while (count--) {
+            double score = 0;
+            sds ele = zrandmemberRandomEntry(o, withscores ? &score : NULL);
+            addReplyBulkCBuffer(c, ele, sdslen(ele));
+            if (withscores) addReplyDouble(c, score);
+            sdsfree(ele);
+        }
+        return;
+    }
+
+    /* Positive count greater than or equal to the sorted set size: return all. */
+    if (count >= size) {
+        addReplyMultiBulkLen(c, (PORT_LONG)(size * (withscores ? 2 : 1)));
+        zrandmemberReplyAll(c, o, withscores);
+        return;
+    }
+
+    /* Positive count smaller than the sorted set size: collect unique members. */
+    {
+        dict *seen = dictCreate(&setDictType, NULL);
+        dictIterator *di;
+        dictEntry *de;
+
+        addReplyMultiBulkLen(c, (PORT_LONG)(count * (withscores ? 2 : 1)));
+        while (dictSize(seen) < count) {
+            sds ele = zrandmemberRandomEntry(o, NULL);
+            if (dictAdd(seen, ele, NULL) != DICT_OK) sdsfree(ele);
+        }
+        di = dictGetIterator(seen);
+        while ((de = dictNext(di)) != NULL) {
+            sds ele = dictGetKey(de);
+            addReplyBulkCBuffer(c, ele, sdslen(ele));
+            if (withscores) {
+                double score;
+                serverAssert(zsetScore(o, ele, &score) == C_OK);
+                addReplyDouble(c, score);
+            }
+        }
+        dictReleaseIterator(di);
+        dictRelease(seen);
+    }
+}
+
+void zrandmemberCommand(client *c) {
+    PORT_LONG l;
+    int withscores = 0;
+    robj *o;
+    sds ele;
+
+    if (c->argc >= 3) {
+        if (getLongFromObjectOrReply(c, c->argv[2], &l, NULL) != C_OK) return;
+        if (c->argc > 4 || (c->argc == 4 && strcasecmp(c->argv[3]->ptr, "withscores"))) {
+            addReply(c, shared.syntaxerr);
+            return;
+        } else if (c->argc == 4) {
+            withscores = 1;
+        }
+        zrandmemberWithCountCommand(c, l, withscores);
+        return;
+    }
+
+    if (c->argc != 2) {
+        addReply(c, shared.syntaxerr);
+        return;
+    }
+
+    if ((o = lookupKeyReadOrReply(c, c->argv[1], shared.nullbulk)) == NULL ||
+        checkType(c, o, OBJ_ZSET)) return;
+
+    ele = zrandmemberRandomEntry(o, NULL);
+    addReplyBulkCBuffer(c, ele, sdslen(ele));
+    sdsfree(ele);
 }
 
 void zrankGenericCommand(client *c, int reverse) {

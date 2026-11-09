@@ -8,7 +8,7 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '5.0.14.1-bp2'
+VERSION = '5.0.14.1-bp3'
 NAME = 'Redis-x64-' + VERSION
 DIST = ROOT / 'dist'
 PKG = DIST / NAME
@@ -91,7 +91,7 @@ if not exist data mkdir data
 "%~dp0redis-server.exe" "%~dp0redis.windows.conf" --dir "%~dp0data"
 popd
 ''', encoding='ascii', newline='\r\n')
-    (PKG/'README.md').write_text('''# Redis Windows 5.0.14.1-bp2
+    (PKG/'README.md').write_text('''# Redis Windows 5.0.14.1-bp3
 
 Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；关闭窗口或 Ctrl+C 停止。
 默认监听 127.0.0.1:6379，AOF 每秒同步，数据保存在同目录 data/。
@@ -105,6 +105,8 @@ Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；
   redis-cli.exe ZUNION 2 z1 z2 WITHSCORES
   redis-cli.exe COPY src dst REPLACE
   redis-cli.exe ACL SETUSER reader on ">secret" "~cache:*" -@all +get +ping
+  redis-cli.exe HRANDFIELD h 2 WITHVALUES
+  redis-cli.exe ZRANDMEMBER z 2 WITHSCORES
 
 本包不自动创建 Windows 服务、不开防火墙、不覆盖已有数据。部署为服务时可使用底座原有
 --service-install 功能，并明确提供配置文件绝对路径及 --dir 数据目录绝对路径；先在目标机验证。
