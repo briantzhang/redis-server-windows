@@ -1,6 +1,6 @@
 # 运维手册
 
-适用版本：Redis for Windows `5.0.14.1-bp3`，仅 Windows x64，单机、非集群。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
+适用版本：Redis for Windows `5.0.14.1-bp4`，仅 Windows x64，单机、非集群。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
 
 本文只覆盖这一个可执行文件的日常操作。它不包含 TLS、多段 AOF 和集群，那些配置项写进 `redis.conf` 也不会生效，启动时会报未知配置。ACL 已按 Redis 6 的范围实现，见第 3 节。
 
@@ -38,7 +38,7 @@
 .\redis-server.exe --version
 ```
 
-应看到 `v=5.0.14.1-bp3`。如果不是这个版本号，说明运行的不是这份回移。
+应看到 `v=5.0.14.1-bp4`。如果不是这个版本号，说明运行的不是这份回移。
 
 另开一个窗口检查存活：
 
@@ -185,6 +185,29 @@ ZRANDMEMBER board -5
 
 `GT`/`LT` 只约束已有成员的分数更新，新成员照常加入；与 `NX` 或彼此同时出现会报错。`INCR` 在条件不满足时返回空。`HRANDFIELD`/`ZRANDMEMBER` 的 `count` 为正数时返回不重复的元素，超过集合大小时返回全部；为负数时允许重复，绝对值是返回个数；不带 `count` 时返回单个元素。
 
+批量弹出与阻塞移动：
+
+```text
+LPOP queue 10
+RPOP queue 10
+BLMOVE queue processing LEFT RIGHT 5
+BLMOVE queue processing LEFT RIGHT 0.5
+```
+
+`LPOP`/`RPOP` 带 `count` 时返回数组，列表不足时返回剩余的全部元素，清空后键被删除；不带 `count` 时仍是原来的单元素回复。`BLMOVE` 在源列表为空时阻塞，超时返回空，超时参数支持小数秒。
+
+统一范围查询与范围落库：
+
+```text
+ZRANGE board 0 -1 WITHSCORES
+ZRANGE board -inf +inf BYSCORE LIMIT 0 10
+ZRANGE board 100 50 BYSCORE REV
+ZRANGE board [a [z BYLEX
+ZRANGESTORE top10 board 0 9 REV
+```
+
+`BYSCORE` 的区间支持 `(` 开区间和 `-inf`/`+inf`，`BYLEX` 使用 `[`、`(`、`-`、`+`；`LIMIT` 只能和 `BYSCORE`/`BYLEX` 一起用，`WITHSCORES` 不能和 `BYLEX` 一起用。`ZRANGESTORE` 没有 `WITHSCORES`，结果为空时会删除目标键并返回 0。原来的 `ZRANGEBYSCORE`、`ZREVRANGEBYLEX` 等命令保持不变，内部走同一套实现。
+
 原子取出旧值并写入：
 
 ```text
@@ -290,7 +313,7 @@ BGREWRITEAOF
 
 等 `INFO persistence` 里两次后台任务的状态都变成 `ok`，再复制 `dir` 下的 `dump.rdb` 和 `appendonly.aof`。复制过程中不要 `SHUTDOWN`，也不要再手动触发保存。
 
-备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp3-20261106.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
+备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp4-20261109.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
 
 ## 7. 排查
 

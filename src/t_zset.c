@@ -1730,9 +1730,9 @@ void zremCommand(client *c) {
 }
 
 /* Implements ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZREMRANGEBYLEX commands. */
-#define ZRANGE_RANK 0
-#define ZRANGE_SCORE 1
-#define ZRANGE_LEX 2
+#define ZRANGE_TYPE_RANK 0
+#define ZRANGE_TYPE_SCORE 1
+#define ZRANGE_TYPE_LEX 2
 void zremrangeGenericCommand(client *c, int rangetype) {
     robj *key = c->argv[1];
     robj *zobj;
@@ -1743,16 +1743,16 @@ void zremrangeGenericCommand(client *c, int rangetype) {
     PORT_LONG start, end, llen;
 
     /* Step 1: Parse the range. */
-    if (rangetype == ZRANGE_RANK) {
+    if (rangetype == ZRANGE_TYPE_RANK) {
         if ((getLongFromObjectOrReply(c,c->argv[2],&start,NULL) != C_OK) ||
             (getLongFromObjectOrReply(c,c->argv[3],&end,NULL) != C_OK))
             return;
-    } else if (rangetype == ZRANGE_SCORE) {
+    } else if (rangetype == ZRANGE_TYPE_SCORE) {
         if (zslParseRange(c->argv[2],c->argv[3],&range) != C_OK) {
             addReplyError(c,"min or max is not a float");
             return;
         }
-    } else if (rangetype == ZRANGE_LEX) {
+    } else if (rangetype == ZRANGE_TYPE_LEX) {
         if (zslParseLexRange(c->argv[2],c->argv[3],&lexrange) != C_OK) {
             addReplyError(c,"min or max not valid string range item");
             return;
@@ -1763,7 +1763,7 @@ void zremrangeGenericCommand(client *c, int rangetype) {
     if ((zobj = lookupKeyWriteOrReply(c,key,shared.czero)) == NULL ||
         checkType(c,zobj,OBJ_ZSET)) goto cleanup;
 
-    if (rangetype == ZRANGE_RANK) {
+    if (rangetype == ZRANGE_TYPE_RANK) {
         /* Sanitize indexes. */
         llen = zsetLength(zobj);
         if (start < 0) start = llen+start;
@@ -1782,13 +1782,13 @@ void zremrangeGenericCommand(client *c, int rangetype) {
     /* Step 3: Perform the range deletion operation. */
     if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         switch(rangetype) {
-        case ZRANGE_RANK:
+        case ZRANGE_TYPE_RANK:
             zobj->ptr = zzlDeleteRangeByRank(zobj->ptr,(int)start+1,(int)end+1,&deleted);   WIN_PORT_FIX /* cast (int), cast (int) */
             break;
-        case ZRANGE_SCORE:
+        case ZRANGE_TYPE_SCORE:
             zobj->ptr = zzlDeleteRangeByScore(zobj->ptr,&range,&deleted);
             break;
-        case ZRANGE_LEX:
+        case ZRANGE_TYPE_LEX:
             zobj->ptr = zzlDeleteRangeByLex(zobj->ptr,&lexrange,&deleted);
             break;
         }
@@ -1799,13 +1799,13 @@ void zremrangeGenericCommand(client *c, int rangetype) {
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
         switch(rangetype) {
-        case ZRANGE_RANK:
+        case ZRANGE_TYPE_RANK:
             deleted = zslDeleteRangeByRank(zs->zsl,(int)start+1,(int)end+1,zs->dict);   WIN_PORT_FIX /* cast (int), cast (int) */
             break;
-        case ZRANGE_SCORE:
+        case ZRANGE_TYPE_SCORE:
             deleted = zslDeleteRangeByScore(zs->zsl,&range,zs->dict);
             break;
-        case ZRANGE_LEX:
+        case ZRANGE_TYPE_LEX:
             deleted = zslDeleteRangeByLex(zs->zsl,&lexrange,zs->dict);
             break;
         }
@@ -1830,19 +1830,19 @@ void zremrangeGenericCommand(client *c, int rangetype) {
     addReplyLongLong(c,deleted);
 
 cleanup:
-    if (rangetype == ZRANGE_LEX) zslFreeLexRange(&lexrange);
+    if (rangetype == ZRANGE_TYPE_LEX) zslFreeLexRange(&lexrange);
 }
 
 void zremrangebyrankCommand(client *c) {
-    zremrangeGenericCommand(c,ZRANGE_RANK);
+    zremrangeGenericCommand(c,ZRANGE_TYPE_RANK);
 }
 
 void zremrangebyscoreCommand(client *c) {
-    zremrangeGenericCommand(c,ZRANGE_SCORE);
+    zremrangeGenericCommand(c,ZRANGE_TYPE_SCORE);
 }
 
 void zremrangebylexCommand(client *c) {
-    zremrangeGenericCommand(c,ZRANGE_LEX);
+    zremrangeGenericCommand(c,ZRANGE_TYPE_LEX);
 }
 
 typedef struct {
@@ -2624,45 +2624,116 @@ void zintercardCommand(client *c) {
     addReplyLongLong(c,card);
 }
 
-void zrangeGenericCommand(client *c, int reverse) {
-    robj *key = c->argv[1];
-    robj *zobj;
-    int withscores = 0;
-    PORT_LONG start;
-    PORT_LONG end;
-    PORT_LONG llen;
+/* -------------------------------------------------------------------------
+ * Unified ZRANGE / ZRANGESTORE (Redis 6.2)
+ *
+ * ZRANGE key start stop [BYSCORE|BYLEX] [REV] [LIMIT offset count] [WITHSCORES]
+ * ZRANGESTORE dst src start stop [BYSCORE|BYLEX] [REV] [LIMIT offset count]
+ *
+ * The legacy Z[REV]RANGE, Z[REV]RANGEBYSCORE and Z[REV]RANGEBYLEX commands are
+ * thin wrappers around the same parser, as in Redis 6.2.
+ * ------------------------------------------------------------------------- */
+
+#define ZRANGE_KIND_AUTO 0
+#define ZRANGE_KIND_RANK 1
+#define ZRANGE_KIND_SCORE 2
+#define ZRANGE_KIND_LEX 3
+typedef int zrange_type;
+
+#define ZRANGE_DIRECTION_AUTO 0
+#define ZRANGE_DIRECTION_FORWARD 1
+#define ZRANGE_DIRECTION_REVERSE 2
+typedef int zrange_direction;
+
+/* Where a range traversal sends its elements: a client reply or a new zset. */
+typedef struct zrangeResult {
+    client *c;
+    int store;              /* Non-zero when building a destination zset. */
+    int withscores;         /* Emit scores in client replies. */
+    robj *dstobj;           /* Destination zset when store is set. */
+    PORT_LONG count;        /* Number of members emitted. */
+    void *replylen;         /* Deferred multi-bulk length for replies. */
+} zrangeResult;
+
+static void zrangeResultInit(zrangeResult *r, client *c, int store,
+                             int withscores) {
+    r->c = c;
+    r->store = store;
+    r->withscores = withscores;
+    r->dstobj = NULL;
+    r->count = 0;
+    r->replylen = NULL;
+    if (store) {
+        r->dstobj = createZsetZiplistObject();
+    } else {
+        r->replylen = addDeferredMultiBulkLength(c);
+    }
+}
+
+static void zrangeEmitCBuffer(zrangeResult *r, const void *p, size_t len,
+                              double score) {
+    if (r->store) {
+        sds ele = sdsnewlen(p,len);
+        int flags = ZADD_NONE;
+        double newscore;
+        serverAssert(zsetAdd(r->dstobj,score,ele,&flags,&newscore));
+        sdsfree(ele);
+    } else {
+        addReplyBulkCBuffer(r->c,(char*)p,len);
+        if (r->withscores) addReplyDouble(r->c,score);
+    }
+    r->count++;
+}
+
+static void zrangeEmitLongLong(zrangeResult *r, PORT_LONGLONG ll, double score) {
+    if (r->store) {
+        sds ele = sdsfromlonglong(ll);
+        int flags = ZADD_NONE;
+        double newscore;
+        serverAssert(zsetAdd(r->dstobj,score,ele,&flags,&newscore));
+        sdsfree(ele);
+    } else {
+        addReplyBulkLongLong(r->c,ll);
+        if (r->withscores) addReplyDouble(r->c,score);
+    }
+    r->count++;
+}
+
+static void zrangeResultFinalize(zrangeResult *r, robj *dstkey) {
+    if (r->store) {
+        if (r->count) {
+            setKey(r->c->db,dstkey,r->dstobj);
+            addReplyLongLong(r->c,r->count);
+            notifyKeyspaceEvent(NOTIFY_ZSET,"zrangestore",dstkey,r->c->db->id);
+            server.dirty++;
+        } else {
+            addReply(r->c,shared.czero);
+            if (dbDelete(r->c->db,dstkey)) {
+                signalModifiedKey(r->c->db,dstkey);
+                notifyKeyspaceEvent(NOTIFY_GENERIC,"del",dstkey,r->c->db->id);
+                server.dirty++;
+            }
+        }
+        decrRefCount(r->dstobj);
+    } else {
+        setDeferredMultiBulkLength(r->c,r->replylen,
+            r->withscores ? r->count*2 : r->count);
+    }
+}
+
+/* Rank based traversal, shared by ZRANGE, ZREVRANGE and ZRANGESTORE. */
+static void zrangeRankCore(zrangeResult *r, robj *zobj, PORT_LONG start,
+                           PORT_LONG end, int reverse) {
+    PORT_LONG llen = zsetLength(zobj);
     PORT_LONG rangelen;
 
-    if ((getLongFromObjectOrReply(c, c->argv[2], &start, NULL) != C_OK) ||
-        (getLongFromObjectOrReply(c, c->argv[3], &end, NULL) != C_OK)) return;
-
-    if (c->argc == 5 && !strcasecmp(c->argv[4]->ptr,"withscores")) {
-        withscores = 1;
-    } else if (c->argc >= 5) {
-        addReply(c,shared.syntaxerr);
-        return;
-    }
-
-    if ((zobj = lookupKeyReadOrReply(c,key,shared.emptymultibulk)) == NULL
-         || checkType(c,zobj,OBJ_ZSET)) return;
-
-    /* Sanitize indexes. */
-    llen = zsetLength(zobj);
     if (start < 0) start = llen+start;
     if (end < 0) end = llen+end;
     if (start < 0) start = 0;
 
-    /* Invariant: start >= 0, so this test will be true when end < 0.
-     * The range is empty when start > end or start >= length. */
-    if (start > end || start >= llen) {
-        addReply(c,shared.emptymultibulk);
-        return;
-    }
+    if (start > end || start >= llen) return;
     if (end >= llen) end = llen-1;
-    rangelen = (int)(end-start)+1;                                              WIN_PORT_FIX /* cast (int) */
-
-    /* Return the result in form of a multi-bulk reply */
-    addReplyMultiBulkLen(c, withscores ? (rangelen*2) : rangelen);
+    rangelen = (end-start)+1;
 
     if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *zl = zobj->ptr;
@@ -2670,39 +2741,35 @@ void zrangeGenericCommand(client *c, int reverse) {
         unsigned char *vstr;
         unsigned int vlen;
         PORT_LONGLONG vlong;
+        double score;
 
         if (reverse)
-            eptr = ziplistIndex(zl,(int)(-2-(2*start)));                        WIN_PORT_FIX /* cast (int) */
+            eptr = ziplistIndex(zl,(int)(-2-(2*start)));
         else
-            eptr = ziplistIndex(zl,(int)(2*start));                             WIN_PORT_FIX /* cast (int) */
+            eptr = ziplistIndex(zl,(int)(2*start));
 
-        serverAssertWithInfo(c,zobj,eptr != NULL);
+        serverAssertWithInfo(r->c,zobj,eptr != NULL);
         sptr = ziplistNext(zl,eptr);
 
         while (rangelen--) {
-            serverAssertWithInfo(c,zobj,eptr != NULL && sptr != NULL);
-            serverAssertWithInfo(c,zobj,ziplistGet(eptr,&vstr,&vlen,&vlong));
+            serverAssertWithInfo(r->c,zobj,eptr != NULL && sptr != NULL);
+            serverAssertWithInfo(r->c,zobj,ziplistGet(eptr,&vstr,&vlen,&vlong));
+            score = (r->store || r->withscores) ? zzlGetScore(sptr) : 0;
             if (vstr == NULL)
-                addReplyBulkLongLong(c,vlong);
+                zrangeEmitLongLong(r,vlong,score);
             else
-                addReplyBulkCBuffer(c,vstr,vlen);
-
-            if (withscores)
-                addReplyDouble(c,zzlGetScore(sptr));
+                zrangeEmitCBuffer(r,vstr,vlen,score);
 
             if (reverse)
                 zzlPrev(zl,&eptr,&sptr);
             else
                 zzlNext(zl,&eptr,&sptr);
         }
-
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
         zskiplist *zsl = zs->zsl;
         zskiplistNode *ln;
-        sds ele;
 
-        /* Check if starting point is trivial, before doing log(N) lookup. */
         if (reverse) {
             ln = zsl->tail;
             if (start > 0)
@@ -2713,12 +2780,9 @@ void zrangeGenericCommand(client *c, int reverse) {
                 ln = zslGetElementByRank(zsl,start+1);
         }
 
-        while(rangelen--) {
-            serverAssertWithInfo(c,zobj,ln != NULL);
-            ele = ln->ele;
-            addReplyBulkCBuffer(c,ele,sdslen(ele));
-            if (withscores)
-                addReplyDouble(c,ln->score);
+        while (rangelen--) {
+            serverAssertWithInfo(r->c,zobj,ln != NULL);
+            zrangeEmitCBuffer(r,ln->ele,sdslen(ln->ele),ln->score);
             ln = reverse ? ln->backward : ln->level[0].forward;
         }
     } else {
@@ -2726,68 +2790,10 @@ void zrangeGenericCommand(client *c, int reverse) {
     }
 }
 
-void zrangeCommand(client *c) {
-    zrangeGenericCommand(c,0);
-}
-
-void zrevrangeCommand(client *c) {
-    zrangeGenericCommand(c,1);
-}
-
-/* This command implements ZRANGEBYSCORE, ZREVRANGEBYSCORE. */
-void genericZrangebyscoreCommand(client *c, int reverse) {
-    zrangespec range;
-    robj *key = c->argv[1];
-    robj *zobj;
-    PORT_LONG offset = 0, limit = -1;
-    int withscores = 0;
-    PORT_ULONG rangelen = 0;
-    void *replylen = NULL;
-    int minidx, maxidx;
-
-    /* Parse the range arguments. */
-    if (reverse) {
-        /* Range is given as [max,min] */
-        maxidx = 2; minidx = 3;
-    } else {
-        /* Range is given as [min,max] */
-        minidx = 2; maxidx = 3;
-    }
-
-    if (zslParseRange(c->argv[minidx],c->argv[maxidx],&range) != C_OK) {
-        addReplyError(c,"min or max is not a float");
-        return;
-    }
-
-    /* Parse optional extra arguments. Note that ZCOUNT will exactly have
-     * 4 arguments, so we'll never enter the following code path. */
-    if (c->argc > 4) {
-        int remaining = c->argc - 4;
-        int pos = 4;
-
-        while (remaining) {
-            if (remaining >= 1 && !strcasecmp(c->argv[pos]->ptr,"withscores")) {
-                pos++; remaining--;
-                withscores = 1;
-            } else if (remaining >= 3 && !strcasecmp(c->argv[pos]->ptr,"limit")) {
-                if ((getLongFromObjectOrReply(c, c->argv[pos+1], &offset, NULL)
-                        != C_OK) ||
-                    (getLongFromObjectOrReply(c, c->argv[pos+2], &limit, NULL)
-                        != C_OK))
-                {
-                    return;
-                }
-                pos += 3; remaining -= 3;
-            } else {
-                addReply(c,shared.syntaxerr);
-                return;
-            }
-        }
-    }
-
-    /* Ok, lookup the key and get the range */
-    if ((zobj = lookupKeyReadOrReply(c,key,shared.emptymultibulk)) == NULL ||
-        checkType(c,zobj,OBJ_ZSET)) return;
+/* Score based traversal, shared by ZRANGEBYSCORE and ZRANGE ... BYSCORE. */
+static void zrangeScoreCore(zrangeResult *r, robj *zobj, zrangespec *range,
+                            PORT_LONG offset, PORT_LONG limit, int reverse) {
+    if (offset > 0 && offset >= (PORT_LONG)zsetLength(zobj)) return;
 
     if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *zl = zobj->ptr;
@@ -2795,143 +2801,297 @@ void genericZrangebyscoreCommand(client *c, int reverse) {
         unsigned char *vstr;
         unsigned int vlen;
         PORT_LONGLONG vlong;
-        double score;
 
-        /* If reversed, get the last node in range as starting point. */
-        if (reverse) {
-            eptr = zzlLastInRange(zl,&range);
-        } else {
-            eptr = zzlFirstInRange(zl,&range);
-        }
+        if (reverse)
+            eptr = zzlLastInRange(zl,range);
+        else
+            eptr = zzlFirstInRange(zl,range);
 
-        /* No "first" element in the specified interval. */
-        if (eptr == NULL) {
-            addReply(c, shared.emptymultibulk);
-            return;
-        }
+        if (eptr) sptr = ziplistNext(zl,eptr);
 
-        /* Get score pointer for the first element. */
-        serverAssertWithInfo(c,zobj,eptr != NULL);
-        sptr = ziplistNext(zl,eptr);
-
-        /* We don't know in advance how many matching elements there are in the
-         * list, so we push this object that will represent the multi-bulk
-         * length in the output buffer, and will "fix" it later */
-        replylen = addDeferredMultiBulkLength(c);
-
-        /* If there is an offset, just traverse the number of elements without
-         * checking the score because that is done in the next loop. */
         while (eptr && offset--) {
-            if (reverse) {
+            if (reverse)
                 zzlPrev(zl,&eptr,&sptr);
-            } else {
+            else
                 zzlNext(zl,&eptr,&sptr);
-            }
         }
 
         while (eptr && limit--) {
-            score = zzlGetScore(sptr);
+            double score = zzlGetScore(sptr);
 
-            /* Abort when the node is no longer in range. */
             if (reverse) {
-                if (!zslValueGteMin(score,&range)) break;
+                if (!zslValueGteMin(score,range)) break;
             } else {
-                if (!zslValueLteMax(score,&range)) break;
+                if (!zslValueLteMax(score,range)) break;
             }
 
-            /* We know the element exists, so ziplistGet should always succeed */
-            serverAssertWithInfo(c,zobj,ziplistGet(eptr,&vstr,&vlen,&vlong));
+            serverAssertWithInfo(r->c,zobj,ziplistGet(eptr,&vstr,&vlen,&vlong));
+            if (vstr == NULL)
+                zrangeEmitLongLong(r,vlong,score);
+            else
+                zrangeEmitCBuffer(r,vstr,vlen,score);
 
-            rangelen++;
-            if (vstr == NULL) {
-                addReplyBulkLongLong(c,vlong);
-            } else {
-                addReplyBulkCBuffer(c,vstr,vlen);
-            }
-
-            if (withscores) {
-                addReplyDouble(c,score);
-            }
-
-            /* Move to next node */
-            if (reverse) {
+            if (reverse)
                 zzlPrev(zl,&eptr,&sptr);
-            } else {
+            else
                 zzlNext(zl,&eptr,&sptr);
-            }
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
         zskiplist *zsl = zs->zsl;
         zskiplistNode *ln;
 
-        /* If reversed, get the last node in range as starting point. */
         if (reverse) {
-            ln = zslLastInRange(zsl,&range);
+            ln = zsl->tail;
+            if (offset > 0)
+                ln = zslGetElementByRank(zsl,zsl->length-offset);
         } else {
-            ln = zslFirstInRange(zsl,&range);
-        }
-
-        /* No "first" element in the specified interval. */
-        if (ln == NULL) {
-            addReply(c, shared.emptymultibulk);
-            return;
-        }
-
-        /* We don't know in advance how many matching elements there are in the
-         * list, so we push this object that will represent the multi-bulk
-         * length in the output buffer, and will "fix" it later */
-        replylen = addDeferredMultiBulkLength(c);
-
-        /* If there is an offset, just traverse the number of elements without
-         * checking the score because that is done in the next loop. */
-        while (ln && offset--) {
-            if (reverse) {
-                ln = ln->backward;
-            } else {
-                ln = ln->level[0].forward;
-            }
+            ln = zsl->header->level[0].forward;
+            if (offset > 0)
+                ln = zslGetElementByRank(zsl,offset+1);
         }
 
         while (ln && limit--) {
-            /* Abort when the node is no longer in range. */
             if (reverse) {
-                if (!zslValueGteMin(ln->score,&range)) break;
+                if (!zslValueGteMin(ln->score,range)) break;
             } else {
-                if (!zslValueLteMax(ln->score,&range)) break;
+                if (!zslValueLteMax(ln->score,range)) break;
             }
-
-            rangelen++;
-            addReplyBulkCBuffer(c,ln->ele,sdslen(ln->ele));
-
-            if (withscores) {
-                addReplyDouble(c,ln->score);
-            }
-
-            /* Move to next node */
-            if (reverse) {
-                ln = ln->backward;
-            } else {
-                ln = ln->level[0].forward;
-            }
+            zrangeEmitCBuffer(r,ln->ele,sdslen(ln->ele),ln->score);
+            ln = reverse ? ln->backward : ln->level[0].forward;
         }
     } else {
         serverPanic("Unknown sorted set encoding");
     }
+}
 
-    if (withscores) {
-        rangelen *= 2;
+/* Lexicographic traversal, shared by ZRANGEBYLEX and ZRANGE ... BYLEX. */
+static void zrangeLexCore(zrangeResult *r, robj *zobj, zlexrangespec *range,
+                          int withscores, PORT_LONG offset, PORT_LONG limit,
+                          int reverse) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
+        unsigned char *zl = zobj->ptr;
+        unsigned char *eptr, *sptr;
+        unsigned char *vstr;
+        unsigned int vlen;
+        PORT_LONGLONG vlong;
+
+        if (reverse)
+            eptr = zzlLastInLexRange(zl,range);
+        else
+            eptr = zzlFirstInLexRange(zl,range);
+
+        if (eptr) sptr = ziplistNext(zl,eptr);
+
+        while (eptr && offset--) {
+            if (reverse)
+                zzlPrev(zl,&eptr,&sptr);
+            else
+                zzlNext(zl,&eptr,&sptr);
+        }
+
+        while (eptr && limit--) {
+            double score = 0;
+            if (withscores)
+                score = zzlGetScore(sptr);
+
+            if (reverse) {
+                if (!zzlLexValueGteMin(eptr,range)) break;
+            } else {
+                if (!zzlLexValueLteMax(eptr,range)) break;
+            }
+
+            serverAssertWithInfo(r->c,zobj,ziplistGet(eptr,&vstr,&vlen,&vlong));
+            if (vstr == NULL)
+                zrangeEmitLongLong(r,vlong,score);
+            else
+                zrangeEmitCBuffer(r,vstr,vlen,score);
+
+            if (reverse)
+                zzlPrev(zl,&eptr,&sptr);
+            else
+                zzlNext(zl,&eptr,&sptr);
+        }
+    } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
+        zset *zs = zobj->ptr;
+        zskiplist *zsl = zs->zsl;
+        zskiplistNode *ln;
+
+        if (reverse) {
+            ln = zsl->tail;
+            if (offset > 0)
+                ln = zslGetElementByRank(zsl,zsl->length-offset);
+        } else {
+            ln = zsl->header->level[0].forward;
+            if (offset > 0)
+                ln = zslGetElementByRank(zsl,offset+1);
+        }
+
+        while (ln && limit--) {
+            if (reverse) {
+                if (!zslLexValueGteMin(ln->ele,range)) break;
+            } else {
+                if (!zslLexValueLteMax(ln->ele,range)) break;
+            }
+            zrangeEmitCBuffer(r,ln->ele,sdslen(ln->ele),ln->score);
+            ln = reverse ? ln->backward : ln->level[0].forward;
+        }
+    } else {
+        serverPanic("Unknown sorted set encoding");
+    }
+}
+
+/* The parser behind ZRANGE and ZRANGESTORE. 'argc_start' is the position of
+ * the source key (1 for ZRANGE, 2 for ZRANGESTORE). */
+static void zrangeGenericCommand(client *c, int argc_start, int store,
+                                 zrange_type rangetype,
+                                 zrange_direction direction) {
+    robj *key = c->argv[argc_start];
+    robj *zobj;
+    zrangespec range;
+    zlexrangespec lexrange;
+    int minidx = argc_start + 1;
+    int maxidx = argc_start + 2;
+    PORT_LONG opt_start = 0, opt_end = 0;
+    int opt_withscores = 0;
+    PORT_LONG opt_offset = 0, opt_limit = -1;
+    int j;
+
+    /* Step 1: parse the optional arguments after <src> <min> <max>. */
+    for (j = argc_start + 3; j < c->argc; j++) {
+        int leftargs = c->argc-j-1;
+        if (!store && !strcasecmp(c->argv[j]->ptr,"withscores")) {
+            opt_withscores = 1;
+        } else if (!strcasecmp(c->argv[j]->ptr,"limit") && leftargs >= 2) {
+            if ((getLongFromObjectOrReply(c,c->argv[j+1],&opt_offset,NULL)
+                    != C_OK) ||
+                (getLongFromObjectOrReply(c,c->argv[j+2],&opt_limit,NULL)
+                    != C_OK))
+            {
+                return;
+            }
+            j += 2;
+        } else if (direction == ZRANGE_DIRECTION_AUTO &&
+                   !strcasecmp(c->argv[j]->ptr,"rev")) {
+            direction = ZRANGE_DIRECTION_REVERSE;
+        } else if (rangetype == ZRANGE_KIND_AUTO &&
+                   !strcasecmp(c->argv[j]->ptr,"bylex")) {
+            rangetype = ZRANGE_KIND_LEX;
+        } else if (rangetype == ZRANGE_KIND_AUTO &&
+                   !strcasecmp(c->argv[j]->ptr,"byscore")) {
+            rangetype = ZRANGE_KIND_SCORE;
+        } else {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
     }
 
-    setDeferredMultiBulkLength(c, replylen, rangelen);
+    if (direction == ZRANGE_DIRECTION_AUTO)
+        direction = ZRANGE_DIRECTION_FORWARD;
+    if (rangetype == ZRANGE_KIND_AUTO)
+        rangetype = ZRANGE_KIND_RANK;
+
+    if (opt_limit != -1 && rangetype == ZRANGE_KIND_RANK) {
+        addReplyError(c,"syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX");
+        return;
+    }
+    if (opt_withscores && rangetype == ZRANGE_KIND_LEX) {
+        addReplyError(c,"syntax error, WITHSCORES not supported in combination with BYLEX");
+        return;
+    }
+
+    if (direction == ZRANGE_DIRECTION_REVERSE &&
+        (rangetype == ZRANGE_KIND_SCORE || rangetype == ZRANGE_KIND_LEX))
+    {
+        int tmp = maxidx;
+        maxidx = minidx;
+        minidx = tmp;
+    }
+
+    /* Step 2: parse the range itself. */
+    switch (rangetype) {
+    case ZRANGE_KIND_AUTO:
+    case ZRANGE_KIND_RANK:
+        if ((getLongFromObjectOrReply(c,c->argv[minidx],&opt_start,NULL)
+                != C_OK) ||
+            (getLongFromObjectOrReply(c,c->argv[maxidx],&opt_end,NULL)
+                != C_OK))
+        {
+            return;
+        }
+        break;
+    case ZRANGE_KIND_SCORE:
+        if (zslParseRange(c->argv[minidx],c->argv[maxidx],&range) != C_OK) {
+            addReplyError(c,"min or max is not a float");
+            return;
+        }
+        break;
+    case ZRANGE_KIND_LEX:
+        if (zslParseLexRange(c->argv[minidx],c->argv[maxidx],&lexrange)
+                != C_OK)
+        {
+            addReplyError(c,"min or max not valid string range item");
+            return;
+        }
+        break;
+    }
+
+    /* Step 3: lookup the source and emit the range. */
+    zobj = store ? lookupKeyWrite(c->db,key) : lookupKeyRead(c->db,key);
+    if (zobj && checkType(c,zobj,OBJ_ZSET)) {
+        if (rangetype == ZRANGE_KIND_LEX) zslFreeLexRange(&lexrange);
+        return;
+    }
+
+    if (zobj == NULL && !store) {
+        if (rangetype == ZRANGE_KIND_LEX) zslFreeLexRange(&lexrange);
+        addReply(c,shared.emptymultibulk);
+        return;
+    }
+
+    {
+        zrangeResult r;
+        zrangeResultInit(&r,c,store,opt_withscores);
+
+        if (zobj != NULL) {
+            int reverse = (direction == ZRANGE_DIRECTION_REVERSE);
+            if (rangetype == ZRANGE_KIND_SCORE) {
+                zrangeScoreCore(&r,zobj,&range,opt_offset,opt_limit,reverse);
+            } else if (rangetype == ZRANGE_KIND_LEX) {
+                zrangeLexCore(&r,zobj,&lexrange,opt_withscores || store,
+                              opt_offset,opt_limit,reverse);
+            } else {
+                zrangeRankCore(&r,zobj,opt_start,opt_end,reverse);
+            }
+        }
+
+        if (rangetype == ZRANGE_KIND_LEX) zslFreeLexRange(&lexrange);
+        zrangeResultFinalize(&r,store ? c->argv[1] : NULL);
+    }
+}
+
+void zrangeCommand(client *c) {
+    zrangeGenericCommand(c,1,0,ZRANGE_KIND_AUTO,ZRANGE_DIRECTION_AUTO);
+}
+
+void zrevrangeCommand(client *c) {
+    zrangeGenericCommand(c,1,0,ZRANGE_KIND_RANK,ZRANGE_DIRECTION_REVERSE);
 }
 
 void zrangebyscoreCommand(client *c) {
-    genericZrangebyscoreCommand(c,0);
+    zrangeGenericCommand(c,1,0,ZRANGE_KIND_SCORE,ZRANGE_DIRECTION_FORWARD);
 }
 
 void zrevrangebyscoreCommand(client *c) {
-    genericZrangebyscoreCommand(c,1);
+    zrangeGenericCommand(c,1,0,ZRANGE_KIND_SCORE,ZRANGE_DIRECTION_REVERSE);
+}
+
+void zrangebylexCommand(client *c) {
+    zrangeGenericCommand(c,1,0,ZRANGE_KIND_LEX,ZRANGE_DIRECTION_FORWARD);
+}
+
+void zrevrangebylexCommand(client *c) {
+    zrangeGenericCommand(c,1,0,ZRANGE_KIND_LEX,ZRANGE_DIRECTION_REVERSE);
 }
 
 void zcountCommand(client *c) {
@@ -3090,192 +3250,9 @@ void zlexcountCommand(client *c) {
     addReplyLongLong(c, count);
 }
 
-/* This command implements ZRANGEBYLEX, ZREVRANGEBYLEX. */
-void genericZrangebylexCommand(client *c, int reverse) {
-    zlexrangespec range;
-    robj *key = c->argv[1];
-    robj *zobj;
-    PORT_LONG offset = 0, limit = -1;
-    PORT_ULONG rangelen = 0;
-    void *replylen = NULL;
-    int minidx, maxidx;
-
-    /* Parse the range arguments. */
-    if (reverse) {
-        /* Range is given as [max,min] */
-        maxidx = 2; minidx = 3;
-    } else {
-        /* Range is given as [min,max] */
-        minidx = 2; maxidx = 3;
-    }
-
-    if (zslParseLexRange(c->argv[minidx],c->argv[maxidx],&range) != C_OK) {
-        addReplyError(c,"min or max not valid string range item");
-        return;
-    }
-
-    /* Parse optional extra arguments. Note that ZCOUNT will exactly have
-     * 4 arguments, so we'll never enter the following code path. */
-    if (c->argc > 4) {
-        int remaining = c->argc - 4;
-        int pos = 4;
-
-        while (remaining) {
-            if (remaining >= 3 && !strcasecmp(c->argv[pos]->ptr,"limit")) {
-                if ((getLongFromObjectOrReply(c, c->argv[pos+1], &offset, NULL) != C_OK) ||
-                    (getLongFromObjectOrReply(c, c->argv[pos+2], &limit, NULL) != C_OK)) {
-                    zslFreeLexRange(&range);
-                    return;
-                }
-                pos += 3; remaining -= 3;
-            } else {
-                zslFreeLexRange(&range);
-                addReply(c,shared.syntaxerr);
-                return;
-            }
-        }
-    }
-
-    /* Ok, lookup the key and get the range */
-    if ((zobj = lookupKeyReadOrReply(c,key,shared.emptymultibulk)) == NULL ||
-        checkType(c,zobj,OBJ_ZSET))
-    {
-        zslFreeLexRange(&range);
-        return;
-    }
-
-    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
-        unsigned char *zl = zobj->ptr;
-        unsigned char *eptr, *sptr;
-        unsigned char *vstr;
-        unsigned int vlen;
-        PORT_LONGLONG vlong;
-
-        /* If reversed, get the last node in range as starting point. */
-        if (reverse) {
-            eptr = zzlLastInLexRange(zl,&range);
-        } else {
-            eptr = zzlFirstInLexRange(zl,&range);
-        }
-
-        /* No "first" element in the specified interval. */
-        if (eptr == NULL) {
-            addReply(c, shared.emptymultibulk);
-            zslFreeLexRange(&range);
-            return;
-        }
-
-        /* Get score pointer for the first element. */
-        serverAssertWithInfo(c,zobj,eptr != NULL);
-        sptr = ziplistNext(zl,eptr);
-
-        /* We don't know in advance how many matching elements there are in the
-         * list, so we push this object that will represent the multi-bulk
-         * length in the output buffer, and will "fix" it later */
-        replylen = addDeferredMultiBulkLength(c);
-
-        /* If there is an offset, just traverse the number of elements without
-         * checking the score because that is done in the next loop. */
-        while (eptr && offset--) {
-            if (reverse) {
-                zzlPrev(zl,&eptr,&sptr);
-            } else {
-                zzlNext(zl,&eptr,&sptr);
-            }
-        }
-
-        while (eptr && limit--) {
-            /* Abort when the node is no longer in range. */
-            if (reverse) {
-                if (!zzlLexValueGteMin(eptr,&range)) break;
-            } else {
-                if (!zzlLexValueLteMax(eptr,&range)) break;
-            }
-
-            /* We know the element exists, so ziplistGet should always
-             * succeed. */
-            serverAssertWithInfo(c,zobj,ziplistGet(eptr,&vstr,&vlen,&vlong));
-
-            rangelen++;
-            if (vstr == NULL) {
-                addReplyBulkLongLong(c,vlong);
-            } else {
-                addReplyBulkCBuffer(c,vstr,vlen);
-            }
-
-            /* Move to next node */
-            if (reverse) {
-                zzlPrev(zl,&eptr,&sptr);
-            } else {
-                zzlNext(zl,&eptr,&sptr);
-            }
-        }
-    } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
-        zset *zs = zobj->ptr;
-        zskiplist *zsl = zs->zsl;
-        zskiplistNode *ln;
-
-        /* If reversed, get the last node in range as starting point. */
-        if (reverse) {
-            ln = zslLastInLexRange(zsl,&range);
-        } else {
-            ln = zslFirstInLexRange(zsl,&range);
-        }
-
-        /* No "first" element in the specified interval. */
-        if (ln == NULL) {
-            addReply(c, shared.emptymultibulk);
-            zslFreeLexRange(&range);
-            return;
-        }
-
-        /* We don't know in advance how many matching elements there are in the
-         * list, so we push this object that will represent the multi-bulk
-         * length in the output buffer, and will "fix" it later */
-        replylen = addDeferredMultiBulkLength(c);
-
-        /* If there is an offset, just traverse the number of elements without
-         * checking the score because that is done in the next loop. */
-        while (ln && offset--) {
-            if (reverse) {
-                ln = ln->backward;
-            } else {
-                ln = ln->level[0].forward;
-            }
-        }
-
-        while (ln && limit--) {
-            /* Abort when the node is no longer in range. */
-            if (reverse) {
-                if (!zslLexValueGteMin(ln->ele,&range)) break;
-            } else {
-                if (!zslLexValueLteMax(ln->ele,&range)) break;
-            }
-
-            rangelen++;
-            addReplyBulkCBuffer(c,ln->ele,sdslen(ln->ele));
-
-            /* Move to next node */
-            if (reverse) {
-                ln = ln->backward;
-            } else {
-                ln = ln->level[0].forward;
-            }
-        }
-    } else {
-        serverPanic("Unknown sorted set encoding");
-    }
-
-    zslFreeLexRange(&range);
-    setDeferredMultiBulkLength(c, replylen, rangelen);
-}
-
-void zrangebylexCommand(client *c) {
-    genericZrangebylexCommand(c,0);
-}
-
-void zrevrangebylexCommand(client *c) {
-    genericZrangebylexCommand(c,1);
+/* ZRANGESTORE dst src start stop [BYSCORE|BYLEX] [REV] [LIMIT offset count] */
+void zrangestoreCommand(client *c) {
+    zrangeGenericCommand(c,2,1,ZRANGE_KIND_AUTO,ZRANGE_DIRECTION_AUTO);
 }
 
 void zcardCommand(client *c) {
@@ -3682,7 +3659,7 @@ void blockingGenericZpopCommand(client *c, int where) {
     }
 
     /* If the keys do not exist we must block */
-    blockForKeys(c,BLOCKED_ZSET,c->argv + 1,c->argc - 2,timeout,NULL,NULL);
+    blockForKeys(c,BLOCKED_ZSET,c->argv + 1,c->argc - 2,timeout,NULL,NULL,NULL);
 }
 
 // BZPOPMIN key [key ...] timeout

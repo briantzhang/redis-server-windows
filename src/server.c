@@ -165,8 +165,8 @@ struct redisCommand redisCommandTable[] = {
     {"rpushx",rpushxCommand,-3,"wmF",0,NULL,1,1,1,0,0},
     {"lpushx",lpushxCommand,-3,"wmF",0,NULL,1,1,1,0,0},
     {"linsert",linsertCommand,5,"wm",0,NULL,1,1,1,0,0},
-    {"rpop",rpopCommand,2,"wF",0,NULL,1,1,1,0,0},
-    {"lpop",lpopCommand,2,"wF",0,NULL,1,1,1,0,0},
+    {"rpop",rpopCommand,-2,"wF",0,NULL,1,1,1,0,0},
+    {"lpop",lpopCommand,-2,"wF",0,NULL,1,1,1,0,0},
     {"brpop",brpopCommand,-3,"ws",0,NULL,1,-2,1,0,0},
     {"brpoplpush",brpoplpushCommand,4,"wms",0,NULL,1,2,1,0,0},
     {"blpop",blpopCommand,-3,"ws",0,NULL,1,-2,1,0,0},
@@ -178,6 +178,7 @@ struct redisCommand redisCommandTable[] = {
     {"lrem",lremCommand,4,"w",0,NULL,1,1,1,0,0},
     {"rpoplpush",rpoplpushCommand,3,"wm",0,NULL,1,2,1,0,0},
     {"lmove",lmoveCommand,-5,"wm",0,NULL,1,2,1,0,0},
+    {"blmove",blmoveCommand,-6,"ws",0,NULL,1,2,1,0,0},
     {"lpos",lposCommand,-3,"r",0,NULL,1,1,1,0,0},
     {"sadd",saddCommand,-3,"wmF",0,NULL,1,1,1,0,0},
     {"srem",sremCommand,-3,"wF",0,NULL,1,1,1,0,0},
@@ -210,6 +211,7 @@ struct redisCommand redisCommandTable[] = {
     {"zdiff",zdiffCommand,-3,"r",0,zunionInterGetKeys,0,0,0,0,0},
     {"zintercard",zintercardCommand,-3,"r",0,zunionInterGetKeys,0,0,0,0,0},
     {"zrange",zrangeCommand,-4,"r",0,NULL,1,1,1,0,0},
+    {"zrangestore",zrangestoreCommand,-5,"wm",0,NULL,1,2,1,0,0},
     {"zrangebyscore",zrangebyscoreCommand,-4,"r",0,NULL,1,1,1,0,0},
     {"zrevrangebyscore",zrevrangebyscoreCommand,-4,"r",0,NULL,1,1,1,0,0},
     {"zrangebylex",zrangebylexCommand,-4,"r",0,NULL,1,1,1,0,0},
@@ -1581,6 +1583,9 @@ void createSharedObjects(void) {
     shared.lpop = createStringObject("LPOP",4);
     shared.lpush = createStringObject("LPUSH",5);
     shared.rpoplpush = createStringObject("RPOPLPUSH",9);
+    shared.lmove = createStringObject("LMOVE",5);
+    shared.left = createStringObject("LEFT",4);
+    shared.right = createStringObject("RIGHT",5);
     shared.zpopmin = createStringObject("ZPOPMIN",7);
     shared.zpopmax = createStringObject("ZPOPMAX",7);
     for (j = 0; j < OBJ_SHARED_INTEGERS; j++) {
@@ -1799,6 +1804,8 @@ void initServerConfig(void) {
     server.lpushCommand = lookupCommandByCString("lpush");
     server.lpopCommand = lookupCommandByCString("lpop");
     server.rpopCommand = lookupCommandByCString("rpop");
+    server.rpoplpushCommand = lookupCommandByCString("rpoplpush");
+    server.lmoveCommand = lookupCommandByCString("lmove");
     server.zpopminCommand = lookupCommandByCString("zpopmin");
     server.zpopmaxCommand = lookupCommandByCString("zpopmax");
     server.sremCommand = lookupCommandByCString("srem");
