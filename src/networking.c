@@ -1773,6 +1773,8 @@ sds catClientInfoString(sds s, client *client) {
     if (client->flags & CLIENT_CLOSE_ASAP) *p++ = 'A';
     if (client->flags & CLIENT_UNIX_SOCKET) *p++ = 'U';
     if (client->flags & CLIENT_READONLY) *p++ = 'r';
+    if (client->flags & CLIENT_NO_EVICT) *p++ = 'e';
+    if (client->flags & CLIENT_NO_TOUCH) *p++ = 'T';
     if (p == flags) *p++ = 'N';
     *p++ = '\0';
 
@@ -1845,7 +1847,7 @@ void resetCommand(client *c) {
     }
     c->flags &= ~(CLIENT_MULTI|CLIENT_DIRTY_CAS|CLIENT_DIRTY_EXEC|
                   CLIENT_ASKING|CLIENT_REPLY_OFF|CLIENT_REPLY_SKIP|
-                  CLIENT_REPLY_SKIP_NEXT);
+                  CLIENT_REPLY_SKIP_NEXT|CLIENT_NO_TOUCH|CLIENT_NO_EVICT);
     discardTransaction(c);
     pubsubUnsubscribeAllChannels(c,0);
     pubsubUnsubscribeAllPatterns(c,0);
@@ -1870,6 +1872,8 @@ void clientCommand(client *c) {
 "     skipme (yes|no)   -- Skip killing current connection (default: yes).",
 "list [options ...]     -- Return information about client connections. Options:",
 "     type (normal|master|replica|pubsub) -- Return clients of specified type.",
+"no-evict (on|off)      -- Set client eviction mode for the current connection.",
+"no-touch (on|off)      -- Don't update the LRU/LFU of keys this client accesses.",
 "pause <timeout>        -- Suspend all Redis clients for <timout> milliseconds.",
 "reply (on|off|skip)    -- Control the replies sent to the current connection.",
 "setname <name>         -- Assign the name <name> to the current connection.",
@@ -2069,6 +2073,28 @@ NULL
                                         != C_OK) return;
         pauseClients(duration);
         addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"no-evict") && c->argc == 3) {
+        /* CLIENT NO-EVICT ON|OFF */
+        if (!strcasecmp(c->argv[2]->ptr,"on")) {
+            c->flags |= CLIENT_NO_EVICT;
+            addReply(c,shared.ok);
+        } else if (!strcasecmp(c->argv[2]->ptr,"off")) {
+            c->flags &= ~CLIENT_NO_EVICT;
+            addReply(c,shared.ok);
+        } else {
+            addReply(c,shared.syntaxerr);
+        }
+    } else if (!strcasecmp(c->argv[1]->ptr,"no-touch") && c->argc == 3) {
+        /* CLIENT NO-TOUCH ON|OFF */
+        if (!strcasecmp(c->argv[2]->ptr,"on")) {
+            c->flags |= CLIENT_NO_TOUCH;
+            addReply(c,shared.ok);
+        } else if (!strcasecmp(c->argv[2]->ptr,"off")) {
+            c->flags &= ~CLIENT_NO_TOUCH;
+            addReply(c,shared.ok);
+        } else {
+            addReply(c,shared.syntaxerr);
+        }
     } else {
         addReplyErrorFormat(c, "Unknown subcommand or wrong number of arguments for '%s'. Try CLIENT HELP", (char*)c->argv[1]->ptr);
     }

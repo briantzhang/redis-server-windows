@@ -741,6 +741,24 @@ int getLongFromObjectOrReply(client *c, robj *o, PORT_LONG *target, const char *
     return C_OK;
 }
 
+/* Parse an object as a long and check that it is within [min, max]. The
+ * optional 'msg' is used for both a non-integer value and an out of range
+ * value, matching the Redis 6.2/7.0 helper of the same name. */
+int getRangeLongFromObjectOrReply(client *c, robj *o, PORT_LONG min, PORT_LONG max, PORT_LONG *target, const char *msg) {
+    if (getLongFromObjectOrReply(c, o, target, msg) != C_OK) return C_ERR;
+    if (*target < min || *target > max) {
+        if (msg != NULL) {
+            addReplyError(c,(char*)msg);
+        } else {
+            addReplyErrorFormat(c,
+                "value is out of range, must be between %ld and %ld inclusive",
+                (long)min,(long)max);
+        }
+        return C_ERR;
+    }
+    return C_OK;
+}
+
 char *strEncoding(int encoding) {
     switch(encoding) {
     case OBJ_ENCODING_RAW: return "raw";

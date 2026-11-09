@@ -324,7 +324,47 @@ void handleClientsBlockedOnKeys(void) {
                         robj *dstkey = receiver->bpop.target;
                         int wherefrom = receiver->bpop.listpos.wherefrom;
                         int whereto = receiver->bpop.listpos.whereto;
-                        robj *value = listTypePop(o,wherefrom);
+                        PORT_LONG count = receiver->bpop.listpos.count;
+                        robj *value;
+
+                        if (count > 0) {
+                            /* BLMPOP: pop up to 'count' elements and reply
+                             * with [key, [elements...]]. */
+                            int deleted = 0;
+                            PORT_LONG popped;
+
+                            unblockClient(receiver);
+                            popped = listPopRangeAndReplyWithKey(receiver,o,
+                                rl->key,wherefrom,count,&deleted);
+
+                            /* Replicate it as [LR]POP key count. */
+                            if (popped > 0) {
+                                robj *argv[3];
+                                struct redisCommand *cmd =
+                                    wherefrom == LIST_HEAD ?
+                                    server.lpopCommand : server.rpopCommand;
+
+                                argv[0] = createStringObject(cmd->name,
+                                                             strlen(cmd->name));
+                                argv[1] = rl->key;
+                                incrRefCount(rl->key);
+                                argv[2] = createStringObjectFromLongLong(popped);
+                                propagate(cmd,receiver->db->id,argv,3,
+                                          PROPAGATE_AOF|PROPAGATE_REPL);
+                                decrRefCount(argv[0]);
+                                decrRefCount(argv[1]);
+                                decrRefCount(argv[2]);
+                            }
+
+                            if (deleted) {
+                                /* The key is gone: nothing left to serve. */
+                                o = NULL;
+                                break;
+                            }
+                            continue;
+                        }
+
+                        value = listTypePop(o,wherefrom);
 
                         if (value) {
                             /* Protect receiver->bpop.target, that will be
@@ -350,7 +390,7 @@ void handleClientsBlockedOnKeys(void) {
                     }
                 }
 
-                if (listTypeLength(o) == 0) {
+                if (o != NULL && listTypeLength(o) == 0) {
                     dbDelete(rl->db,rl->key);
                     notifyKeyspaceEvent(NOTIFY_GENERIC,"del",rl->key,rl->db->id);
                 }
@@ -381,25 +421,44 @@ void handleClientsBlockedOnKeys(void) {
                             continue;
                         }
 
-                        int where = (receiver->lastcmd &&
-                                     receiver->lastcmd->proc == bzpopminCommand)
-                                     ? ZSET_MIN : ZSET_MAX;
+                        int where = receiver->bpop.listpos.wherefrom;
+                        PORT_LONG count = receiver->bpop.listpos.count;
+                        int use_nested_array = (count > 0);
+                        int deleted = 0;
+                        PORT_LONG popped;
+
+                        /* A count of 0 means BZPOP[MIN|MAX], which is a
+                         * plain single pop. */
+                        if (!use_nested_array) count = -1;
+
                         unblockClient(receiver);
-                        genericZpopCommand(receiver,&rl->key,1,where,1,NULL);
-                        zcard--;
+                        popped = genericZpopCommand(receiver,&rl->key,1,where,
+                                    1,count,use_nested_array,0,&deleted);
+                        zcard -= popped;
 
                         /* Replicate the command. */
-                        robj *argv[2];
-                        struct redisCommand *cmd = where == ZSET_MIN ?
-                                                   server.zpopminCommand :
-                                                   server.zpopmaxCommand;
-                        argv[0] = createStringObject(cmd->name,strlen(cmd->name));
-                        argv[1] = rl->key;
-                        incrRefCount(rl->key);
-                        propagate(cmd,receiver->db->id,
-                                  argv,2,PROPAGATE_AOF|PROPAGATE_REPL);
-                        decrRefCount(argv[0]);
-                        decrRefCount(argv[1]);
+                        {
+                            robj *argv[3];
+                            int argn = 2;
+                            struct redisCommand *cmd = where == ZSET_MIN ?
+                                                       server.zpopminCommand :
+                                                       server.zpopmaxCommand;
+                            argv[0] = createStringObject(cmd->name,
+                                                         strlen(cmd->name));
+                            argv[1] = rl->key;
+                            incrRefCount(rl->key);
+                            if (use_nested_array) {
+                                argv[2] = createStringObjectFromLongLong(popped);
+                                argn = 3;
+                            }
+                            propagate(cmd,receiver->db->id,
+                                      argv,argn,PROPAGATE_AOF|PROPAGATE_REPL);
+                            decrRefCount(argv[0]);
+                            decrRefCount(argv[1]);
+                            if (use_nested_array) decrRefCount(argv[2]);
+                        }
+
+                        if (deleted) break;
                     }
                 }
             }

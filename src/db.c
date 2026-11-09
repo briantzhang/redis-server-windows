@@ -60,6 +60,16 @@ robj *lookupKey(redisDb *db, robj *key, int flags) {
     if (de) {
         robj *val = dictGetVal(de);
 
+        /* CLIENT NO-TOUCH makes lookups leave the LRU/LFU untouched. The
+         * TOUCH command itself must still update the access time. */
+        if (server.current_client &&
+            (server.current_client->flags & CLIENT_NO_TOUCH) &&
+            server.current_client->cmd &&
+            server.current_client->cmd->proc != touchCommand)
+        {
+            flags |= LOOKUP_NOTOUCH;
+        }
+
         /* Update the access time for the ageing algorithm.
          * Don't do it if we have a saving child, as this will trigger
          * a copy on write madness. */
@@ -1515,6 +1525,33 @@ int *zunionInterGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *nu
     /* The STORE forms also touch the destination key. */
     if (storing) keys[num] = 1;
     *numkeys = num+(storing?1:0);
+    return keys;
+}
+
+/* Helper function to extract keys from the LMPOP/BLMPOP/ZMPOP/BZMPOP
+ * family:
+ *
+ * LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]
+ * BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT count]
+ *
+ * The blocking variants carry the timeout as their first argument, so the
+ * key count is at argv[2] instead of argv[1]. */
+int *mpopGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys) {
+    int i, num, *keys;
+    int countidx = (cmd->proc == blmpopCommand ||
+                    cmd->proc == bzmpopCommand) ? 2 : 1;
+
+    num = atoi(argv[countidx]->ptr);
+    /* Sanity check. Don't return any key if the command is going to
+     * reply with syntax error. */
+    if (num < 1 || num > (argc-countidx-1)) {
+        *numkeys = 0;
+        return NULL;
+    }
+
+    keys = zmalloc(sizeof(int)*num);
+    for (i = 0; i < num; i++) keys[i] = countidx+1+i;
+    *numkeys = num;
     return keys;
 }
 

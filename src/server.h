@@ -268,6 +268,9 @@ typedef PORT_LONGLONG ustime_t; /* microsecond time type. */
 #define CLIENT_PREVENT_PROP (CLIENT_PREVENT_AOF_PROP|CLIENT_PREVENT_REPL_PROP)
 #define CLIENT_PENDING_WRITE (1<<21) /* Client has output to send but a write
                                         handler is yet not installed. */
+#define CLIENT_NO_EVICT (1<<29)   /* This client should not be evicted when
+                                   * maxmemory is reached. */
+#define CLIENT_NO_TOUCH (1<<30)   /* Don't update LRU/LFU on key accesses. */
 #define CLIENT_REPLY_OFF (1<<22)   /* Don't send replies to client. */
 #define CLIENT_REPLY_SKIP_NEXT (1<<23)  /* Set CLIENT_REPLY_SKIP for next cmd */
 #define CLIENT_REPLY_SKIP (1<<24)  /* Don't send just this reply. */
@@ -692,10 +695,14 @@ typedef struct multiState {
 
 /* This structure holds the blocking operation state for a client.
  * The fields used depend on client->btype. */
-/* Where a blocking list operation takes elements from and pushes them to. */
+/* Where a blocking list/zset operation takes elements from and pushes them
+ * to. 'count' is 0 for the single-element variants (BLPOP, BRPOP,
+ * BRPOPLPUSH, BLMOVE, BZPOPMIN, BZPOPMAX) and holds the requested number of
+ * elements for BLMPOP and BZMPOP. */
 struct listPos {
-    int wherefrom;  /* LIST_HEAD or LIST_TAIL. */
+    int wherefrom;  /* LIST_HEAD/LIST_TAIL or ZSET_MIN/ZSET_MAX. */
     int whereto;    /* LIST_HEAD or LIST_TAIL. */
+    PORT_LONG count; /* Number of elements for BLMPOP/BZMPOP, 0 otherwise. */
 };
 
 typedef struct blockingState {
@@ -1611,6 +1618,7 @@ robj *createZsetZiplistObject(void);
 robj *createStreamObject(void);
 robj *createModuleObject(moduleType *mt, void *value);
 int getLongFromObjectOrReply(client *c, robj *o, PORT_LONG *target, const char *msg);
+int getRangeLongFromObjectOrReply(client *c, robj *o, PORT_LONG min, PORT_LONG max, PORT_LONG *target, const char *msg);
 int checkType(client *c, robj *o, int type);
 int getLongLongFromObjectOrReply(client *c, robj *o, PORT_LONGLONG *target, const char *msg);
 int getDoubleFromObjectOrReply(client *c, robj *o, double *target, const char *msg);
@@ -1747,7 +1755,9 @@ PORT_ULONG zslGetRank(zskiplist *zsl, double score, sds o);
 int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore);
 PORT_LONG zsetRank(robj *zobj, sds ele, int reverse);
 int zsetDel(robj *zobj, sds ele);
-void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey, robj *countarg);
+PORT_LONG genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey,
+                             PORT_LONG count, int use_nested_array,
+                             int reply_nil_when_empty, int *deleted);
 sds ziplistGetObject(unsigned char *sptr);
 int zslValueGteMin(double value, zrangespec *spec);
 int zslValueLteMax(double value, zrangespec *spec);
@@ -1935,6 +1945,7 @@ void freeObjAsync(robj *o);
 int *getKeysFromCommand(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
 void getKeysFreeResult(int *result);
 int *zunionInterGetKeys(struct redisCommand *cmd,robj **argv, int argc, int *numkeys);
+int *mpopGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
 int *evalGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
 int *sortGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
 int *migrateGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
@@ -2095,6 +2106,8 @@ void lremCommand(client *c);
 void lposCommand(client *c);
 void lmoveCommand(client *c);
 void blmoveCommand(client *c);
+void lmpopCommand(client *c);
+void blmpopCommand(client *c);
 void rpoplpushCommand(client *c);
 void infoCommand(client *c);
 void mgetCommand(client *c);
@@ -2133,6 +2146,8 @@ void zpopminCommand(client *c);
 void zpopmaxCommand(client *c);
 void bzpopminCommand(client *c);
 void bzpopmaxCommand(client *c);
+void zmpopCommand(client *c);
+void bzmpopCommand(client *c);
 void multiCommand(client *c);
 void execCommand(client *c);
 void discardCommand(client *c);
@@ -2140,6 +2155,7 @@ void blpopCommand(client *c);
 void brpopCommand(client *c);
 void brpoplpushCommand(client *c);
 int serveClientBlockedOnList(client *receiver, robj *key, robj *dstkey, redisDb *db, robj *value, int wherefrom, int whereto);
+PORT_LONG listPopRangeAndReplyWithKey(client *c, robj *o, robj *key, int where, PORT_LONG count, int *deleted);
 void appendCommand(client *c);
 void strlenCommand(client *c);
 void zrankCommand(client *c);
