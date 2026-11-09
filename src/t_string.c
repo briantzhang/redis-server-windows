@@ -556,3 +556,213 @@ void strlenCommand(client *c) {
         checkType(c,o,OBJ_STRING)) return;
     addReplyLongLong(c,stringObjectLen(o));
 }
+
+/* LCS key1 key2 [LEN] [IDX] [MINMATCHLEN <len>] [WITHMATCHLEN]
+ *
+ * Longest common subsequence of the two string values. With IDX the reply
+ * is the flat RESP2 form of the map {"matches": [...], "len": N}; each match
+ * is [[start,end],[start,end]] optionally followed by its length. */
+void lcsCommand(client *c) {
+    uint32_t i, j;
+    PORT_LONGLONG minmatchlen = 0;
+    sds a = NULL, b = NULL;
+    int getlen = 0, getidx = 0, withmatchlen = 0;
+    robj *obja = NULL, *objb = NULL;
+    uint32_t *lcs = NULL;
+    sds result = NULL;
+
+    obja = lookupKeyRead(c->db,c->argv[1]);
+    objb = lookupKeyRead(c->db,c->argv[2]);
+    if ((obja && obja->type != OBJ_STRING) ||
+        (objb && objb->type != OBJ_STRING))
+    {
+        addReplyError(c,"The specified keys must contain string values");
+        /* Don't cleanup the objects, we need to do that only after calling
+         * getDecodedObject(). */
+        obja = NULL;
+        objb = NULL;
+        goto cleanup;
+    }
+    obja = obja ? getDecodedObject(obja) : createStringObject("",0);
+    objb = objb ? getDecodedObject(objb) : createStringObject("",0);
+    a = obja->ptr;
+    b = objb->ptr;
+
+    for (j = 3; j < (uint32_t)c->argc; j++) {
+        char *opt = c->argv[j]->ptr;
+        int moreargs = (c->argc-1) - j;
+
+        if (!strcasecmp(opt,"IDX")) {
+            getidx = 1;
+        } else if (!strcasecmp(opt,"LEN")) {
+            getlen = 1;
+        } else if (!strcasecmp(opt,"WITHMATCHLEN")) {
+            withmatchlen = 1;
+        } else if (!strcasecmp(opt,"MINMATCHLEN") && moreargs) {
+            if (getLongLongFromObjectOrReply(c,c->argv[j+1],&minmatchlen,NULL)
+                != C_OK) goto cleanup;
+            if (minmatchlen < 0) minmatchlen = 0;
+            j++;
+        } else {
+            addReply(c,shared.syntaxerr);
+            goto cleanup;
+        }
+    }
+
+    /* Complain if the user passed ambiguous parameters. */
+    if (getlen && getidx) {
+        addReplyError(c,
+            "If you want both the length and indexes, please just use IDX.");
+        goto cleanup;
+    }
+
+    /* Detect string truncation or later overflows. */
+    if (sdslen(a) >= UINT32_MAX-1 || sdslen(b) >= UINT32_MAX-1) {
+        addReplyError(c, "String too long for LCS");
+        goto cleanup;
+    }
+
+    /* Compute the LCS using the vanilla dynamic programming technique of
+     * building a table of LCS(x,y) substrings. */
+    uint32_t alen = sdslen(a);
+    uint32_t blen = sdslen(b);
+
+    /* Setup an uint32_t array to store at LCS[i,j] the length of the
+     * LCS A0..i-1, B0..j-1. Note that we have a linear array here, so
+     * we index it as LCS[j+(blen+1)*i]. */
+    #define LCS(A,B) lcs[(B)+((A)*(blen+1))]
+
+    /* Try to allocate the LCS table, and abort on overflow or insufficient
+     * memory. */
+    unsigned long long lcssize = (unsigned long long)(alen+1)*(blen+1);
+    unsigned long long lcsalloc = lcssize * sizeof(uint32_t);
+    if (lcsalloc < SIZE_MAX && lcssize != 0 &&
+        lcsalloc / lcssize == sizeof(uint32_t))
+    {
+        if (lcsalloc > (PORT_ULONGLONG)server.proto_max_bulk_len) {
+            addReplyError(c,"Insufficient memory, transient memory for LCS "
+                            "exceeds proto-max-bulk-len");
+            goto cleanup;
+        }
+        lcs = ztrymalloc((size_t)lcsalloc);
+    }
+    if (!lcs) {
+        addReplyError(c,"Insufficient memory, failed allocating transient "
+                        "memory for LCS");
+        goto cleanup;
+    }
+
+    /* Start building the LCS table. */
+    for (uint32_t ti = 0; ti <= alen; ti++) {
+        for (uint32_t tj = 0; tj <= blen; tj++) {
+            if (ti == 0 || tj == 0) {
+                LCS(ti,tj) = 0;
+            } else if (a[ti-1] == b[tj-1]) {
+                LCS(ti,tj) = LCS(ti-1,tj-1)+1;
+            } else {
+                uint32_t lcs1 = LCS(ti-1,tj);
+                uint32_t lcs2 = LCS(ti,tj-1);
+                LCS(ti,tj) = lcs1 > lcs2 ? lcs1 : lcs2;
+            }
+        }
+    }
+
+    /* Store the actual LCS string in "result" if needed. We create
+     * it backward, but the length is already known, we store it into idx. */
+    uint32_t idx = LCS(alen,blen);
+    void *arraylenptr = NULL; /* Deferred length of the array for IDX. */
+    uint32_t arange_start = alen, /* alen signals that values are not set. */
+             arange_end = 0,
+             brange_start = 0,
+             brange_end = 0;
+
+    /* Do we need to compute the actual LCS string? Allocate it in that case. */
+    int computelcs = getidx || !getlen;
+    if (computelcs) result = sdsnewlen(SDS_NOINIT,idx);
+
+    /* Start with a deferred array if we have to emit the ranges. */
+    uint32_t arraylen = 0;  /* Number of ranges emitted in the array. */
+    if (getidx) {
+        addReplyMultiBulkLen(c,4);
+        addReplyBulkCString(c,"matches");
+        arraylenptr = addDeferredMultiBulkLength(c);
+    }
+
+    i = alen, j = blen;
+    while (computelcs && i > 0 && j > 0) {
+        int emit_range = 0;
+        if (a[i-1] == b[j-1]) {
+            /* If there is a match, store the character and reduce
+             * the indexes to look for a new match. */
+            result[idx-1] = a[i-1];
+
+            /* Track the current range. */
+            if (arange_start == alen) {
+                arange_start = i-1;
+                arange_end = i-1;
+                brange_start = j-1;
+                brange_end = j-1;
+            } else {
+                /* Let's see if we can extend the range backward since
+                 * it is contiguous. */
+                if (arange_start == i && brange_start == j) {
+                    arange_start--;
+                    brange_start--;
+                } else {
+                    emit_range = 1;
+                }
+            }
+            /* Emit the range if we matched with the first byte of
+             * one of the two strings. We'll exit the loop ASAP. */
+            if (arange_start == 0 || brange_start == 0) emit_range = 1;
+            idx--; i--; j--;
+        } else {
+            /* Otherwise reduce i and j depending on the largest
+             * LCS between, to understand what direction we need to go. */
+            uint32_t lcs1 = LCS(i-1,j);
+            uint32_t lcs2 = LCS(i,j-1);
+            if (lcs1 > lcs2)
+                i--;
+            else
+                j--;
+            if (arange_start != alen) emit_range = 1;
+        }
+
+        /* Emit the current range if needed. */
+        uint32_t match_len = arange_end - arange_start + 1;
+        if (emit_range) {
+            if (minmatchlen == 0 || match_len >= minmatchlen) {
+                if (arraylenptr) {
+                    addReplyMultiBulkLen(c,2+withmatchlen);
+                    addReplyMultiBulkLen(c,2);
+                    addReplyLongLong(c,arange_start);
+                    addReplyLongLong(c,arange_end);
+                    addReplyMultiBulkLen(c,2);
+                    addReplyLongLong(c,brange_start);
+                    addReplyLongLong(c,brange_end);
+                    if (withmatchlen) addReplyLongLong(c,match_len);
+                    arraylen++;
+                }
+            }
+            arange_start = alen; /* Restart at the next match. */
+        }
+    }
+
+    /* Reply depending on the given options. */
+    if (arraylenptr) {
+        addReplyBulkCString(c,"len");
+        addReplyLongLong(c,LCS(alen,blen));
+        setDeferredMultiBulkLength(c,arraylenptr,arraylen);
+    } else if (getlen) {
+        addReplyLongLong(c,LCS(alen,blen));
+    } else {
+        addReplyBulkSds(c,result);
+        result = NULL;
+    }
+
+cleanup:
+    sdsfree(result);
+    zfree(lcs);
+    if (obja) decrRefCount(obja);
+    if (objb) decrRefCount(objb);
+}

@@ -130,6 +130,12 @@ void blockClient(client *c, int btype) {
     c->btype = btype;
     server.blocked_clients++;
     server.blocked_clients_by_type[btype]++;
+    if (btype == BLOCKED_PAUSE) {
+        listAddNodeTail(server.paused_clients,c);
+        c->paused_list_node = listLast(server.paused_clients);
+        /* Mark this client to execute its command after unpausing. */
+        c->flags |= CLIENT_PENDING_COMMAND;
+    }
 }
 
 /* This function is called in the beforeSleep() function of the event loop
@@ -151,7 +157,12 @@ void processUnblockedClients(void) {
          * client is not blocked before to proceed, but things may change and
          * the code is conceptually more correct this way. */
         if (!(c->flags & CLIENT_BLOCKED)) {
-            if (c->querybuf && sdslen(c->querybuf) > 0) {
+            /* If the client has a fully parsed command pending (for example
+             * because it was blocked by CLIENT PAUSE), execute it now. */
+            if (processPendingCommandsAndResetClient(c) == C_ERR) continue;
+            if (c->querybuf && sdslen(c->querybuf) > 0 &&
+                !(c->flags & CLIENT_BLOCKED))
+            {
                 processInputBufferAndReplicate(c);
             }
         }
@@ -194,6 +205,9 @@ void unblockClient(client *c) {
         unblockClientWaitingReplicas(c);
     } else if (c->btype == BLOCKED_MODULE) {
         unblockClientFromModule(c);
+    } else if (c->btype == BLOCKED_PAUSE) {
+        listDelNode(server.paused_clients,c->paused_list_node);
+        c->paused_list_node = NULL;
     } else {
         serverPanic("Unknown btype in unblockClient().");
     }
@@ -239,6 +253,11 @@ void disconnectAllBlockedClients(void) {
         client *c = listNodeValue(ln);
 
         if (c->flags & CLIENT_BLOCKED) {
+            /* Paused clients are an exception: when they'll be unblocked the
+             * command processing will start from scratch, and the command
+             * will be either executed or rejected. */
+            if (c->btype == BLOCKED_PAUSE) continue;
+
             addReplySds(c,sdsnew(
                 "-UNBLOCKED force unblock from blocking operation, "
                 "instance state changed (master -> replica?)\r\n"));

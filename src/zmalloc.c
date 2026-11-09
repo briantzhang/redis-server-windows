@@ -144,6 +144,24 @@ void zfree_no_tcache(void *ptr) {
 }
 #endif
 
+/* Like zmalloc(), but returns NULL instead of aborting when the allocation
+ * fails. Used for large transient buffers (LCS) where an error reply is
+ * preferable to terminating the server. */
+void *ztrymalloc(size_t size) {
+    ASSERT_NO_SIZE_OVERFLOW(size);
+    void *ptr = malloc(size+PREFIX_SIZE);
+
+    if (!ptr) return NULL;
+#ifdef HAVE_MALLOC_SIZE
+    update_zmalloc_stat_alloc(zmalloc_size(ptr));
+    return ptr;
+#else
+    *((size_t*)ptr) = size;
+    update_zmalloc_stat_alloc(size+PREFIX_SIZE);
+    return (char*)ptr+PREFIX_SIZE;
+#endif
+}
+
 void *zcalloc(size_t size) {
     ASSERT_NO_SIZE_OVERFLOW(size);
     void *ptr = calloc(1, size+PREFIX_SIZE);

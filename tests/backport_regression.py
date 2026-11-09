@@ -1822,6 +1822,229 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(info[b"max-deleted-entry-id"], b"1-1")
 
 
+    def test_bitcount_bitpos_bit_ranges(self):
+        key = self.key("bits")
+        self.cmd("SET", key, b"\xff\x00\x0f")
+        self.assertEqual(self.cmd("BITCOUNT", key), 12)
+        self.assertEqual(self.cmd("BITCOUNT", key, "0", "0"), 8)
+        self.assertEqual(self.cmd("BITCOUNT", key, "0", "0", "BIT"), 1)
+        self.assertEqual(self.cmd("BITCOUNT", key, "0", "7", "BIT"), 8)
+        self.assertEqual(self.cmd("BITCOUNT", key, "0", "-1", "BIT"), 12)
+        self.assertEqual(self.cmd("BITCOUNT", key, "8", "15", "BIT"), 0)
+        self.assertEqual(self.cmd("BITCOUNT", key, "16", "23", "BIT"), 4)
+        self.assertEqual(self.cmd("BITCOUNT", key, "0", "0", "BYTE"), 8)
+        with self.assertRaises(RedisError):
+            self.cmd("BITCOUNT", key, "0", "0", "NIBBLE")
+
+        self.assertEqual(self.cmd("BITPOS", key, "0"), 8)
+        self.assertEqual(self.cmd("BITPOS", key, "0", "0", "-1", "BIT"), 8)
+        self.assertEqual(self.cmd("BITPOS", key, "1", "0", "-1", "BIT"), 0)
+        self.assertEqual(self.cmd("BITPOS", key, "1", "8", "-1", "BIT"), 20)
+        self.assertEqual(self.cmd("BITPOS", key, "0", "2", "-1", "BIT"), 8)
+        self.assertEqual(self.cmd("BITPOS", key, "0", "2", "-1"), 16)
+
+        # A string of all ones has no zero bit.
+        ones = self.key("ones")
+        self.cmd("SET", ones, b"\xff")
+        # Without an explicit range the first bit past the end is reported.
+        self.assertEqual(self.cmd("BITPOS", ones, "0"), 8)
+        self.assertEqual(self.cmd("BITPOS", ones, "0", "0", "-1", "BIT"), -1)
+        self.assertEqual(self.cmd("BITPOS", ones, "1"), 0)
+        with self.assertRaises(RedisError):
+            self.cmd("BITPOS", key, "0", "0", "-1", "BITS")
+
+    def test_bitfield_ro(self):
+        key = self.key("bitfield")
+        self.cmd("SET", key, b"\x01\x02\x03\x04")
+        self.assertEqual(self.cmd("BITFIELD_RO", key, "GET", "u8", "0",
+                                  "GET", "u8", "8"), [1, 2])
+        self.assertEqual(self.cmd("BITFIELD_RO", key, "GET", "u16", "0"), [258])
+        with self.assertRaises(RedisError):
+            self.cmd("BITFIELD_RO", key, "SET", "u8", "0", "9")
+        with self.assertRaises(RedisError):
+            self.cmd("BITFIELD_RO", key, "INCRBY", "u8", "0", "1")
+        # The failed SET must not have modified the value.
+        self.assertEqual(self.cmd("GET", key), b"\x01\x02\x03\x04")
+        # The regular BITFIELD still writes.
+        self.assertEqual(self.cmd("BITFIELD", key, "SET", "u8", "0", "9"), [1])
+        self.assertEqual(self.cmd("GET", key), b"\x09\x02\x03\x04")
+
+    def test_lcs(self):
+        a = self.key("lcs:a")
+        b = self.key("lcs:b")
+        self.cmd("SET", a, "ohmytext")
+        self.cmd("SET", b, "mynewtext")
+        self.assertEqual(self.cmd("LCS", a, b), b"mytext")
+        self.assertEqual(self.cmd("LCS", a, b, "LEN"), 6)
+        self.assertEqual(self.cmd("LCS", a, b, "IDX"), [
+            b"matches", [[[4, 7], [5, 8]], [[2, 3], [0, 1]]],
+            b"len", 6,
+        ])
+        self.assertEqual(self.cmd("LCS", a, b, "IDX", "WITHMATCHLEN"), [
+            b"matches", [[[4, 7], [5, 8], 4], [[2, 3], [0, 1], 2]],
+            b"len", 6,
+        ])
+        self.assertEqual(self.cmd("LCS", a, b, "IDX", "MINMATCHLEN", "5"), [
+            b"matches", [], b"len", 6,
+        ])
+        with self.assertRaises(RedisError):
+            self.cmd("LCS", a, b, "LEN", "IDX")
+        with self.assertRaises(RedisError):
+            self.cmd("LCS", a, b, "NOSUCHOPTION")
+
+        missing = self.key("lcs:missing")
+        self.assertEqual(self.cmd("LCS", missing, b), b"")
+        self.assertEqual(self.cmd("LCS", missing, b, "LEN"), 0)
+        self.assertEqual(self.cmd("LCS", missing, b, "IDX"),
+                         [b"matches", [], b"len", 0])
+
+        wrong = self.key("lcs:list")
+        self.cmd("RPUSH", wrong, "x")
+        with self.assertRaises(RedisError):
+            self.cmd("LCS", wrong, b)
+
+    def test_sort_ro(self):
+        key = self.key("sortro")
+        self.cmd("RPUSH", key, "3", "1", "2")
+        self.assertEqual(self.cmd("SORT_RO", key), [b"1", b"2", b"3"])
+        self.assertEqual(self.cmd("SORT_RO", key, "DESC"), [b"3", b"2", b"1"])
+        self.assertEqual(self.cmd("SORT_RO", key, "LIMIT", "0", "2"),
+                         [b"1", b"2"])
+        out = self.key("sortro:out")
+        with self.assertRaises(RedisError):
+            self.cmd("SORT_RO", key, "STORE", out)
+        self.assertEqual(self.cmd("EXISTS", out), 0)
+        self.assertEqual(self.cmd("SORT", key, "STORE", out), 3)
+        self.assertEqual(self.cmd("LRANGE", out, "0", "-1"),
+                         [b"1", b"2", b"3"])
+
+    def test_eval_ro(self):
+        key = self.key("evalro")
+        self.cmd("SET", key, "value")
+        self.assertEqual(self.cmd("EVAL_RO",
+                                  "return redis.call('get',KEYS[1])", "1", key),
+                         b"value")
+        with self.assertRaises(RedisError):
+            self.cmd("EVAL_RO",
+                     "return redis.call('set',KEYS[1],'changed')", "1", key)
+        self.assertEqual(self.cmd("GET", key), b"value")
+
+        sha = self.cmd("SCRIPT", "LOAD", "return redis.call('get',KEYS[1])")
+        self.assertEqual(self.cmd("EVALSHA_RO", sha, "1", key), b"value")
+        sha_write = self.cmd("SCRIPT", "LOAD",
+                             "return redis.call('set',KEYS[1],'changed')")
+        with self.assertRaises(RedisError):
+            self.cmd("EVALSHA_RO", sha_write, "1", key)
+        self.assertEqual(self.cmd("GET", key), b"value")
+
+        # A normal EVAL can still write.
+        self.assertEqual(self.cmd("EVAL",
+                                  "return redis.call('set',KEYS[1],'new')",
+                                  "1", key), b"OK")
+        self.assertEqual(self.cmd("GET", key), b"new")
+
+    def test_client_info_unpause_pause(self):
+        if self.server is None:
+            self.skipTest("CLIENT PAUSE tests require --server")
+        info = self.cmd("CLIENT", "INFO")
+        self.assertIn(b"id=", info)
+        self.assertIn(b"addr=", info)
+        self.assertIn(b"name=", info)
+
+        with self.connect() as other:
+            self.assertEqual(self.cmd("CLIENT", "PAUSE", "5000", "WRITE"),
+                             b"OK")
+            started = time.monotonic()
+            self.assertEqual(other.command("GET", self.key("pause:missing")),
+                             None)
+            self.assertLess(time.monotonic() - started, 2.0)
+
+            pool = ThreadPoolExecutor(max_workers=1)
+            self.addCleanup(pool.shutdown)
+            pending = pool.submit(other.command, "SET",
+                                  self.key("pause:set"), "1")
+            time.sleep(0.3)
+            self.assertFalse(pending.done())
+            self.assertEqual(self.cmd("CLIENT", "UNPAUSE"), b"OK")
+            self.assertEqual(pending.result(timeout=5), b"OK")
+            self.assertEqual(self.cmd("GET", self.key("pause:set")), b"1")
+
+            # ALL pauses reads too, but the pause times out on its own.
+            self.assertEqual(self.cmd("CLIENT", "PAUSE", "300", "ALL"), b"OK")
+            started = time.monotonic()
+            self.assertEqual(other.command("PING"), b"PONG")
+            self.assertGreaterEqual(time.monotonic() - started, 0.2)
+
+        with self.assertRaises(RedisError):
+            self.cmd("CLIENT", "PAUSE", "100", "SOMETHING")
+
+    def test_config_multi_get_set(self):
+        if self.server is None:
+            self.skipTest("CONFIG tests require --server")
+        self.assertEqual(self.cmd("CONFIG", "GET", "maxmemory",
+                                  "maxmemory-samples"), [
+            b"maxmemory", b"0",
+            b"maxmemory-samples", b"5",
+        ])
+        # Overlapping patterns must not repeat a parameter.
+        self.assertEqual(self.cmd("CONFIG", "GET", "maxmemory", "maxmemory"),
+                         [b"maxmemory", b"0"])
+        self.assertEqual(self.cmd("CONFIG", "GET", "maxmemory*"),
+                         self.cmd("CONFIG", "GET", "maxmemory*"))
+
+        self.assertEqual(self.cmd("CONFIG", "SET", "maxmemory-samples", "7",
+                                  "timeout", "123"), b"OK")
+        self.assertEqual(self.cmd("CONFIG", "GET", "maxmemory-samples",
+                                  "timeout"),
+                         [b"maxmemory-samples", b"7", b"timeout", b"123"])
+
+        # Pairs are applied in order: the first one stays applied when a
+        # later one is rejected.
+        with self.assertRaises(RedisError):
+            self.cmd("CONFIG", "SET", "maxmemory-samples", "9",
+                     "no-such-parameter", "1")
+        self.assertEqual(self.cmd("CONFIG", "GET", "maxmemory-samples"),
+                         [b"maxmemory-samples", b"9"])
+        with self.assertRaises(RedisError):
+            self.cmd("CONFIG", "SET", "maxmemory-samples", "1", "timeout")
+        self.cmd("CONFIG", "SET", "maxmemory-samples", "5", "timeout", "0")
+
+    def test_command_list_and_getkeysandflags(self):
+        names = self.cmd("COMMAND", "LIST")
+        self.assertIn(b"get", names)
+        self.assertIn(b"bitfield_ro", names)
+
+        bits = self.cmd("COMMAND", "LIST", "FILTERBY", "PATTERN", "bit*")
+        self.assertIn(b"bitcount", bits)
+        self.assertIn(b"bitfield_ro", bits)
+        self.assertTrue(all(name.startswith(b"bit") for name in bits))
+
+        reads = self.cmd("COMMAND", "LIST", "FILTERBY", "ACLCAT", "read")
+        self.assertIn(b"get", reads)
+        self.assertNotIn(b"set", reads)
+        writes = self.cmd("COMMAND", "LIST", "FILTERBY", "ACLCAT", "write")
+        self.assertIn(b"set", writes)
+        self.assertNotIn(b"get", writes)
+        self.assertEqual(self.cmd("COMMAND", "LIST", "FILTERBY", "MODULE",
+                                  "whatever"), [])
+        with self.assertRaises(RedisError):
+            self.cmd("COMMAND", "LIST", "FILTERBY", "NOPE", "x")
+
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "SET",
+                                  "key", "value"),
+                         [[b"key", [b"RW", b"access", b"update"]]])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "GET", "key"),
+                         [[b"key", [b"RO", b"access"]]])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "MSET",
+                                  "a", "1", "b", "2"),
+                         [[b"a", [b"RW", b"access", b"update"]],
+                          [b"b", [b"RW", b"access", b"update"]]])
+        with self.assertRaises(RedisError):
+            self.cmd("COMMAND", "GETKEYSANDFLAGS", "NOSUCHCOMMAND", "x")
+        with self.assertRaises(RedisError):
+            self.cmd("COMMAND", "GETKEYSANDFLAGS", "PING")
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)

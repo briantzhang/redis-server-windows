@@ -271,6 +271,9 @@ typedef PORT_LONGLONG ustime_t; /* microsecond time type. */
 #define CLIENT_NO_EVICT (1<<29)   /* This client should not be evicted when
                                    * maxmemory is reached. */
 #define CLIENT_NO_TOUCH (1<<30)   /* Don't update LRU/LFU on key accesses. */
+#define CLIENT_PENDING_COMMAND (1u<<31) /* Client has a parsed command
+                                         waiting to be executed after a
+                                         CLIENT PAUSE. */
 #define CLIENT_REPLY_OFF (1<<22)   /* Don't send replies to client. */
 #define CLIENT_REPLY_SKIP_NEXT (1<<23)  /* Set CLIENT_REPLY_SKIP for next cmd */
 #define CLIENT_REPLY_SKIP (1<<24)  /* Don't send just this reply. */
@@ -287,7 +290,8 @@ typedef PORT_LONGLONG ustime_t; /* microsecond time type. */
 #define BLOCKED_MODULE 3  /* Blocked by a loadable module. */
 #define BLOCKED_STREAM 4  /* XREAD. */
 #define BLOCKED_ZSET 5    /* BZPOP et al. */
-#define BLOCKED_NUM 6     /* Number of blocked states. */
+#define BLOCKED_PAUSE 6   /* Blocked by CLIENT PAUSE */
+#define BLOCKED_NUM 7     /* Number of blocked states. */
 
 /* Client request types */
 #define PROTO_REQ_INLINE 1
@@ -799,6 +803,7 @@ typedef struct client {
     int slave_capa;         /* Slave capabilities: SLAVE_CAPA_* bitwise OR. */
     multiState mstate;      /* MULTI/EXEC state */
     int btype;              /* Type of blocking op if CLIENT_BLOCKED. */
+    listNode *paused_list_node; /* list node in server.paused_clients */
     blockingState bpop;     /* blocking state */
     PORT_LONGLONG woff;         /* Last write global replication offset. */
     list *watched_keys;     /* Keys WATCHED for MULTI/EXEC CAS */
@@ -973,6 +978,13 @@ struct clusterState;
 #define CHILD_INFO_TYPE_RDB 0
 #define CHILD_INFO_TYPE_AOF 1
 
+/* Client pause modes, ordered by restrictiveness. */
+typedef enum {
+    CLIENT_PAUSE_OFF = 0, /* Pause no commands */
+    CLIENT_PAUSE_WRITE,   /* Pause write commands */
+    CLIENT_PAUSE_ALL      /* Pause all commands */
+} pause_type;
+
 struct redisServer {
     /* General */
     pid_t pid;                  /* Main process pid. */
@@ -1030,6 +1042,7 @@ struct redisServer {
     rax *clients_index;         /* Active clients dictionary by client ID. */
     int clients_paused;         /* True if clients are currently paused */
     mstime_t clients_pause_end_time; /* Time when we undo clients_paused */
+    pause_type client_pause_type; /* Kind of pause currently in effect */
     char neterr[ANET_ERR_LEN];   /* Error buffer for anet.c */
     dict *migrate_cached_sockets;/* MIGRATE cached sockets */
     uint64_t next_client_id;    /* Next client unique ID. Incremental. */
@@ -1248,6 +1261,7 @@ struct redisServer {
     unsigned int blocked_clients;   /* # of clients executing a blocking cmd.*/
     unsigned int blocked_clients_by_type[BLOCKED_NUM];
     list *unblocked_clients; /* list of clients to unblock before next loop */
+    list *paused_clients; /* clients blocked because of CLIENT PAUSE */
     list *ready_keys;        /* List of readyList structures for BLPOP & co */
     /* Sort parameters - qsort_r() is only available under BSD so we
      * have to take this state global, in order to pass it to sortCompare() */
@@ -1493,6 +1507,7 @@ void *addDeferredMultiBulkLength(client *c);
 void setDeferredMultiBulkLength(client *c, void *node, PORT_LONG length);
 void processInputBuffer(client *c);
 void processInputBufferAndReplicate(client *c);
+int processPendingCommandsAndResetClient(client *c);
 void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask);
@@ -1536,7 +1551,10 @@ char *getClientTypeName(int IF_WIN32(_class,class));
 void flushSlavesOutputBuffers(void);
 void disconnectSlaves(void);
 int listenToPort(int port, int *fds, int *count);
-void pauseClients(mstime_t duration);
+void pauseClients(mstime_t end, pause_type type);
+void unpauseClients(void);
+int areClientsPaused(void);
+int checkClientPauseTimeoutAndReturnIfPaused(void);
 int clientsArePaused(void);
 int processEventsWhileBlocked(void);
 int handleClientsWithPendingWrites(void);
@@ -2049,6 +2067,7 @@ void existsCommand(client *c);
 void setbitCommand(client *c);
 void getbitCommand(client *c);
 void bitfieldCommand(client *c);
+void bitfieldRoCommand(client *c);
 void setrangeCommand(client *c);
 void getrangeCommand(client *c);
 void incrCommand(client *c);
@@ -2102,6 +2121,7 @@ void syncCommand(client *c);
 void flushdbCommand(client *c);
 void flushallCommand(client *c);
 void sortCommand(client *c);
+void sortroCommand(client *c);
 void lremCommand(client *c);
 void lposCommand(client *c);
 void lmoveCommand(client *c);
@@ -2158,6 +2178,7 @@ int serveClientBlockedOnList(client *receiver, robj *key, robj *dstkey, redisDb 
 PORT_LONG listPopRangeAndReplyWithKey(client *c, robj *o, robj *key, int where, PORT_LONG count, int *deleted);
 void appendCommand(client *c);
 void strlenCommand(client *c);
+void lcsCommand(client *c);
 void zrankCommand(client *c);
 void zrevrankCommand(client *c);
 void hsetCommand(client *c);
@@ -2206,6 +2227,8 @@ void memoryCommand(client *c);
 void clientCommand(client *c);
 void evalCommand(client *c);
 void evalShaCommand(client *c);
+void evalRoCommand(client *c);
+void evalShaRoCommand(client *c);
 void scriptCommand(client *c);
 void timeCommand(client *c);
 void bitopCommand(client *c);

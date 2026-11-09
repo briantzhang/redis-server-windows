@@ -373,6 +373,9 @@ void luaReplyToRedisReply(client *c, lua_State *lua) {
 
 #define LUA_CMD_OBJCACHE_SIZE 32
 #define LUA_CMD_OBJCACHE_MAX_LEN 64
+/* True while a read-only script (EVAL_RO / EVALSHA_RO) is running. */
+static int lua_ro = 0;
+
 int luaRedisGenericCommand(lua_State *lua, int raise_error) {
     int j, argc = lua_gettop(lua);
     struct redisCommand *cmd;
@@ -509,6 +512,12 @@ int luaRedisGenericCommand(lua_State *lua, int raise_error) {
     /* There are commands that are not allowed inside scripts. */
     if (cmd->flags & CMD_NOSCRIPT) {
         luaPushError(lua, "This Redis command is not allowed from scripts");
+        goto cleanup;
+    }
+
+    /* Write commands are forbidden from read-only scripts. */
+    if (lua_ro && (cmd->flags & CMD_WRITE)) {
+        luaPushError(lua, "Write commands are not allowed from read-only scripts.");
         goto cleanup;
     }
 
@@ -1491,10 +1500,17 @@ void evalGenericCommand(client *c, int evalsha) {
 }
 
 void evalCommand(client *c) {
+    int prev_ro = lua_ro;
+    if (c->cmd->proc == evalRoCommand) lua_ro = 1;
     if (!(c->flags & CLIENT_LUA_DEBUG))
         evalGenericCommand(c,0);
     else
         evalGenericCommandWithDebugging(c,0);
+    lua_ro = prev_ro;
+}
+
+void evalRoCommand(client *c) {
+    evalCommand(c);
 }
 
 void evalShaCommand(client *c) {
@@ -1506,12 +1522,17 @@ void evalShaCommand(client *c) {
         addReply(c, shared.noscripterr);
         return;
     }
+    int prev_ro = lua_ro;
+    if (c->cmd->proc == evalShaRoCommand) lua_ro = 1;
     if (!(c->flags & CLIENT_LUA_DEBUG))
         evalGenericCommand(c,1);
-    else {
+    else
         addReplyError(c,"Please use EVAL instead of EVALSHA for debugging");
-        return;
-    }
+    lua_ro = prev_ro;
+}
+
+void evalShaRoCommand(client *c) {
+    evalShaCommand(c);
 }
 
 void scriptCommand(client *c) {
