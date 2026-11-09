@@ -433,6 +433,8 @@ typedef PORT_LONGLONG ustime_t; /* microsecond time type. */
 #define SHUTDOWN_SAVE 1         /* Force SAVE on SHUTDOWN even if no save
                                    points are configured. */
 #define SHUTDOWN_NOSAVE 2       /* Don't SAVE on SHUTDOWN. */
+#define SHUTDOWN_NOW 4          /* Don't wait for lagging replicas. */
+#define SHUTDOWN_FORCE 8        /* Ignore errors saving on SHUTDOWN. */
 
 /* Command call flags, see call() function */
 #define CMD_CALL_NONE 0
@@ -2041,6 +2043,7 @@ void authCommand(client *c);
 void aclCommand(client *c);
 void ACLInit(void);
 void *ACLDefaultUser(void);
+const char *ACLUserName(void *user);
 int ACLCheckCommand(client *c);
 void ACLInitDefaultUser(void);
 void ACLAssignCommandIDs(void);
@@ -2236,12 +2239,15 @@ void bitcountCommand(client *c);
 void bitposCommand(client *c);
 void replconfCommand(client *c);
 void waitCommand(client *c);
+void waitaofCommand(client *c);
 void geoencodeCommand(client *c);
 void geodecodeCommand(client *c);
 void georadiusbymemberCommand(client *c);
 void georadiusbymemberroCommand(client *c);
 void georadiusCommand(client *c);
 void georadiusroCommand(client *c);
+void geosearchCommand(client *c);
+void geosearchstoreCommand(client *c);
 void geoaddCommand(client *c);
 void geohashCommand(client *c);
 void geoposCommand(client *c);

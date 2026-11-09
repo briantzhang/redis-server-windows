@@ -1,6 +1,6 @@
 # 运维手册
 
-适用版本：Redis for Windows `5.0.14.1-bp7`，仅 Windows x64，单机、非集群。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
+适用版本：Redis for Windows `5.0.14.1-bp8`，仅 Windows x64，单机、非集群。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
 
 本文只覆盖这一个可执行文件的日常操作。它不包含 TLS、多段 AOF 和集群，那些配置项写进 `redis.conf` 也不会生效，启动时会报未知配置。ACL 已按 Redis 6 的范围实现，见第 3 节。
 
@@ -38,7 +38,7 @@
 .\redis-server.exe --version
 ```
 
-应看到 `v=5.0.14.1-bp7`。如果不是这个版本号，说明运行的不是这份回移。
+应看到 `v=5.0.14.1-bp8`。如果不是这个版本号，说明运行的不是这份回移。
 
 另开一个窗口检查存活：
 
@@ -116,10 +116,16 @@ logfile D:/redis-data/redis.log
 ACL SETUSER reader on >secret ~cache:* -@all +get +ping
 AUTH reader secret
 ACL WHOAMI
+ACL CAT                  -- 列出全部分类
+ACL CAT read             -- 列出 read 分类里的命令
+ACL USERS                -- 列出全部用户
+ACL GETUSER reader       -- 查看某个用户的标志、口令摘要、命令和键规则
+ACL GENPASS 64           -- 生成 64 位（16 个十六进制字符）的随机口令
+ACL DRYRUN reader get cache:1   -- 预检权限，不执行命令
 ```
 
 - `on`/`off` 启用或停用用户。`>口令` 追加一个口令，口令以 SHA1 摘要保存，不明文落盘。
-- `-@all +get +ping` 先清空命令权限再放行单个命令。分类有 `read`、`write`、`admin`、`pubsub`、`fast`、`slow`，顺序有意义，`+get` 必须写在 `-@all` 后面。
+- `-@all +get +ping` 先清空命令权限再放行单个命令。分类有 `keyspace`、`read`、`write`、`admin`、`pubsub`、`fast`、`slow`，顺序有意义，`+get` 必须写在 `-@all` 后面。
 - `~cache:*` 只允许匹配该通配符的键，`~*` 是全部键。键权限只有允许或不允许，没有 Redis 7 那种按键区分读和写的选择器，写了 `%R~` 这类规则会报未知规则。
 - 一个用户不能删掉自己看不到的用户：`ACL` 命令本身受权限控制，但 `ACL WHOAMI` 对任何已认证用户都放行。
 - 配置了 `requirepass` 时，未认证连接收到 `NOAUTH`；没有配置时，连接以 `default` 用户进入，`default` 默认拥有全部权限。
@@ -331,6 +337,19 @@ COMMAND GETKEYSANDFLAGS MSET a 1 b 2
 
 `CONFIG GET` 对重叠的模式去重。`CONFIG SET` 逐对应用：如果第二对参数非法，第一对已经生效，返回错误后要自己检查当前值。`COMMAND GETKEYSANDFLAGS` 的键标志是按命令级读写属性近似出来的（`RO`/`RW`、`access`、`update`），没有 Redis 7 的细粒度键规格。
 
+地理搜索与连接排查：
+
+```text
+GEOSEARCH places FROMLONLAT 116.40 39.90 BYRADIUS 10 km ASC WITHDIST
+GEOSEARCHSTORE nearby places FROMMEMBER home BYBOX 20 20 km STOREDIST
+CLIENT LIST                       -- 每行现在带 laddr= 和 user=
+CLIENT KILL USER reader           -- 断开某个 ACL 用户的全部连接
+CLIENT KILL MAXAGE 3600           -- 断开建立超过一小时的连接
+CLIENT KILL LADDR 127.0.0.1:6379  -- 命中该监听地址上的全部连接
+```
+
+`CLIENT KILL` 默认跳过发起命令的连接；`LADDR` 是服务端本地地址，不是客户端地址，所以同一监听端口上的连接都会命中。`MAXAGE` 按连接建立至今的秒数计算，`-1` 会被拒绝。`INFO everything` 与 `INFO all` 输出相同。
+
 ## 5. 持久化与恢复
 
 RDB 是某个时间点的快照，AOF 是写命令日志。两者同时开启时，重启优先用 AOF 恢复，因为它更接近停机前的状态。
@@ -366,6 +385,14 @@ BGREWRITEAOF
 
 本版把带过期时间的 `SET` 记成 `SET` 加绝对时间的 `PEXPIREAT`。所以从 AOF 恢复后，TTL 不会因为“重放时重新计算相对时间”而变长。
 
+需要确认 AOF 已经落盘时：
+
+```text
+WAITAOF 1 0 1000
+```
+
+本版在命令内同步刷盘后立即返回 `[1, 0]`；第二项是副本 AOF 确认数，始终为 0。它不会像 Redis 7.2 那样阻塞到超时，也不能用来等待副本。`SHUTDOWN` 另接受 `NOW`（不等副本）、`FORCE`（保存失败也退出）和 `ABORT`（取消已置位但尚未执行的关闭请求）；正常停机仍建议先 `BGSAVE`/`BGREWRITEAOF`，确认完成后再 `SHUTDOWN`。
+
 ## 6. 备份
 
 备份前先拿到一致的文件：
@@ -377,7 +404,7 @@ BGREWRITEAOF
 
 等 `INFO persistence` 里两次后台任务的状态都变成 `ok`，再复制 `dir` 下的 `dump.rdb` 和 `appendonly.aof`。复制过程中不要 `SHUTDOWN`，也不要再手动触发保存。
 
-备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp7-20261109.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
+备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp8-20261109.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
 
 流的 `entries-added` 和 `max-deleted-entry-id` 不写入 RDB 快照：从 `dump.rdb` 恢复后前者按当前长度重算、后者归零；从 AOF 恢复（含 AOF 重写）会保留。若业务依赖这两个计数，恢复时优先使用 AOF，或在恢复后用 `XSETID <key> <id> ENTRIESADDED <n> MAXDELETEDID <id>` 校正。
 

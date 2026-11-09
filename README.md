@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp7
+# Redis for Windows 5.0.14.1-bp8
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp7`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp8`。
 
 ## 这个版本新增了什么
 
@@ -56,14 +56,22 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `CLIENT PAUSE timeout [WRITE\|ALL]`、`CLIENT UNPAUSE`、`CLIENT INFO` | 6.2 | 暂停写命令或全部命令、提前恢复、返回当前连接信息 |
 | `CONFIG GET pattern [pattern ...]`、`CONFIG SET param value [param value ...]` | 7.0 | 多模式查询（结果去重）与多参数设置；SET 按顺序应用，不是原子操作 |
 | `COMMAND LIST [FILTERBY PATTERN\|ACLCAT\|MODULE ...]`、`COMMAND GETKEYSANDFLAGS` | 7.0 | 列出命令名；键标志按命令级读写属性近似给出 |
+| `GEOSEARCH key FROMMEMBER\|FROMLONLAT ... BYRADIUS\|BYBOX ... [ASC\|DESC] [COUNT n [ANY]] [WITHCOORD\|WITHDIST\|WITHHASH]` | 6.2 | 按圆形或矩形区域搜索地理位置，支持 ANY 提前结束 |
+| `GEOSEARCHSTORE dst src ... [STOREDIST]` | 6.2 | 把搜索结果写入有序集合，可存距离；源键不存在时删除目标键 |
+| `ACL CAT [category]` / `ACL USERS` / `ACL GETUSER user` / `ACL GENPASS [bits]` / `ACL DRYRUN user cmd ...` | 6.0 | 列出命令分类与用户，查看用户规则，生成随机口令，预检权限 |
+| `CLIENT KILL` 的 `LADDR` / `USER` / `MAXAGE` | 6.0 / 7.0 | 按服务端本地地址、认证用户、连接存活秒数筛选要断开的连接 |
+| `CLIENT LIST` / `CLIENT INFO` 的 `laddr=`、`user=` 字段 | 6.0 / 6.2 | 输出连接的本地地址与当前认证用户 |
+| `INFO everything` | 7.0 | 与 `INFO all` 相同地输出全部区段 |
+| `WAITAOF numlocal numreplicas timeout` | 7.2 | 同步确认本机 AOF 已落盘；副本 AOF 计数固定为 0，见下方说明 |
+| `SHUTDOWN [NOSAVE\|SAVE] [NOW] [FORCE] [ABORT]` | 7.0 | `NOW` 不等副本，`FORCE` 保存失败也退出，`ABORT` 取消待执行的关闭 |
 
 过期时间在秒数乘 1000、相对时间加当前时间之前做有符号 64 位溢出检查，非法值报错且不改动数据。
 
-ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`>password`、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`。没有 Redis 7 的多选择器（一个用户多套权限）和按键的读写权限位。配置了 `requirepass` 时，它仍然是 `default` 用户的口令，未认证的连接一律拒绝；不配置时连接直接以 `default` 用户身份进入，ACL 规则照常生效。
+ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`>password`、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并可用 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN` 查看规则和预检权限。没有 Redis 7 的多选择器（一个用户多套权限）和按键的读写权限位。配置了 `requirepass` 时，它仍然是 `default` 用户的口令，未认证的连接一律拒绝；不配置时连接直接以 `default` 用户身份进入，ACL 规则照常生效。
 
 命令语义参照 Redis `7.0.15`（BSD）手工适配，没有引入 Redis 8 的源码。完整说明见 [BACKPORT-RELEASE.md](BACKPORT-RELEASE.md)。
 
-`CLIENT PAUSE WRITE` 只拦写命令与 `EXEC`，`CLIENT PAUSE ALL` 连读命令一起拦；被暂停的连接在恢复后按原顺序执行已解析的命令。`CONFIG SET` 多参数时逐对应用，后面的参数非法时前面的已经生效。`COMMAND LIST FILTERBY ACLCAT` 用命令级读写标志近似 `read`/`write`/`keyspace` 分类；`COMMAND GETKEYSANDFLAGS` 只给出 `RO`/`RW`、`access`、`update` 三种标志，没有 Redis 7 的键规格。
+`CLIENT PAUSE WRITE` 只拦写命令与 `EXEC`，`CLIENT PAUSE ALL` 连读命令一起拦；被暂停的连接在恢复后按原顺序执行已解析的命令。`CONFIG SET` 多参数时逐对应用，后面的参数非法时前面的已经生效。`COMMAND LIST FILTERBY ACLCAT` 用命令级读写标志近似 `read`/`write`/`keyspace` 分类；`COMMAND GETKEYSANDFLAGS` 只给出 `RO`/`RW`、`access`、`update` 三种标志，没有 Redis 7 的键规格。`CLIENT KILL LADDR` 匹配的是服务端监听地址，因此同一监听地址上的所有连接都会命中；`MAXAGE` 按连接建立到现在的秒数计算。`WAITAOF` 在本版没有异步 fsync 确认机制：它在命令内同步刷盘后立即返回 `[本机确认, 0]`，不会阻塞到超时，也不跟踪副本的 AOF 落盘。`SHUTDOWN ABORT` 只能取消已置位但尚未执行的关闭请求，此时没有“关闭进行中”的状态。
 
 ## 没有合入的部分
 
@@ -92,13 +100,13 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 
 ## 验证
 
-在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，41 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
+在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，55 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
 
 ```bash
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮新增流命令用例：XADD/XTRIM 的 MINID 与 LIMIT、NOMKSTREAM、XGROUP CREATECONSUMER、XPENDING IDLE、XAUTOCLAIM、XSETID 计数选项、XINFO STREAM FULL，以及 AOF 重放和重写后的计数与 NOACK 消费者。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮新增 GEOSEARCH/GEOSEARCHSTORE 的两种区域与结果选项、ACL 子命令、CLIENT KILL 的 LADDR/USER/MAXAGE、CLIENT LIST 新字段、INFO everything、WAITAOF 的 AOF 开/关两种情形，以及 SHUTDOWN 选项校验和一个真实退出的附加实例。
 
 这轮验证不等于已合入上游全部安全补丁，也没有做生产压力测试。
 

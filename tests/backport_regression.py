@@ -2044,6 +2044,201 @@ class BackportRegression(unittest.TestCase):
         with self.assertRaises(RedisError):
             self.cmd("COMMAND", "GETKEYSANDFLAGS", "PING")
 
+    def test_geosearch_geosearchstore(self):
+        g = self.key("geo:search")
+        self.assertEqual(self.cmd("GEOADD", g,
+                                  "13.361389", "38.115556", "palermo",
+                                  "15.087269", "37.502669", "catania",
+                                  "12.5", "41.9", "rome"), 3)
+
+        self.assertEqual(self.cmd("GEOSEARCH", g, "FROMLONLAT", "15", "37",
+                                  "BYRADIUS", "200", "km", "ASC"),
+                         [b"catania", b"palermo"])
+        self.assertEqual(self.cmd("GEOSEARCH", g, "FROMMEMBER", "palermo",
+                                  "BYRADIUS", "200", "km", "ASC"),
+                         [b"palermo", b"catania"])
+        self.assertEqual(self.cmd("GEOSEARCH", g, "FROMMEMBER", "palermo",
+                                  "BYBOX", "400", "400", "km", "ASC",
+                                  "COUNT", "1"), [b"palermo"])
+        self.assertEqual(self.cmd("GEOSEARCH", g, "FROMLONLAT", "15", "37",
+                                  "BYRADIUS", "200", "km", "DESC"),
+                         [b"palermo", b"catania"])
+
+        rows = self.cmd("GEOSEARCH", g, "FROMLONLAT", "15", "37",
+                        "BYRADIUS", "200", "km", "ASC",
+                        "WITHCOORD", "WITHDIST", "WITHHASH")
+        self.assertEqual([row[0] for row in rows], [b"catania", b"palermo"])
+        self.assertAlmostEqual(float(rows[0][1]), 56.44, places=1)
+        self.assertIsInstance(rows[0][2], int)
+        self.assertEqual(len(rows[0][3]), 2)
+
+        # ANY needs COUNT and may return any single matching member.
+        any_one = self.cmd("GEOSEARCH", g, "FROMLONLAT", "15", "37",
+                           "BYRADIUS", "200", "km", "COUNT", "1", "ANY")
+        self.assertEqual(len(any_one), 1)
+        self.assertIn(any_one[0], (b"catania", b"palermo"))
+        with self.assertRaises(RedisError):
+            self.cmd("GEOSEARCH", g, "FROMLONLAT", "15", "37",
+                     "BYRADIUS", "200", "km", "ANY")
+        with self.assertRaises(RedisError):
+            self.cmd("GEOSEARCH", g, "FROMMEMBER", "palermo",
+                     "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km")
+        with self.assertRaises(RedisError):
+            self.cmd("GEOSEARCH", g, "FROMMEMBER", "palermo",
+                     "BYRADIUS", "200", "km", "BYBOX", "1", "1", "km")
+
+        dst = self.key("geo:search:dst")
+        self.assertEqual(self.cmd("GEOSEARCHSTORE", dst, g,
+                                  "FROMLONLAT", "15", "37",
+                                  "BYRADIUS", "200", "km", "STOREDIST"), 2)
+        self.assertEqual(self.cmd("ZRANGE", dst, "0", "-1", "WITHSCORES"),
+                         [b"catania", b"56.441257870158204",
+                          b"palermo", b"190.44242984775784"])
+
+        # A missing source deletes the destination and returns zero.
+        missing = self.key("geo:search:missing")
+        self.assertEqual(self.cmd("GEOSEARCHSTORE", dst, missing,
+                                  "FROMMEMBER", "x",
+                                  "BYRADIUS", "1", "km"), 0)
+        self.assertEqual(self.cmd("EXISTS", dst), 0)
+
+        # The old GEORADIUS command keeps working on top of the new engine.
+        self.assertEqual(self.cmd("GEORADIUS", g, "15", "37", "200", "km",
+                                  "ASC"), [b"catania", b"palermo"])
+
+    def test_acl_subcommands(self):
+        categories = self.cmd("ACL", "CAT")
+        for name in (b"keyspace", b"read", b"write", b"admin", b"pubsub",
+                     b"fast", b"slow"):
+            self.assertIn(name, categories)
+        reads = self.cmd("ACL", "CAT", "read")
+        self.assertIn(b"get", reads)
+        self.assertNotIn(b"set", reads)
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "CAT", "nosuchcategory")
+
+        name = "bp8acluser"
+        self.assertEqual(self.cmd("ACL", "SETUSER", name, "on", ">pw",
+                                  "~pref:*", "+get", "+set"), b"OK")
+        self.assertIn(name.encode(), self.cmd("ACL", "USERS"))
+
+        info = self.flat_map(self.cmd("ACL", "GETUSER", name))
+        self.assertEqual(info[b"flags"], [b"on"])
+        self.assertEqual(info[b"keys"], [b"~pref:*"])
+        self.assertEqual(len(info[b"passwords"]), 1)
+        self.assertIn(b"-@all", info[b"commands"])
+        self.assertIn(b"+get", info[b"commands"])
+        self.assertEqual(info[b"channels"], b"")
+
+        self.assertEqual(len(self.cmd("ACL", "GENPASS")), 64)
+        self.assertEqual(len(self.cmd("ACL", "GENPASS", "8")), 2)
+
+        self.assertEqual(self.cmd("ACL", "DRYRUN", name, "get", "pref:1"),
+                         b"OK")
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "DRYRUN", name, "del", "pref:1")
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "DRYRUN", name, "get", "other:1")
+
+        self.assertEqual(self.cmd("ACL", "DELUSER", name), 1)
+        self.assertNotIn(name.encode(), self.cmd("ACL", "USERS"))
+
+    def test_client_kill_options_and_list_fields(self):
+        if self.server is None:
+            self.skipTest("CLIENT tests require --server")
+        info = self.cmd("CLIENT", "INFO")
+        self.assertIn(("laddr=127.0.0.1:%d" % self.port).encode(), info)
+        self.assertIn(b"user=default", info)
+
+        name = "bp8killuser"
+        self.assertEqual(self.cmd("ACL", "SETUSER", name, "on", ">pw",
+                                  "+@all", "~*"), b"OK")
+        self.addCleanup(self.cmd, "ACL", "DELUSER", name)
+
+        with self.connect() as user_client:
+            self.assertEqual(user_client.command("AUTH", name, "pw"), b"OK")
+            self.assertIn(b"user=" + name.encode(), self.cmd("CLIENT", "LIST"))
+            self.assertEqual(self.cmd("CLIENT", "KILL", "USER", name), 1)
+            with self.assertRaises((OSError, EOFError)):
+                user_client.command("PING")
+        self.assertEqual(self.cmd("CLIENT", "KILL", "USER", "nosuchuser"), 0)
+
+        with self.connect() as victim:
+            self.assertEqual(victim.command("PING"), b"PONG")
+            self.assertEqual(self.cmd("CLIENT", "KILL", "MAXAGE", "99999"), 0)
+            self.assertEqual(self.cmd("CLIENT", "KILL", "MAXAGE", "0"), 1)
+            with self.assertRaises((OSError, EOFError)):
+                victim.command("PING")
+        with self.assertRaises(RedisError):
+            self.cmd("CLIENT", "KILL", "MAXAGE", "-1")
+
+        # laddr is the address the server accepted on, so it matches every
+        # connection; skipme keeps the issuing client alive.
+        with self.connect() as victim:
+            victim_info = victim.command("CLIENT", "INFO")
+            laddr = [field for field in victim_info.split()
+                     if field.startswith(b"laddr=")][0][len(b"laddr="):]
+            self.assertEqual(self.cmd("CLIENT", "KILL", "LADDR", laddr), 1)
+            with self.assertRaises((OSError, EOFError)):
+                victim.command("PING")
+
+    def test_info_everything_and_wait_aof_local(self):
+        if self.server is None:
+            self.skipTest("INFO/WAITAOF tests require --server")
+        info = self.cmd("INFO", "everything")
+        for section in (b"# Server", b"# Clients", b"# Commandstats",
+                        b"# Keyspace"):
+            self.assertIn(section, info)
+
+        # appendfsync is "always" for the managed test server, so the local
+        # AOF is acknowledged synchronously.
+        self.assertEqual(self.cmd("WAITAOF", "1", "0", "100"), [1, 0])
+        self.assertEqual(self.cmd("WAITAOF", "0", "0", "100"), [0, 0])
+        self.assertEqual(self.cmd("WAITAOF", "1", "2", "100"), [1, 0])
+        with self.assertRaises(RedisError):
+            self.cmd("WAITAOF", "-1", "0", "100")
+        with self.assertRaises(RedisError):
+            self.cmd("WAITAOF", "0", "-1", "100")
+
+    def test_wait_durability_without_appendonly(self):
+        if self.server is None:
+            self.skipTest("WAITAOF test requires --server")
+        self.assertEqual(self.cmd("WAITAOF", "0", "0", "100"), [0, 0])
+        with self.assertRaises(RedisError):
+            self.cmd("WAITAOF", "1", "0", "100")
+
+    def test_shutdown_option_validation(self):
+        if self.server is None:
+            self.skipTest("SHUTDOWN tests require --server")
+        with self.assertRaises(RedisError) as raised:
+            self.cmd("SHUTDOWN", "ABORT")
+        self.assertIn("No shutdown in progress", str(raised.exception))
+        for args in (("SHUTDOWN", "ABORT", "SAVE"),
+                     ("SHUTDOWN", "ABORT", "NOSAVE"),
+                     ("SHUTDOWN", "SAVE", "NOSAVE"),
+                     ("SHUTDOWN", "NOSAVE", "BOGUS")):
+            with self.assertRaises(RedisError):
+                self.cmd(*args)
+
+        # NOW and FORCE are accepted and the extra server exits.
+        directory = Path(self.temp.name) / "shutdown"
+        directory.mkdir()
+        extra = ManagedServer(self.server.executable, directory,
+                              OPTIONS.timeout, OPTIONS.startup_timeout)
+        self.addCleanup(extra.close)
+        extra.start()
+        client = RESP2("127.0.0.1", extra.port, OPTIONS.timeout)
+        try:
+            client.command("SHUTDOWN", "NOW", "FORCE")
+        except (OSError, EOFError):
+            pass
+        finally:
+            client.close()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and extra.process.poll() is None:
+            time.sleep(0.05)
+        self.assertIsNotNone(extra.process.poll())
+
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__,

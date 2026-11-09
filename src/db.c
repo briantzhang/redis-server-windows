@@ -1080,22 +1080,47 @@ void typeCommand(client *c) {
 }
 
 void shutdownCommand(client *c) {
-    int flags = 0;
+    int flags = 0, abort = 0;
 
-    if (c->argc > 2) {
-        addReply(c,shared.syntaxerr);
-        return;
-    } else if (c->argc == 2) {
-        if (!strcasecmp(c->argv[1]->ptr,"nosave")) {
+    for (int i = 1; i < c->argc; i++) {
+        if (!strcasecmp(c->argv[i]->ptr,"nosave")) {
             flags |= SHUTDOWN_NOSAVE;
-        } else if (!strcasecmp(c->argv[1]->ptr,"save")) {
+        } else if (!strcasecmp(c->argv[i]->ptr,"save")) {
             flags |= SHUTDOWN_SAVE;
+        } else if (!strcasecmp(c->argv[i]->ptr,"now")) {
+            flags |= SHUTDOWN_NOW;
+        } else if (!strcasecmp(c->argv[i]->ptr,"force")) {
+            flags |= SHUTDOWN_FORCE;
+        } else if (!strcasecmp(c->argv[i]->ptr,"abort")) {
+            abort = 1;
         } else {
             addReply(c,shared.syntaxerr);
             return;
         }
     }
+    if ((abort && flags != 0) ||
+        ((flags & SHUTDOWN_NOSAVE) && (flags & SHUTDOWN_SAVE)))
+    {
+        addReply(c,shared.syntaxerr);
+        return;
+    }
+
+    if (abort) {
+        if (server.shutdown_asap) {
+            server.shutdown_asap = 0;
+            serverLog(LL_WARNING,"Shutdown aborted.");
+            addReply(c,shared.ok);
+        } else {
+            addReplyError(c,"No shutdown in progress");
+        }
+        return;
+    }
+
     if (prepareForShutdown(flags) == C_OK) exit(0);
+    if (flags & SHUTDOWN_FORCE) {
+        /* The dataset could not be saved: shut down anyway, without saving. */
+        if (prepareForShutdown(SHUTDOWN_NOSAVE) == C_OK) exit(0);
+    }
     addReplyError(c,"Errors trying to SHUTDOWN. Check logs.");
 }
 

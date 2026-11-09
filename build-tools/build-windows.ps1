@@ -9,7 +9,7 @@ $buildId = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $hdr = @"
 #define REDIS_GIT_SHA1 "$sha"
 #define REDIS_GIT_DIRTY "$dirty"
-#define REDIS_BUILD_ID "windows-bp7-$buildId"
+#define REDIS_BUILD_ID "windows-bp8-$buildId"
 "@
 [IO.File]::WriteAllText((Join-Path $root 'src\release.h'), $hdr, [Text.Encoding]::ASCII)
 $log = Join-Path $root 'build-tools\build-windows.log'

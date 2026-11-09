@@ -1789,8 +1789,14 @@ char *getClientPeerId(client *c) {
 /* Concatenate a string representing the state of a client in an human
  * readable format, into the sds string 's'. */
 sds catClientInfoString(sds s, client *client) {
-    char flags[16], events[3], *p;
+    char flags[16], events[3], laddr[NET_PEER_ID_LEN], *p;
     int emask;
+
+    if (client->fd == -1) {
+        laddr[0] = '\0';
+    } else {
+        anetFormatSock(client->fd,laddr,sizeof(laddr));
+    }
 
     p = flags;
     if (client->flags & CLIENT_SLAVE) {
@@ -1820,9 +1826,10 @@ sds catClientInfoString(sds s, client *client) {
     if (emask & AE_WRITABLE) *p++ = 'w';
     *p = '\0';
     return sdscatfmt(s,
-        "id=%U addr=%s fd=%i name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i multi=%i qbuf=%U qbuf-free=%U obl=%U oll=%U omem=%U events=%s cmd=%s",
+        "id=%U addr=%s laddr=%s fd=%i name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i multi=%i qbuf=%U qbuf-free=%U obl=%U oll=%U omem=%U events=%s cmd=%s user=%s",
         (PORT_ULONGLONG) client->id,
         getClientPeerId(client),
+        laddr,
         client->fd,
         client->name ? (char*)client->name->ptr : "",
         (PORT_LONGLONG)(server.unixtime - client->ctime),
@@ -1838,7 +1845,8 @@ sds catClientInfoString(sds s, client *client) {
         (PORT_ULONGLONG) listLength(client->reply),
         (PORT_ULONGLONG) getClientOutputBufferMemoryUsage(client),
         events,
-        client->lastcmd ? client->lastcmd->name : "NULL");
+        client->lastcmd ? client->lastcmd->name : "NULL",
+        client->user ? ACLUserName(client->user) : "");
 }
 
 sds getAllClientsInfoString(int type) {
@@ -1905,6 +1913,9 @@ void clientCommand(client *c) {
 "kill <option> <value> [option value ...] -- Kill connections. Options are:",
 "     addr <ip:port>                      -- Kill connection made from <ip:port>",
 "     type (normal|master|replica|pubsub) -- Kill connections by type.",
+"     laddr <ip:port>                     -- Kill connection made to <ip:port>.",
+"     user <username>                     -- Kill connections authenticated as <username>.",
+"     maxage <seconds>                    -- Kill connections older than <seconds>.",
 "     skipme (yes|no)   -- Skip killing current connection (default: yes).",
 "list [options ...]     -- Return information about client connections. Options:",
 "     type (normal|master|replica|pubsub) -- Return clients of specified type.",
@@ -1959,6 +1970,8 @@ NULL
         char *addr = NULL;
         int type = -1;
         uint64_t id = 0;
+        char *laddr = NULL, *username = NULL;
+        long long maxage = 0;
         int skipme = 1;
         int killed = 0, close_this_client = 0;
 
@@ -1988,6 +2001,21 @@ NULL
                     }
                 } else if (!strcasecmp(c->argv[i]->ptr,"addr") && moreargs) {
                     addr = c->argv[i+1]->ptr;
+                } else if (!strcasecmp(c->argv[i]->ptr,"laddr") && moreargs) {
+                    laddr = c->argv[i+1]->ptr;
+                } else if (!strcasecmp(c->argv[i]->ptr,"user") && moreargs) {
+                    username = c->argv[i+1]->ptr;
+                } else if (!strcasecmp(c->argv[i]->ptr,"maxage") && moreargs) {
+                    long long tmp;
+
+                    if (getLongLongFromObjectOrReply(c,c->argv[i+1],&tmp,NULL)
+                        != C_OK) return;
+                    if (tmp < 0) {
+                        addReplyError(c,
+                            "maxage must be greater than or equal to 0");
+                        return;
+                    }
+                    maxage = tmp;
                 } else if (!strcasecmp(c->argv[i]->ptr,"skipme") && moreargs) {
                     if (!strcasecmp(c->argv[i+1]->ptr,"yes")) {
                         skipme = 1;
@@ -2013,6 +2041,17 @@ NULL
         while ((ln = listNext(&li)) != NULL) {
             client = listNodeValue(ln);
             if (addr && strcmp(getClientPeerId(client),addr) != 0) continue;
+            if (laddr) {
+                char laddr_obj[NET_PEER_ID_LEN];
+
+                if (client->fd == -1) continue;
+                anetFormatSock(client->fd,laddr_obj,sizeof(laddr_obj));
+                if (strcmp(laddr,laddr_obj) != 0) continue;
+            }
+            if (username && (!client->user ||
+                strcmp(username,ACLUserName(client->user)) != 0)) continue;
+            if (maxage && (long long)(time(NULL) - client->ctime) < maxage)
+                continue;
             if (type != -1 && getClientType(client) != type) continue;
             if (id != 0 && client->id != id) continue;
             if (c == client && skipme) continue;
