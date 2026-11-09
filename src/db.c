@@ -668,6 +668,13 @@ static robj *dupCollectionObject(robj *src) {
             }
             raxStop(&ri);
         }
+        /* Preserve the stream counters that are not derived from the entries
+         * themselves. */
+        {
+            stream *ds = dst->ptr;
+            ds->entries_added = os->entries_added;
+            ds->max_deleted_entry_id = os->max_deleted_entry_id;
+        }
         return dst;
     }
 

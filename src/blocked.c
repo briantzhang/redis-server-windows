@@ -523,6 +523,13 @@ void handleClientsBlockedOnKeys(void) {
                                            receiver->bpop.xread_consumer->ptr,
                                            SLC_NONE);
                                 noack = receiver->bpop.xread_group_noack;
+                                /* With NOACK there is no PEL entry that
+                                 * would create the consumer on replicas. */
+                                if (noack) {
+                                    streamPropagateConsumerCreation(receiver,
+                                        rl->key, receiver->bpop.xread_group,
+                                        consumer->name);
+                                }
                             }
 
                             /* Emit the two elements sub-array consisting of

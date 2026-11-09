@@ -17,6 +17,8 @@ typedef struct stream {
     rax *rax;               /* The radix tree holding the stream. */
     uint64_t length;        /* Number of elements inside this stream. */
     streamID last_id;       /* Zero if there are yet no items. */
+    streamID max_deleted_entry_id; /* Max ID of any entry deleted by XDEL. */
+    uint64_t entries_added; /* All the entries ever added to the stream. */
     rax *cgroups;           /* Consumer groups dictionary: name -> streamCG */
 } stream;
 
@@ -110,9 +112,11 @@ void streamIteratorStart(streamIterator *si, stream *s, streamID *start, streamI
 int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields);
 void streamIteratorGetField(streamIterator *si, unsigned char **fieldptr, unsigned char **valueptr, int64_t *fieldlen, int64_t *valuelen);
 void streamIteratorStop(streamIterator *si);
+int streamDeleteItem(stream *s, streamID *id);
 streamCG *streamLookupCG(stream *s, sds groupname);
 streamConsumer *streamLookupConsumer(streamCG *cg, sds name, int flags);
 streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id);
+void streamPropagateConsumerCreation(client *c, robj *key, robj *groupname, sds consumername);
 streamNACK *streamCreateNACK(streamConsumer *consumer);
 void streamDecodeID(void *buf, streamID *id);
 int streamCompareID(streamID *a, streamID *b);
