@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp7
+# Redis for Windows 5.0.14.1-bp8
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -49,8 +49,15 @@
 | `CLIENT PAUSE [WRITE\|ALL]` / `CLIENT UNPAUSE` / `CLIENT INFO` | 6.2 | 移植了 6.2 的 pending-command 机制：命令先解析再阻塞，恢复后按原顺序执行 |
 | `CONFIG GET` 多模式 / `CONFIG SET` 多参数 | 7.0 | GET 对重叠模式去重；SET 逐对顺序应用，后一对失败时前面的已生效，不是原子操作 |
 | `COMMAND LIST` / `COMMAND GETKEYSANDFLAGS` | 7.0 | 支持 FILTERBY PATTERN/ACLCAT/MODULE；ACLCAT 用命令级读写标志近似，MODULE 恒为空。键标志只给出 RO/RW、access、update |
+| `GEOSEARCH` / `GEOSEARCHSTORE` | 6.2 | 圆形或矩形区域搜索；支持 FROMMEMBER/FROMLONLAT、BYRADIUS/BYBOX、ANY、WITHDIST/WITHHASH/WITHCOORD；STORE 形式可存距离，源键缺失时删除目标键 |
+| `ACL CAT` / `ACL USERS` / `ACL GETUSER` / `ACL GENPASS` / `ACL DRYRUN` | 6.0 | 列出分类与用户、输出用户规则、生成随机口令、预检命令与键权限 |
+| `CLIENT KILL` 的 `LADDR` / `USER` / `MAXAGE` | 6.0 / 7.0 | 按本地监听地址、认证用户和连接存活秒数筛选；LADDR 会命中同一监听地址上的全部连接 |
+| `CLIENT LIST` / `CLIENT INFO` 的 `laddr=`、`user=` | 6.0 / 6.2 | 输出本地地址与当前认证用户名 |
+| `INFO everything` | 7.0 | 与 `INFO all` 等价地输出全部区段 |
+| `WAITAOF` | 7.2 | 同步刷盘并返回 `[本机确认, 0]`；不阻塞等待，不跟踪副本 AOF |
+| `SHUTDOWN` 的 `NOW` / `FORCE` / `ABORT` | 7.0 | NOW 不等副本，FORCE 在保存失败时仍退出，ABORT 取消已置位的关闭请求 |
 
-ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`。没有 Redis 7 的多选择器，也没有按键的读写权限位。`requirepass` 成为 `default` 用户的口令，设置后未认证连接被拒绝；不设置时连接以 `default` 用户进入。`ACL WHOAMI` 对任何已认证用户放行。
+ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并提供 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN`。没有 Redis 7 的多选择器，也没有按键的读写权限位。`requirepass` 成为 `default` 用户的口令，设置后未认证连接被拒绝；不设置时连接以 `default` 用户进入。`ACL WHOAMI` 对任何已认证用户放行。
 
 代码参照 Redis `7.0.15` 与 `7.2.5`（BSD）中的相关命令语义，按旧版 API 手工适配；没有引入 Redis 8 的源码或模块。
 
@@ -63,6 +70,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 - 条件过期仅记录成功结果的绝对截止时间，恢复时不重新判断 NX/XX/GT/LT。
 - 不迁入新版 RDB 格式、多段 AOF、RESP3、线程 I/O、TLS、Functions 或集群功能。ACL 只做到 Redis 6 的单权限集，没有 Redis 7 的选择器。原底座已有功能保留，但本版没有对其做现代化升级。
 - 没有实现 Redis 7 的客户端内存驱逐（`maxmemory-clients`）。`CLIENT NO-EVICT` 只为客户端兼容而接受并记录标志，内存压力下不会据此保留连接。
+- `WAITAOF` 没有 7.2 的异步 fsync 完成队列：开启 AOF 时在命令内调用 `flushAppendOnlyFile` 并 `fsync`，然后立即返回；`numreplicas` 只做参数校验，回复中的副本数恒为 0，不阻塞到超时。
 - 网络/IOCP、Windows 服务与 fork 模拟层沿用底座代码。
 
 ## 性能预期
@@ -89,7 +97,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-09 在 Windows 11、MSVC 14.44（v143）上跑完 41 项全部通过，包括此前会崩溃的 AOF 重启，以及新增的有序集合运算、COPY 深拷贝、ACL 权限、列表查找移动、交集基数、条件分数更新、随机取样、批量弹出、阻塞移动、统一范围查询、多键弹出、CLIENT 标志，以及流的 MINID/LIMIT 裁剪、NOMKSTREAM、CREATECONSUMER、XPENDING IDLE、XAUTOCLAIM、XSETID 计数、XINFO STREAM FULL、AOF 计数保留和 NOACK 消费者恢复用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-09 在 Windows 11、MSVC 14.44（v143）上跑完 55 项全部通过，包括此前会崩溃的 AOF 重启，以及新增的 GEOSEARCH/GEOSEARCHSTORE 两种区域与结果选项、ACL 子命令、CLIENT KILL 的 LADDR/USER/MAXAGE 与 LIST 新字段、INFO everything、WAITAOF 的 AOF 开/关两种情形、SHUTDOWN 选项校验及附加实例真实退出，另有此前各轮的有序集合运算、COPY 深拷贝、列表查找移动、多键弹出、流命令和 AOF 计数保留用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 

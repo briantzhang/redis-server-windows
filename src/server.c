@@ -334,12 +334,15 @@ struct redisCommand redisCommandTable[] = {
     {"bitpos",bitposCommand,-3,"r",0,NULL,1,1,1,0,0},
     {"lcs",lcsCommand,-3,"r",0,NULL,1,1,1,0,0},
     {"wait",waitCommand,3,"s",0,NULL,0,0,0,0,0},
+    {"waitaof",waitaofCommand,4,"s",0,NULL,0,0,0,0,0},
     {"command",commandCommand,0,"ltR",0,NULL,0,0,0,0,0},
     {"geoadd",geoaddCommand,-5,"wm",0,NULL,1,1,1,0,0},
     {"georadius",georadiusCommand,-6,"w",0,georadiusGetKeys,1,1,1,0,0},
     {"georadius_ro",georadiusroCommand,-6,"r",0,georadiusGetKeys,1,1,1,0,0},
     {"georadiusbymember",georadiusbymemberCommand,-5,"w",0,georadiusGetKeys,1,1,1,0,0},
     {"georadiusbymember_ro",georadiusbymemberroCommand,-5,"r",0,georadiusGetKeys,1,1,1,0,0},
+    {"geosearch",geosearchCommand,-7,"r",0,NULL,1,1,1,0,0},
+    {"geosearchstore",geosearchstoreCommand,-8,"wm",0,NULL,1,2,1,0,0},
     {"geohash",geohashCommand,-2,"r",0,NULL,1,1,1,0,0},
     {"geopos",geoposCommand,-2,"r",0,NULL,1,1,1,0,0},
     {"geodist",geodistCommand,-4,"r",0,NULL,1,1,1,0,0},
@@ -3398,7 +3401,8 @@ sds genRedisInfoString(char *section) {
     int sections = 0;
 
     if (section == NULL) section = "default";
-    allsections = strcasecmp(section,"all") == 0;
+    allsections = strcasecmp(section,"all") == 0 ||
+                  strcasecmp(section,"everything") == 0;
     defsections = strcasecmp(section,"default") == 0;
 
     getrusage(RUSAGE_SELF, &self_ru);

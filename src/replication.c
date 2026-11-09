@@ -2643,6 +2643,53 @@ void waitCommand(client *c) {
     replicationRequestAckFromSlaves();
 }
 
+/* WAITAOF <numlocal> <numreplicas> <timeout>
+ *
+ * There is no asynchronous AOF fsync acknowledgement and no replica-side AOF
+ * tracking in this 5.0 backport, so the local fsync is done synchronously
+ * before replying and the replica count is always reported as zero. */
+void waitaofCommand(client *c) {
+    PORT_LONGLONG numlocal, numreplicas;
+    mstime_t timeout;
+    PORT_LONGLONG acked_local = 0;
+
+    if (server.masterhost) {
+        addReplyError(c,"WAITAOF cannot be used with replica instances.");
+        return;
+    }
+
+    if (getLongLongFromObjectOrReply(c,c->argv[1],&numlocal,NULL) != C_OK)
+        return;
+    if (getLongLongFromObjectOrReply(c,c->argv[2],&numreplicas,NULL) != C_OK)
+        return;
+    if (getTimeoutFromObjectOrReply(c,c->argv[3],&timeout,UNIT_MILLISECONDS)
+        != C_OK) return;
+    (void) timeout;
+
+    if (numlocal < 0 || numreplicas < 0) {
+        addReplyError(c,"numlocal and numreplicas can't be negative");
+        return;
+    }
+    if (numlocal > 0 && server.aof_state == AOF_OFF) {
+        addReplyError(c,"WAITAOF cannot be used when numlocal is set but "
+                        "appendonly is disabled.");
+        return;
+    }
+
+    if (numlocal > 0) {
+        flushAppendOnlyFile(1);
+        if (redis_fsync(server.aof_fd) == -1) {
+            addReplyError(c,"Error trying to fsync the AOF file");
+            return;
+        }
+        acked_local = 1;
+    }
+
+    addReplyMultiBulkLen(c,2);
+    addReplyLongLong(c,acked_local);
+    addReplyLongLong(c,0); /* Replica AOF acknowledgements are not tracked. */
+}
+
 /* This is called by unblockClient() to perform the blocking op type
  * specific cleanup. We just remove the client from the list of clients
  * waiting for replica acks. Never call it directly, call unblockClient()

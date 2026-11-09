@@ -102,34 +102,53 @@ uint8_t geohashEstimateStepsByRadius(double range_meters, double lat) {
  * Since this function is currently only used as an optimization, the
  * optimization is not used for very big radiuses, however the function
  * should be fixed. */
-int geohashBoundingBox(double longitude, double latitude, double radius_meters,
-                       double *bounds) {
+int geohashBoundingBox(GeoShape *shape, double *bounds) {
     if (!bounds) return 0;
+    double longitude = shape->xy[0];
+    double latitude = shape->xy[1];
+    double height = shape->conversion * (shape->type == CIRCULAR_TYPE ? shape->t.radius : shape->t.r.height/2);
+    double width = shape->conversion * (shape->type == CIRCULAR_TYPE ? shape->t.radius : shape->t.r.width/2);
 
-    bounds[0] = longitude - rad_deg(radius_meters/EARTH_RADIUS_IN_METERS/cos(deg_rad(latitude)));
-    bounds[2] = longitude + rad_deg(radius_meters/EARTH_RADIUS_IN_METERS/cos(deg_rad(latitude)));
-    bounds[1] = latitude - rad_deg(radius_meters/EARTH_RADIUS_IN_METERS);
-    bounds[3] = latitude + rad_deg(radius_meters/EARTH_RADIUS_IN_METERS);
+    const double lat_delta = rad_deg(height/EARTH_RADIUS_IN_METERS);
+    const double long_delta_top = rad_deg(width/EARTH_RADIUS_IN_METERS/cos(deg_rad(latitude+lat_delta)));
+    const double long_delta_bottom = rad_deg(width/EARTH_RADIUS_IN_METERS/cos(deg_rad(latitude-lat_delta)));
+    /* The directions of the northern and southern hemispheres
+     * are opposite, so we choose different points as min/max long/lat. */
+    int southern_hemisphere = latitude < 0 ? 1 : 0;
+    bounds[0] = southern_hemisphere ? longitude-long_delta_bottom : longitude-long_delta_top;
+    bounds[2] = southern_hemisphere ? longitude+long_delta_bottom : longitude+long_delta_top;
+    bounds[1] = latitude - lat_delta;
+    bounds[3] = latitude + lat_delta;
     return 1;
 }
 
-/* Return a set of areas (center + 8) that are able to cover a range query
- * for the specified position and radius. */
-GeoHashRadius geohashGetAreasByRadius(double longitude, double latitude, double radius_meters) {
+/* Calculate a set of areas (center + 8) that are able to cover a range query
+ * for the specified position and shape (see geohash.h GeoShape).
+ * The bounding box is saved in shape->bounds. */
+GeoHashRadius geohashCalculateAreasByShapeWGS84(GeoShape *shape) {
     GeoHashRange long_range, lat_range;
     GeoHashRadius radius;
     GeoHashBits hash;
     GeoHashNeighbors neighbors;
     GeoHashArea area;
     double min_lon, max_lon, min_lat, max_lat;
-    double bounds[4];
     int steps;
 
-    geohashBoundingBox(longitude, latitude, radius_meters, bounds);
-    min_lon = bounds[0];
-    min_lat = bounds[1];
-    max_lon = bounds[2];
-    max_lat = bounds[3];
+    geohashBoundingBox(shape, shape->bounds);
+    min_lon = shape->bounds[0];
+    min_lat = shape->bounds[1];
+    max_lon = shape->bounds[2];
+    max_lat = shape->bounds[3];
+
+    double longitude = shape->xy[0];
+    double latitude = shape->xy[1];
+    /* radius_meters is calculated differently in different search types:
+     * 1) CIRCULAR_TYPE, just use radius.
+     * 2) RECTANGLE_TYPE, we use sqrt((width/2)^2 + (height/2)^2) to
+     * calculate the distance from the center point to the corner. */
+    double radius_meters = shape->type == CIRCULAR_TYPE ? shape->t.radius :
+            sqrt((shape->t.r.width/2)*(shape->t.r.width/2) + (shape->t.r.height/2)*(shape->t.r.height/2));
+    radius_meters *= shape->conversion;
 
     steps = geohashEstimateStepsByRadius(radius_meters,latitude);
 
@@ -198,6 +217,18 @@ GeoHashRadius geohashGetAreasByRadius(double longitude, double latitude, double 
     return radius;
 }
 
+/* Return a set of areas (center + 8) that are able to cover a range query
+ * for the specified position and radius. Kept for API compatibility. */
+GeoHashRadius geohashGetAreasByRadius(double longitude, double latitude, double radius_meters) {
+    GeoShape shape = {0};
+    shape.type = CIRCULAR_TYPE;
+    shape.xy[0] = longitude;
+    shape.xy[1] = latitude;
+    shape.conversion = 1;
+    shape.t.radius = radius_meters;
+    return geohashCalculateAreasByShapeWGS84(&shape);
+}
+
 GeoHashRadius geohashGetAreasByRadiusWGS84(double longitude, double latitude,
                                            double radius_meters) {
     return geohashGetAreasByRadius(longitude, latitude, radius_meters);
@@ -234,4 +265,26 @@ int geohashGetDistanceIfInRadiusWGS84(double x1, double y1, double x2,
                                       double y2, double radius,
                                       double *distance) {
     return geohashGetDistanceIfInRadius(x1, y1, x2, y2, radius, distance);
+}
+
+/* Calculate the latitude distance between two points in meters. */
+double geohashGetLatDistance(double lat1d, double lat2d) {
+    return EARTH_RADIUS_IN_METERS * fabs(deg_rad(lat2d) - deg_rad(lat1d));
+}
+
+/* Check if a point is inside a rectangle centered at (x1,y1), with the
+ * given width and height in meters. On success *distance is set to the
+ * distance between the center and the point. */
+int geohashGetDistanceIfInRectangle(double width_m, double height_m,
+                                    double x1, double y1,
+                                    double x2, double y2,
+                                    double *distance) {
+    /* Latitude distance is less expensive to compute than longitude
+     * distance, so we check the latitude condition first. */
+    double lat_distance = geohashGetLatDistance(y1, y2);
+    if (lat_distance > height_m/2) return 0;
+    double lon_distance = geohashGetDistance(x1, y1, x2, y2);
+    if (lon_distance > width_m/2) return 0;
+    *distance = lon_distance;
+    return 1;
 }

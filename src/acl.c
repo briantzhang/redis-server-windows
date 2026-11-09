@@ -28,6 +28,8 @@ static rax *CommandIds;
 
 void *ACLDefaultUser(void) { return DefaultUser; }
 
+const char *ACLUserName(void *u) { return ((user*)u)->name; }
+
 /* Keys here are SDS, but lookups also arrive as plain C strings (AUTH passes
  * a literal username). dictSdsKeyCompare calls sdslen(), which reads the byte
  * before the pointer, so a C string would fault. Compare by strlen instead and
@@ -128,6 +130,8 @@ static int aclCategoryMatch(struct redisCommand *cmd, const char *name) {
     if (!strcasecmp(name,"write")) return f & CMD_WRITE;
     if (!strcasecmp(name,"admin")) return f & CMD_ADMIN;
     if (!strcasecmp(name,"pubsub")) return f & CMD_PUBSUB;
+    if (!strcasecmp(name,"keyspace"))
+        return cmd->firstkey != 0 || cmd->getkeys_proc != NULL;
     if (!strcasecmp(name,"fast")) return f & CMD_FAST;
     if (!strcasecmp(name,"slow")) return !(f & CMD_FAST);
     return -1;
@@ -316,6 +320,72 @@ void authCommand(client *c) {
     addReply(c, shared.ok);
 }
 
+/* Describe the command rules of a user in the same syntax accepted by
+ * ACL SETUSER, for ACL GETUSER. */
+static sds ACLDescribeUserCommandRules(user *u) {
+    sds rules = sdsempty();
+    raxIterator ri;
+
+    if (u->flags & USER_ALLCMD) return sdscat(rules,"+@all");
+    rules = sdscat(rules,"-@all");
+    raxStart(&ri,CommandIds);
+    raxSeek(&ri,"^",NULL,0);
+    while(raxNext(&ri)) {
+        unsigned id = (unsigned)(size_t)ri.data - 1;
+        if (aclCommandBit(u,id)) {
+            rules = sdscat(rules," +");
+            rules = sdscatlen(rules,ri.key,ri.key_len);
+        }
+    }
+    raxStop(&ri);
+    return rules;
+}
+
+/* Check whether a user may run the given command with the given arguments,
+ * without executing it (ACL DRYRUN). On refusal *err is set to an sds
+ * describing the reason and the caller must free it. */
+static int aclCheckUserPerm(user *u, struct redisCommand *cmd,
+                            robj **argv, int argc, sds *err)
+{
+    int *keys, numkeys, i;
+
+    if (!(u->flags & USER_ENABLED)) {
+        *err = sdsnew("User is disabled");
+        return C_ERR;
+    }
+    if (!(u->flags & USER_ALLCMD) && !aclCommandBit(u,cmd->id)) {
+        *err = sdscatprintf(sdsempty(),
+            "This user has no permissions to run the '%s' command",cmd->name);
+        return C_ERR;
+    }
+    if (u->flags & USER_ALLKEYS) return C_OK;
+
+    keys = getKeysFromCommand(cmd,argv,argc,&numkeys);
+    for (i = 0; i < numkeys; i++) {
+        sds key = argv[keys[i]]->ptr;
+        listIter li;
+        listNode *ln;
+        int allowed = 0;
+
+        listRewind(u->patterns,&li);
+        while ((ln = listNext(&li))) {
+            sds pat = ln->value;
+            if (stringmatchlen(pat,(int)sdslen(pat),key,(int)sdslen(key),0)) {
+                allowed = 1;
+                break;
+            }
+        }
+        if (!allowed) {
+            *err = sdsnew("This user has no permissions to access one of "
+                          "the keys used as arguments");
+            if (keys) getKeysFreeResult(keys);
+            return C_ERR;
+        }
+    }
+    if (keys) getKeysFreeResult(keys);
+    return C_OK;
+}
+
 void aclCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"list")) {
         dictIterator *di = dictGetIterator(Users);
@@ -365,6 +435,148 @@ void aclCommand(client *c) {
             return;
         }
         addReplyLongLong(c, dictDelete(Users, c->argv[2]->ptr) == DICT_OK);
+        return;
+    }
+    if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"users")) {
+        dictIterator *di = dictGetIterator(Users);
+        dictEntry *de;
+        addReplyMultiBulkLen(c, dictSize(Users));
+        while ((de = dictNext(di)) != NULL) {
+            user *u = dictGetVal(de);
+            addReplyBulkCBuffer(c, u->name, sdslen(u->name));
+        }
+        dictReleaseIterator(di);
+        return;
+    }
+    if (!strcasecmp(c->argv[1]->ptr,"cat") && (c->argc == 2 || c->argc == 3)) {
+        static const char *categories[] = {
+            "keyspace", "read", "write", "admin", "pubsub", "fast", "slow",
+            NULL
+        };
+        int i;
+        if (c->argc == 2) {
+            for (i = 0; categories[i]; i++);
+            addReplyMultiBulkLen(c, i);
+            for (i = 0; categories[i]; i++)
+                addReplyBulkCString(c, categories[i]);
+            return;
+        }
+        for (i = 0; categories[i]; i++) {
+            if (!strcasecmp(categories[i], c->argv[2]->ptr)) break;
+        }
+        if (categories[i] == NULL) {
+            addReplyErrorFormat(c,"Unknown ACL cat '%s'",(char*)c->argv[2]->ptr);
+            return;
+        }
+        /* Count the matching commands first, then list them. */
+        dictIterator *di = dictGetIterator(server.commands);
+        dictEntry *de;
+        PORT_LONG count = 0;
+        while ((de = dictNext(di)) != NULL) {
+            if (aclCategoryMatch(dictGetVal(de), c->argv[2]->ptr) != 0) count++;
+        }
+        dictReleaseIterator(di);
+        addReplyMultiBulkLen(c, count);
+        di = dictGetIterator(server.commands);
+        while ((de = dictNext(di)) != NULL) {
+            struct redisCommand *cmd = dictGetVal(de);
+            if (aclCategoryMatch(cmd, c->argv[2]->ptr) != 0)
+                addReplyBulkCString(c, cmd->name);
+        }
+        dictReleaseIterator(di);
+        return;
+    }
+    if (c->argc == 3 && !strcasecmp(c->argv[1]->ptr,"getuser")) {
+        user *u = ACLGetUser(c->argv[2]->ptr);
+        if (u == NULL) {
+            addReply(c,shared.nullmultibulk);
+            return;
+        }
+        addReplyMultiBulkLen(c,10);
+
+        int numflags = 1;
+        if (u->flags & USER_ALLKEYS) numflags++;
+        if (u->flags & USER_ALLCMD) numflags++;
+        if (u->flags & USER_NOPASS) numflags++;
+        addReplyBulkCString(c,"flags");
+        addReplyMultiBulkLen(c,numflags);
+        addReplyBulkCString(c,(u->flags & USER_ENABLED) ? "on" : "off");
+        if (u->flags & USER_ALLKEYS) addReplyBulkCString(c,"allkeys");
+        if (u->flags & USER_ALLCMD) addReplyBulkCString(c,"allcommands");
+        if (u->flags & USER_NOPASS) addReplyBulkCString(c,"nopass");
+
+        addReplyBulkCString(c,"passwords");
+        addReplyMultiBulkLen(c, listLength(u->passwords));
+        listIter li;
+        listNode *ln;
+        listRewind(u->passwords,&li);
+        while ((ln = listNext(&li))) {
+            sds pw = ln->value;
+            addReplyBulkCBuffer(c, pw, sdslen(pw));
+        }
+
+        addReplyBulkCString(c,"commands");
+        addReplyBulkSds(c, ACLDescribeUserCommandRules(u));
+
+        addReplyBulkCString(c,"keys");
+        if (u->flags & USER_ALLKEYS) {
+            addReplyMultiBulkLen(c,1);
+            addReplyBulkCString(c,"~*");
+        } else {
+            addReplyMultiBulkLen(c, listLength(u->patterns));
+            listRewind(u->patterns,&li);
+            while ((ln = listNext(&li))) {
+                sds pat = ln->value;
+                addReplyBulkSds(c, sdscatprintf(sdsempty(),"~%s",pat));
+            }
+        }
+
+        /* This build has no Pub/Sub channel permissions. */
+        addReplyBulkCString(c,"channels");
+        addReplyBulkCString(c,"");
+        return;
+    }
+    if (!strcasecmp(c->argv[1]->ptr,"genpass") &&
+        (c->argc == 2 || c->argc == 3))
+    {
+        #define ACL_GENPASS_MAX_BITS 4096
+        char pass[ACL_GENPASS_MAX_BITS/8*2];
+        PORT_LONGLONG bits = 256;
+        if (c->argc == 3) {
+            if (getLongLongFromObjectOrReply(c,c->argv[2],&bits,NULL) != C_OK)
+                return;
+            if (bits <= 0 || bits > ACL_GENPASS_MAX_BITS) {
+                addReplyError(c,
+                    "ACL GENPASS argument must be the number of bits for "
+                    "the output password, a positive number up to 4096");
+                return;
+            }
+        }
+        PORT_LONG chars = (PORT_LONG)((bits+3)/4);
+        getRandomHexChars(pass,chars);
+        addReplyBulkCBuffer(c,pass,chars);
+        return;
+    }
+    if (c->argc >= 4 && !strcasecmp(c->argv[1]->ptr,"dryrun")) {
+        user *u = ACLGetUser(c->argv[2]->ptr);
+        struct redisCommand *cmd;
+        sds err = NULL;
+        if (u == NULL) {
+            addReplyErrorFormat(c,"User '%s' not found",(char*)c->argv[2]->ptr);
+            return;
+        }
+        cmd = lookupCommand(c->argv[3]->ptr);
+        if (cmd == NULL) {
+            addReplyErrorFormat(c,"Command '%s' does not exist",
+                (char*)c->argv[3]->ptr);
+            return;
+        }
+        if (aclCheckUserPerm(u,cmd,c->argv+3,c->argc-3,&err) == C_OK) {
+            addReply(c,shared.ok);
+        } else {
+            addReplyError(c,err);
+            sdsfree(err);
+        }
         return;
     }
     addReplyError(c,"unknown ACL subcommand or wrong number of arguments");
