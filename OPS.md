@@ -1,6 +1,6 @@
 # 运维手册
 
-适用版本：Redis for Windows `5.0.14.1-bp6`，仅 Windows x64，单机、非集群。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
+适用版本：Redis for Windows `5.0.14.1-bp7`，仅 Windows x64，单机、非集群。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
 
 本文只覆盖这一个可执行文件的日常操作。它不包含 TLS、多段 AOF 和集群，那些配置项写进 `redis.conf` 也不会生效，启动时会报未知配置。ACL 已按 Redis 6 的范围实现，见第 3 节。
 
@@ -38,7 +38,7 @@
 .\redis-server.exe --version
 ```
 
-应看到 `v=5.0.14.1-bp6`。如果不是这个版本号，说明运行的不是这份回移。
+应看到 `v=5.0.14.1-bp7`。如果不是这个版本号，说明运行的不是这份回移。
 
 另开一个窗口检查存活：
 
@@ -288,6 +288,49 @@ ZMSCORE board amy carl
 
 `SMISMEMBER` 按参数顺序返回 `1/0`。`ZMSCORE` 对不存在的成员返回空。
 
+位范围与只读命令：
+
+```text
+SET bitmap "abc"
+BITCOUNT bitmap 0 0 BIT          -- 只看第 0 位
+BITCOUNT bitmap 16 23 BIT        -- 只看第 3 个字节
+BITPOS bitmap 0 2 -1             -- 从第 2 个字节开始找 0 位
+BITFIELD_RO bitmap GET u8 0      -- 只读读取，SET/INCRBY 会报错
+BITCOUNT bitmap 0 0 BIT          -- 只看第 0 位
+BITCOUNT bitmap 16 23 BIT        -- 只看第 3 个字节
+BITPOS bitmap 0 2 -1             -- 从第 2 个字节开始找 0 位
+BITFIELD_RO bitmap GET u8 0      -- 只读读取，SET/INCRBY 会报错
+LCS key1 key2 LEN                -- 最长公共子序列长度
+LCS key1 key2 IDX MINMATCHLEN 4  -- 输出匹配区间
+SORT_RO list LIMIT 0 10          -- 带 STORE 会报错
+EVAL_RO "return redis.call('get',KEYS[1])" 1 k
+```
+
+`EVAL_RO`/`EVALSHA_RO` 只允许脚本调用读命令；脚本里出现写命令时整个调用报错，数据不变。需要写操作请继续用 `EVAL`/`EVALSHA`。
+
+暂停与恢复：
+
+```text
+CLIENT PAUSE 5000 WRITE   -- 5 秒内只拦写命令，读命令照常
+CLIENT PAUSE 5000 ALL     -- 读写都拦
+CLIENT UNPAUSE            -- 立即恢复，不等超时
+CLIENT INFO               -- 当前连接的信息，和 CLIENT LIST 的单行格式相同
+```
+
+暂停只影响普通客户端，副本连接不受影响。暂停期间到达的命令会先解析并挂起，恢复后按到达顺序执行；客户端不需要重发。
+
+配置与命令清单：
+
+```text
+CONFIG GET maxmemory maxmemory-samples
+CONFIG SET maxmemory-samples 7 timeout 123
+COMMAND LIST FILTERBY PATTERN bit*
+COMMAND LIST FILTERBY ACLCAT write
+COMMAND GETKEYSANDFLAGS MSET a 1 b 2
+```
+
+`CONFIG GET` 对重叠的模式去重。`CONFIG SET` 逐对应用：如果第二对参数非法，第一对已经生效，返回错误后要自己检查当前值。`COMMAND GETKEYSANDFLAGS` 的键标志是按命令级读写属性近似出来的（`RO`/`RW`、`access`、`update`），没有 Redis 7 的细粒度键规格。
+
 ## 5. 持久化与恢复
 
 RDB 是某个时间点的快照，AOF 是写命令日志。两者同时开启时，重启优先用 AOF 恢复，因为它更接近停机前的状态。
@@ -334,7 +377,7 @@ BGREWRITEAOF
 
 等 `INFO persistence` 里两次后台任务的状态都变成 `ok`，再复制 `dir` 下的 `dump.rdb` 和 `appendonly.aof`。复制过程中不要 `SHUTDOWN`，也不要再手动触发保存。
 
-备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp6-20261109.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
+备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp7-20261109.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
 
 流的 `entries-added` 和 `max-deleted-entry-id` 不写入 RDB 快照：从 `dump.rdb` 恢复后前者按当前长度重算、后者归零；从 AOF 恢复（含 AOF 重写）会保留。若业务依赖这两个计数，恢复时优先使用 AOF，或在恢复后用 `XSETID <key> <id> ENTRIESADDED <n> MAXDELETEDID <id>` 校正。
 

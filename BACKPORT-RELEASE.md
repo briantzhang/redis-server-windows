@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp6
+# Redis for Windows 5.0.14.1-bp7
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -41,6 +41,14 @@
 | `XPENDING key group [IDLE ms] start end count [consumer]` | 6.2 | 按空闲时间过滤待处理消息 |
 | `XAUTOCLAIM key group consumer min-idle start [COUNT n] [JUSTID]` | 6.2 | 批量转移待处理消息；返回下一游标；流条目已删除的 PEL 记录会被清理并在第三项返回 |
 | `XINFO STREAM key [FULL [COUNT n]]` | 6.2 / 7.0 | `FULL` 输出条目、组、消费者及 PEL；摘要新增 `max-deleted-entry-id`、`entries-added`、`recorded-first-entry-id` |
+| `BITCOUNT ... [BYTE\|BIT]` / `BITPOS ... [BYTE\|BIT]` | 7.0 | 范围单位可选字节或位；边界位用掩码处理，负下标按单位换算 |
+| `BITFIELD_RO` | 6.2 | 只读 BITFIELD，只接受 GET；SET/INCRBY 报错且不修改数据 |
+| `LCS` | 7.0 | 最长公共子序列；`LEN` 只返回长度，`IDX` 返回匹配区间，`MINMATCHLEN`/`WITHMATCHLEN` 控制区间输出 |
+| `SORT_RO` | 7.0 | 只读 SORT；出现 `STORE` 直接报错 |
+| `EVAL_RO` / `EVALSHA_RO` | 7.0 | 只读脚本入口；脚本执行期间调用任何写命令都会被拒绝 |
+| `CLIENT PAUSE [WRITE\|ALL]` / `CLIENT UNPAUSE` / `CLIENT INFO` | 6.2 | 移植了 6.2 的 pending-command 机制：命令先解析再阻塞，恢复后按原顺序执行 |
+| `CONFIG GET` 多模式 / `CONFIG SET` 多参数 | 7.0 | GET 对重叠模式去重；SET 逐对顺序应用，后一对失败时前面的已生效，不是原子操作 |
+| `COMMAND LIST` / `COMMAND GETKEYSANDFLAGS` | 7.0 | 支持 FILTERBY PATTERN/ACLCAT/MODULE；ACLCAT 用命令级读写标志近似，MODULE 恒为空。键标志只给出 RO/RW、access、update |
 
 ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`。没有 Redis 7 的多选择器，也没有按键的读写权限位。`requirepass` 成为 `default` 用户的口令，设置后未认证连接被拒绝；不设置时连接以 `default` 用户进入。`ACL WHOAMI` 对任何已认证用户放行。
 

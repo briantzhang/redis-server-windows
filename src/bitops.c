@@ -768,9 +768,12 @@ void bitopCommand(client *c) {
 /* BITCOUNT key [start end] */
 void bitcountCommand(client *c) {
     robj *o;
-    PORT_LONG start, end, strlen;
+    PORT_LONGLONG start, end;
+    PORT_LONG strlen;
     unsigned char *p;
     char llbuf[LONG_STR_SIZE];
+    int isbit = 0;
+    unsigned char first_byte_neg_mask = 0, last_byte_neg_mask = 0;
 
     /* Lookup, check for type, and return 0 for non existing keys. */
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
@@ -778,21 +781,39 @@ void bitcountCommand(client *c) {
     p = getObjectReadOnlyString(o,&strlen,llbuf);
 
     /* Parse start/end range if any. */
-    if (c->argc == 4) {
-        if (getLongFromObjectOrReply(c,c->argv[2],&start,NULL) != C_OK)
+    if (c->argc == 4 || c->argc == 5) {
+        PORT_LONGLONG totlen = strlen;
+        if (getLongLongFromObjectOrReply(c,c->argv[2],&start,NULL) != C_OK)
             return;
-        if (getLongFromObjectOrReply(c,c->argv[3],&end,NULL) != C_OK)
+        if (getLongLongFromObjectOrReply(c,c->argv[3],&end,NULL) != C_OK)
             return;
         /* Convert negative indexes */
         if (start < 0 && end < 0 && start > end) {
             addReply(c,shared.czero);
             return;
         }
-        if (start < 0) start = strlen+start;
-        if (end < 0) end = strlen+end;
+        if (c->argc == 5) {
+            if (!strcasecmp(c->argv[4]->ptr,"bit")) isbit = 1;
+            else if (!strcasecmp(c->argv[4]->ptr,"byte")) isbit = 0;
+            else {
+                addReply(c,shared.syntaxerr);
+                return;
+            }
+        }
+        if (isbit) totlen <<= 3;
+        if (start < 0) start = totlen+start;
+        if (end < 0) end = totlen+end;
         if (start < 0) start = 0;
         if (end < 0) end = 0;
-        if (end >= strlen) end = strlen-1;
+        if (end >= totlen) end = totlen-1;
+        if (isbit && start <= end) {
+            /* Before converting bit offsets to byte offsets, create negative
+             * masks for the two edge bytes. */
+            first_byte_neg_mask = ~((1<<(8-(start&7)))-1) & 0xFF;
+            last_byte_neg_mask = (1<<(7-(end&7)))-1;
+            start >>= 3;
+            end >>= 3;
+        }
     } else if (c->argc == 2) {
         /* The whole string. */
         start = 0;
@@ -809,18 +830,30 @@ void bitcountCommand(client *c) {
         addReply(c,shared.czero);
     } else {
         PORT_LONG bytes = end-start+1;
-
-        addReplyLongLong(c,redisPopcount(p+start,bytes));
+        PORT_LONGLONG count = redisPopcount(p+start,bytes);
+        if (first_byte_neg_mask != 0 || last_byte_neg_mask != 0) {
+            unsigned char firstlast[2] = {0, 0};
+            /* Bits outside the requested range in the edge bytes are counted
+             * by redisPopcount(), subtract them. */
+            if (first_byte_neg_mask != 0)
+                firstlast[0] = p[start] & first_byte_neg_mask;
+            if (last_byte_neg_mask != 0)
+                firstlast[1] = p[end] & last_byte_neg_mask;
+            count -= redisPopcount(firstlast,2);
+        }
+        addReplyLongLong(c,count);
     }
 }
 
-/* BITPOS key bit [start [end]] */
+/* BITPOS key bit [start [end [BIT|BYTE]]] */
 void bitposCommand(client *c) {
     robj *o;
-    PORT_LONG bit, start, end, strlen;
+    PORT_LONGLONG start, end;
+    PORT_LONG bit, strlen;
     unsigned char *p;
     char llbuf[LONG_STR_SIZE];
-    int end_given = 0;
+    int isbit = 0, end_given = 0;
+    unsigned char first_byte_neg_mask = 0, last_byte_neg_mask = 0;
 
     /* Parse the bit argument to understand what we are looking for, set
      * or clear bits. */
@@ -842,22 +875,41 @@ void bitposCommand(client *c) {
     p = getObjectReadOnlyString(o,&strlen,llbuf);
 
     /* Parse start/end range if any. */
-    if (c->argc == 4 || c->argc == 5) {
-        if (getLongFromObjectOrReply(c,c->argv[3],&start,NULL) != C_OK)
+    if (c->argc == 4 || c->argc == 5 || c->argc == 6) {
+        PORT_LONGLONG totlen = strlen;
+        if (getLongLongFromObjectOrReply(c,c->argv[3],&start,NULL) != C_OK)
             return;
-        if (c->argc == 5) {
-            if (getLongFromObjectOrReply(c,c->argv[4],&end,NULL) != C_OK)
+        if (c->argc == 6) {
+            if (!strcasecmp(c->argv[5]->ptr,"bit")) isbit = 1;
+            else if (!strcasecmp(c->argv[5]->ptr,"byte")) isbit = 0;
+            else {
+                addReply(c,shared.syntaxerr);
+                return;
+            }
+        }
+        if (c->argc >= 5) {
+            if (getLongLongFromObjectOrReply(c,c->argv[4],&end,NULL) != C_OK)
                 return;
             end_given = 1;
         } else {
-            end = strlen-1;
+            if (isbit) end = (totlen<<3) + 7;
+            else end = totlen-1;
         }
+        if (isbit) totlen <<= 3;
         /* Convert negative indexes */
-        if (start < 0) start = strlen+start;
-        if (end < 0) end = strlen+end;
+        if (start < 0) start = totlen+start;
+        if (end < 0) end = totlen+end;
         if (start < 0) start = 0;
         if (end < 0) end = 0;
-        if (end >= strlen) end = strlen-1;
+        if (end >= totlen) end = totlen-1;
+        if (isbit && start <= end) {
+            /* Before converting bit offsets to byte offsets, create negative
+             * masks for the two edge bytes. */
+            first_byte_neg_mask = ~((1<<(8-(start&7)))-1) & 0xFF;
+            last_byte_neg_mask = (1<<(7-(end&7)))-1;
+            start >>= 3;
+            end >>= 3;
+        }
     } else if (c->argc == 3) {
         /* The whole string. */
         start = 0;
@@ -874,8 +926,38 @@ void bitposCommand(client *c) {
         addReplyLongLong(c, -1);
     } else {
         PORT_LONG bytes = end-start+1;
-        PORT_LONGLONG pos = redisBitpos(p+start,(PORT_ULONG)bytes,(int)bit);        WIN_PORT_FIX /* cast (PORT_ULONG), cast (int) */
+        PORT_LONGLONG pos;
+        unsigned char tmpchar;
 
+        if (first_byte_neg_mask) {
+            if (bit) tmpchar = p[start] & ~first_byte_neg_mask;
+            else tmpchar = p[start] | first_byte_neg_mask;
+            /* Special case: there is only one byte. */
+            if (last_byte_neg_mask && bytes == 1) {
+                if (bit) tmpchar = tmpchar & ~last_byte_neg_mask;
+                else tmpchar = tmpchar | last_byte_neg_mask;
+            }
+            pos = redisBitpos(&tmpchar,1,(int)bit);
+            /* If there are no more bytes or we get a valid position, exit. */
+            if (bytes == 1 || (pos != -1 && pos != 8)) goto result;
+            start++;
+            bytes--;
+        }
+
+        /* If the last byte has no bits in range, exclude it. */
+        PORT_LONG curbytes = bytes - (last_byte_neg_mask ? 1 : 0);
+        if (curbytes > 0) {
+            pos = redisBitpos(p+start,curbytes,(int)bit);
+            if (bytes == curbytes ||
+                (pos != -1 && pos != (PORT_LONGLONG)curbytes<<3)) goto result;
+            start += curbytes;
+            bytes -= curbytes;
+        }
+        if (bit) tmpchar = p[end] & ~last_byte_neg_mask;
+        else tmpchar = p[end] | last_byte_neg_mask;
+        pos = redisBitpos(&tmpchar,1,(int)bit);
+
+    result:
         /* If we are looking for clear bits, and the user specified an exact
          * range with start-end, we can't consider the right of the range as
          * zero padded (as we do when no explicit end is given).
@@ -911,7 +993,10 @@ struct bitfieldOp {
     int sign;           /* True if signed, otherwise unsigned op. */
 };
 
-void bitfieldCommand(client *c) {
+#define BITFIELD_FLAG_NONE 0
+#define BITFIELD_FLAG_READONLY (1<<0)
+
+void bitfieldGeneric(client *c, int flags) {
     robj *o;
     uint64_t bitoffset;
     int j, numops = 0, changes = 0;
@@ -968,6 +1053,12 @@ void bitfieldCommand(client *c) {
 
         if (opcode != BITFIELDOP_GET) {
             readonly = 0;
+            if (flags & BITFIELD_FLAG_READONLY) {
+                addReplyError(c,"BITFIELD_RO only supports the GET "
+                                "subcommand");
+                zfree(ops);
+                return;
+            }
             if (highest_write_offset < bitoffset + bits - 1)
                 highest_write_offset = bitoffset + bits - 1;
             /* INCRBY and SET require another argument. */
@@ -1128,4 +1219,12 @@ void bitfieldCommand(client *c) {
         server.dirty += changes;
     }
     zfree(ops);
+}
+
+void bitfieldCommand(client *c) {
+    bitfieldGeneric(c,BITFIELD_FLAG_NONE);
+}
+
+void bitfieldRoCommand(client *c) {
+    bitfieldGeneric(c,BITFIELD_FLAG_READONLY);
 }

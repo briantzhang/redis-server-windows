@@ -154,6 +154,7 @@ struct redisCommand redisCommandTable[] = {
     {"setbit",setbitCommand,4,"wm",0,NULL,1,1,1,0,0},
     {"getbit",getbitCommand,3,"rF",0,NULL,1,1,1,0,0},
     {"bitfield",bitfieldCommand,-2,"wm",0,NULL,1,1,1,0,0},
+    {"bitfield_ro",bitfieldRoCommand,-2,"r",0,NULL,1,1,1,0,0},
     {"setrange",setrangeCommand,4,"wm",0,NULL,1,1,1,0,0},
     {"getrange",getrangeCommand,4,"r",0,NULL,1,1,1,0,0},
     {"substr",getrangeCommand,4,"r",0,NULL,1,1,1,0,0},
@@ -290,6 +291,7 @@ struct redisCommand redisCommandTable[] = {
     {"flushdb",flushdbCommand,-1,"w",0,NULL,0,0,0,0,0},
     {"flushall",flushallCommand,-1,"w",0,NULL,0,0,0,0,0},
     {"sort",sortCommand,-2,"wm",0,sortGetKeys,1,1,1,0,0},
+    {"sort_ro",sortroCommand,-2,"r",0,sortGetKeys,1,1,1,0,0},
     {"info",infoCommand,-1,"ltR",0,NULL,0,0,0,0,0},
     {"monitor",monitorCommand,1,"as",0,NULL,0,0,0,0,0},
     {"ttl",ttlCommand,2,"rFR",0,NULL,1,1,1,0,0},
@@ -321,13 +323,16 @@ struct redisCommand redisCommandTable[] = {
     {"memory",memoryCommand,-2,"rR",0,NULL,0,0,0,0,0},
     {"client",clientCommand,-2,"as",0,NULL,0,0,0,0,0},
     {"eval",evalCommand,-3,"s",0,evalGetKeys,0,0,0,0,0},
+    {"eval_ro",evalRoCommand,-3,"s",0,evalGetKeys,0,0,0,0,0},
     {"evalsha",evalShaCommand,-3,"s",0,evalGetKeys,0,0,0,0,0},
+    {"evalsha_ro",evalShaRoCommand,-3,"s",0,evalGetKeys,0,0,0,0,0},
     {"slowlog",slowlogCommand,-2,"aR",0,NULL,0,0,0,0,0},
     {"script",scriptCommand,-2,"s",0,NULL,0,0,0,0,0},
     {"time",timeCommand,1,"RF",0,NULL,0,0,0,0,0},
     {"bitop",bitopCommand,-4,"wm",0,NULL,2,-1,1,0,0},
     {"bitcount",bitcountCommand,-2,"r",0,NULL,1,1,1,0,0},
     {"bitpos",bitposCommand,-3,"r",0,NULL,1,1,1,0,0},
+    {"lcs",lcsCommand,-3,"r",0,NULL,1,1,1,0,0},
     {"wait",waitCommand,3,"s",0,NULL,0,0,0,0,0},
     {"command",commandCommand,0,"ltR",0,NULL,0,0,0,0,0},
     {"geoadd",geoaddCommand,-5,"wm",0,NULL,1,1,1,0,0},
@@ -2173,10 +2178,12 @@ void initServer(void) {
     server.clients_pending_write = listCreate();
     server.slaveseldb = -1; /* Force to emit the first SELECT command. */
     server.unblocked_clients = listCreate();
+    server.paused_clients = listCreate();
     server.ready_keys = listCreate();
     server.clients_waiting_acks = listCreate();
     server.get_ack_from_slaves = 0;
     server.clients_paused = 0;
+    server.client_pause_type = CLIENT_PAUSE_OFF;
     server.system_memory_size = zmalloc_get_memory_size();
 
     createSharedObjects();
@@ -2895,6 +2902,18 @@ int processCommand(client *c) {
         return C_OK;
     }
 
+    /* If the server is paused, block the client until the pause has ended.
+     * Replicas are never paused. */
+    if (!(c->flags & CLIENT_SLAVE) &&
+        (server.client_pause_type == CLIENT_PAUSE_ALL ||
+         (server.client_pause_type == CLIENT_PAUSE_WRITE &&
+          ((c->cmd->flags & CMD_WRITE) || c->cmd->proc == execCommand))))
+    {
+        c->bpop.timeout = 0;
+        blockClient(c,BLOCKED_PAUSE);
+        return C_OK;
+    }
+
     /* Exec the command */
     if (c->flags & CLIENT_MULTI &&
         c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
@@ -3181,7 +3200,9 @@ void commandCommand(client *c) {
 "(no subcommand) -- Return details about all Redis commands.",
 "COUNT -- Return the total number of commands in this Redis server.",
 "GETKEYS <full-command> -- Return the keys from a full Redis command.",
+"GETKEYSANDFLAGS <full-command> -- Return the keys and their flags from a full Redis command.",
 "INFO [command-name ...] -- Return details about multiple Redis commands.",
+"LIST [FILTERBY (PATTERN <pattern>|ACLCAT <category>|MODULE <module-name>)] -- Return command names.",
 NULL
         };
         addReplyHelp(c, help);
@@ -3225,6 +3246,112 @@ NULL
             for (j = 0; j < numkeys; j++) addReplyBulk(c,c->argv[keys[j]+2]);
             getKeysFreeResult(keys);
         }
+    } else if (!strcasecmp(c->argv[1]->ptr,"getkeysandflags") && c->argc >= 3) {
+        struct redisCommand *cmd = lookupCommand(c->argv[2]->ptr);
+        int *keys, numkeys, j;
+
+        if (!cmd) {
+            addReplyError(c,"Invalid command specified");
+            return;
+        } else if (cmd->getkeys_proc == NULL && cmd->firstkey == 0) {
+            addReplyError(c,"The command has no key arguments");
+            return;
+        } else if ((cmd->arity > 0 && cmd->arity != c->argc-2) ||
+                   ((c->argc-2) < -cmd->arity))
+        {
+            addReplyError(c,"Invalid number of arguments specified for command");
+            return;
+        }
+
+        keys = getKeysFromCommand(cmd,c->argv+2,c->argc-2,&numkeys);
+        if (!keys) {
+            addReplyError(c,"Invalid arguments specified for command");
+        } else {
+            /* Redis 5.0 has no key specifications: approximate the flags from
+             * the command level flags (read-only commands access keys, write
+             * commands also update them). */
+            addReplyMultiBulkLen(c,numkeys);
+            for (j = 0; j < numkeys; j++) {
+                addReplyMultiBulkLen(c,2);
+                addReplyBulk(c,c->argv[keys[j]+2]);
+                addReplyMultiBulkLen(c,(cmd->flags & CMD_WRITE) ? 3 : 2);
+                addReplyBulkCString(c,(cmd->flags & CMD_WRITE) ? "RW" : "RO");
+                addReplyBulkCString(c,"access");
+                if (cmd->flags & CMD_WRITE) addReplyBulkCString(c,"update");
+            }
+            getKeysFreeResult(keys);
+        }
+    } else if (!strcasecmp(c->argv[1]->ptr,"list")) {
+        /* COMMAND LIST [FILTERBY PATTERN <pattern>|ACLCAT <category>|MODULE <name>] */
+        char *pattern = NULL;
+        int filterby = 0; /* 0 = none, 1 = pattern, 2 = aclcat, 3 = module */
+        int aclcat = 0;   /* 1 = read, 2 = write, 3 = keyspace, 4 = unknown */
+        PORT_LONG count = 0;
+
+        if (c->argc > 2) {
+            if (c->argc != 5 || strcasecmp(c->argv[2]->ptr,"filterby")) {
+                addReplyError(c,"syntax error");
+                return;
+            }
+            if (!strcasecmp(c->argv[3]->ptr,"pattern")) {
+                filterby = 1;
+                pattern = c->argv[4]->ptr;
+            } else if (!strcasecmp(c->argv[3]->ptr,"aclcat")) {
+                filterby = 2;
+                if (!strcasecmp(c->argv[4]->ptr,"read")) aclcat = 1;
+                else if (!strcasecmp(c->argv[4]->ptr,"write")) aclcat = 2;
+                else if (!strcasecmp(c->argv[4]->ptr,"keyspace")) aclcat = 3;
+                else aclcat = 4;
+            } else if (!strcasecmp(c->argv[3]->ptr,"module")) {
+                /* No modules can be loaded by this build, so no command
+                 * belongs to any module. */
+                filterby = 3;
+            } else {
+                addReplyError(c,"syntax error");
+                return;
+            }
+        }
+
+        di = dictGetIterator(server.commands);
+        while ((de = dictNext(di)) != NULL) {
+            struct redisCommand *cmd = dictGetVal(de);
+            int match = 1;
+
+            if (filterby == 1) {
+                match = stringmatch(pattern,cmd->name,1);
+            } else if (filterby == 2) {
+                if (aclcat == 1) match = (cmd->flags & CMD_READONLY) != 0;
+                else if (aclcat == 2) match = (cmd->flags & CMD_WRITE) != 0;
+                else if (aclcat == 3)
+                    match = (cmd->firstkey != 0 || cmd->getkeys_proc != NULL);
+                else match = 0;
+            } else if (filterby == 3) {
+                match = 0;
+            }
+            if (match) count++;
+        }
+        dictReleaseIterator(di);
+
+        addReplyMultiBulkLen(c,count);
+        di = dictGetIterator(server.commands);
+        while ((de = dictNext(di)) != NULL) {
+            struct redisCommand *cmd = dictGetVal(de);
+            int match = 1;
+
+            if (filterby == 1) {
+                match = stringmatch(pattern,cmd->name,1);
+            } else if (filterby == 2) {
+                if (aclcat == 1) match = (cmd->flags & CMD_READONLY) != 0;
+                else if (aclcat == 2) match = (cmd->flags & CMD_WRITE) != 0;
+                else if (aclcat == 3)
+                    match = (cmd->firstkey != 0 || cmd->getkeys_proc != NULL);
+                else match = 0;
+            } else if (filterby == 3) {
+                match = 0;
+            }
+            if (match) addReplyBulkCString(c,cmd->name);
+        }
+        dictReleaseIterator(di);
     } else {
         addReplySubcommandSyntaxError(c);
     }

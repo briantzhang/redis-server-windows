@@ -988,46 +988,44 @@ void loadServerConfig(char* filename, char* options) {
  *----------------------------------------------------------------------------*/
 
 #define config_set_bool_field(_name,_var) \
-    } else if (!strcasecmp(c->argv[2]->ptr,_name)) { \
+    } else if (!strcasecmp(nameobj->ptr,_name)) { \
         int yn = yesnotoi(o->ptr); \
         if (yn == -1) goto badfmt; \
         _var = yn;
 
 #define config_set_numerical_field(_name,_var,min,max) \
-    } else if (!strcasecmp(c->argv[2]->ptr,_name)) { \
+    } else if (!strcasecmp(nameobj->ptr,_name)) { \
         if (getLongLongFromObject(o,&ll) == C_ERR) goto badfmt; \
         if (min != LLONG_MIN && ll < min) goto badfmt; \
         if (max != LLONG_MAX && ll > max) goto badfmt; \
         _var = ll;
 
 #define config_set_memory_field(_name,_var,min,max) \
-    } else if (!strcasecmp(c->argv[2]->ptr,_name)) { \
+    } else if (!strcasecmp(nameobj->ptr,_name)) { \
         ll = memtoll(o->ptr,&err); \
         if (err || ll < (PORT_LONGLONG) (min) || ll > (PORT_LONGLONG) (max)) goto badfmt; \
         _var = ll;
 
 #define config_set_enum_field(_name,_var,_enumvar) \
-    } else if (!strcasecmp(c->argv[2]->ptr,_name)) { \
+    } else if (!strcasecmp(nameobj->ptr,_name)) { \
         int enumval = configEnumGetValue(_enumvar,o->ptr); \
         if (enumval == INT_MIN) goto badfmt; \
         _var = enumval;
 
 #define config_set_special_field(_name) \
-    } else if (!strcasecmp(c->argv[2]->ptr,_name)) {
+    } else if (!strcasecmp(nameobj->ptr,_name)) {
 
 #define config_set_special_field_with_alias(_name1,_name2) \
-    } else if (!strcasecmp(c->argv[2]->ptr,_name1) || \
-               !strcasecmp(c->argv[2]->ptr,_name2)) {
+    } else if (!strcasecmp(nameobj->ptr,_name1) || \
+               !strcasecmp(nameobj->ptr,_name2)) {
 
 #define config_set_else } else
 
-void configSetCommand(client *c) {
-    robj *o;
+static int configSetOne(client *c, robj *nameobj, robj *o) {
     PORT_LONGLONG ll;
     int err;
-    serverAssertWithInfo(c,c->argv[2],sdsEncodedObject(c->argv[2]));
-    serverAssertWithInfo(c,c->argv[3],sdsEncodedObject(c->argv[3]));
-    o = c->argv[3];
+    serverAssertWithInfo(c,nameobj,sdsEncodedObject(nameobj));
+    serverAssertWithInfo(c,o,sdsEncodedObject(o));
 
     if (0) { /* this starts the config_set macros else-if chain. */
 
@@ -1035,7 +1033,7 @@ void configSetCommand(client *c) {
     config_set_special_field("dbfilename") {
         if (!pathIsBaseName(o->ptr)) {
             addReplyError(c, "dbfilename can't be a path, just a filename");
-            return;
+            return C_ERR;
         }
         zfree(server.rdb_filename);
         server.rdb_filename = zstrdup(o->ptr);
@@ -1061,7 +1059,7 @@ void configSetCommand(client *c) {
             if (server.maxclients != ll) {
                 addReplyErrorFormat(c,"The operating system is not able to handle the specified number of clients, try with %lld", server.maxclients);
                 server.maxclients = orig_value;
-                return;
+                return C_ERR;
             }
             if ((unsigned int) aeGetSetSize(server.el) <
                 server.maxclients + CONFIG_FDSET_INCR)
@@ -1071,7 +1069,7 @@ void configSetCommand(client *c) {
                 {
                     addReplyError(c,"The event loop API used by Redis is not able to handle the specified number of clients");
                     server.maxclients = orig_value;
-                    return;
+                    return C_ERR;
                 }
             }
         }
@@ -1085,7 +1083,7 @@ void configSetCommand(client *c) {
             if (startAppendOnly() == C_ERR) {
                 addReplyError(c,
                     "Unable to turn on AOF. Check server logs.");
-                return;
+                return C_ERR;
             }
         }
     } config_set_special_field("save") {
@@ -1125,7 +1123,7 @@ void configSetCommand(client *c) {
     } config_set_special_field("dir") {
         if (chdir((char*)o->ptr) == -1) {
             addReplyErrorFormat(c,"Changing directory: %s", IF_WIN32(wsa_strerror(errno), strerror(errno)));
-            return;
+            return C_ERR;
         }
     } config_set_special_field("client-output-buffer-limit") {
         int vlen, j;
@@ -1230,7 +1228,7 @@ void configSetCommand(client *c) {
                 "requires a Redis server compiled with a modified Jemalloc "
                 "like the one shipped by default with the Redis source "
                 "distribution");
-            return;
+            return C_ERR;
         }
 #endif
     } config_set_bool_field(
@@ -1400,26 +1398,64 @@ void configSetCommand(client *c) {
     /* Everyhing else is an error... */
     } config_set_else {
         addReplyErrorFormat(c,"Unsupported CONFIG parameter: %s",
-            (char*)c->argv[2]->ptr);
-        return;
+            (char*)nameobj->ptr);
+        return C_ERR;
     }
 
-    /* On success we just return a generic OK for all the options. */
-    addReply(c,shared.ok);
-    return;
+    /* On success the caller replies with a single OK for all the options. */
+    return C_OK;
 
 badfmt: /* Bad format errors */
     addReplyErrorFormat(c,"Invalid argument '%s' for CONFIG SET '%s'",
             (char*)o->ptr,
-            (char*)c->argv[2]->ptr);
+            (char*)nameobj->ptr);
+    return C_ERR;
 }
 
+
+/* CONFIG SET accepts one or more parameter-value pairs, applied in order.
+ * Note that the application is not atomic: if a later pair is invalid the
+ * earlier pairs stay applied. */
+void configSetCommand(client *c) {
+    int i;
+
+    if (c->argc < 4 || (c->argc % 2) != 0) {
+        addReplyError(c,"Wrong number of arguments for CONFIG SET");
+        return;
+    }
+
+    for (i = 2; i < c->argc; i += 2) {
+        if (configSetOne(c,c->argv[i],c->argv[i+1]) != C_OK) return;
+    }
+    addReply(c,shared.ok);
+}
 /*-----------------------------------------------------------------------------
  * CONFIG GET implementation
  *----------------------------------------------------------------------------*/
 
+/* Return true if the configuration name was already emitted in this
+ * CONFIG GET call, so that overlapping patterns don't produce duplicates. */
+static int configGetNameAlreadyAdded(list *names, const char *name) {
+    listNode *ln;
+    listIter li;
+
+    listRewind(names,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        if (!strcasecmp((char*)ln->value,name)) return 1;
+    }
+    return 0;
+}
+
+/* Every matched field is added to the 'names' list so that a field matching
+ * more than one of the supplied patterns is reported only once. */
+#define config_get_field_matches(_name) \
+    (stringmatch(pattern,_name,1) && !configGetNameAlreadyAdded(names,_name))
+
+#define config_get_add_name(_name) listAddNodeTail(names,zstrdup(_name))
+
 #define config_get_string_field(_name,_var) do { \
-    if (stringmatch(pattern,_name,1)) { \
+    if (config_get_field_matches(_name)) { \
+        config_get_add_name(_name); \
         addReplyBulkCString(c,_name); \
         addReplyBulkCString(c,_var ? _var : ""); \
         matches++; \
@@ -1427,7 +1463,8 @@ badfmt: /* Bad format errors */
 } while(0);
 
 #define config_get_bool_field(_name,_var) do { \
-    if (stringmatch(pattern,_name,1)) { \
+    if (config_get_field_matches(_name)) { \
+        config_get_add_name(_name); \
         addReplyBulkCString(c,_name); \
         addReplyBulkCString(c,_var ? "yes" : "no"); \
         matches++; \
@@ -1435,7 +1472,8 @@ badfmt: /* Bad format errors */
 } while(0);
 
 #define config_get_numerical_field(_name,_var) do { \
-    if (stringmatch(pattern,_name,1)) { \
+    if (config_get_field_matches(_name)) { \
+        config_get_add_name(_name); \
         ll2string(buf,sizeof(buf),_var); \
         addReplyBulkCString(c,_name); \
         addReplyBulkCString(c,buf); \
@@ -1444,7 +1482,8 @@ badfmt: /* Bad format errors */
 } while(0);
 
 #define config_get_enum_field(_name,_var,_enumvar) do { \
-    if (stringmatch(pattern,_name,1)) { \
+    if (config_get_field_matches(_name)) { \
+        config_get_add_name(_name); \
         addReplyBulkCString(c,_name); \
         addReplyBulkCString(c,configEnumGetNameOrUnknown(_enumvar,_var)); \
         matches++; \
@@ -1452,12 +1491,20 @@ badfmt: /* Bad format errors */
 } while(0);
 
 void configGetCommand(client *c) {
-    robj *o = c->argv[2];
     void *replylen = addDeferredMultiBulkLength(c);
-    char *pattern = o->ptr;
-    char buf[128];
+    list *names = listCreate();
     int matches = 0;
-    serverAssertWithInfo(c,o,sdsEncodedObject(o));
+    int i;
+
+    listSetFreeMethod(names,(void (*)(void*))zfree);
+
+    /* CONFIG GET accepts one or more patterns. A field matching more than
+     * one of the supplied patterns is reported only once. */
+    for (i = 2; i < c->argc; i++) {
+        robj *o = c->argv[i];
+        char *pattern = o->ptr;
+        char buf[128];
+        serverAssertWithInfo(c,o,sdsEncodedObject(o));
 
     /* String values */
     config_get_string_field("dbfilename",server.rdb_filename);
@@ -1706,7 +1753,10 @@ void configGetCommand(client *c) {
         sdsfree(aux);
         matches++;
     }
+    }
+
     setDeferredMultiBulkLength(c,replylen,(PORT_LONG)matches*2);  WIN_PORT_FIX /* cat (PORT_LONG) */
+    listRelease(names);
 }
 
 /*-----------------------------------------------------------------------------
@@ -2392,16 +2442,16 @@ void configCommand(client *c) {
 
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
         const char *help[] = {
-"GET <pattern> -- Return parameters matching the glob-like <pattern> and their values.",
-"SET <parameter> <value> -- Set parameter to value.",
+"GET <pattern> [<pattern> ...] -- Return parameters matching the glob-like <pattern> and their values.",
+"SET <parameter> <value> [<parameter> <value> ...] -- Set one or more parameters.",
 "RESETSTAT -- Reset statistics reported by INFO.",
 "REWRITE -- Rewrite the configuration file.",
 NULL
         };
         addReplyHelp(c, help);
-    } else if (!strcasecmp(c->argv[1]->ptr,"set") && c->argc == 4) {
+    } else if (!strcasecmp(c->argv[1]->ptr,"set") && c->argc >= 3) {
         configSetCommand(c);
-    } else if (!strcasecmp(c->argv[1]->ptr,"get") && c->argc == 3) {
+    } else if (!strcasecmp(c->argv[1]->ptr,"get") && c->argc >= 3) {
         configGetCommand(c);
     } else if (!strcasecmp(c->argv[1]->ptr,"resetstat") && c->argc == 2) {
         resetServerStats();

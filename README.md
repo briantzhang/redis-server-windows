@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp6
+# Redis for Windows 5.0.14.1-bp7
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp6`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp7`。
 
 ## 这个版本新增了什么
 
@@ -47,12 +47,23 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `XPENDING key group [IDLE ms] start end count [consumer]` | 6.2 | 只返回空闲时间达到阈值的待处理消息 |
 | `XAUTOCLAIM key group consumer min-idle start [COUNT n] [JUSTID]` | 6.2 | 批量转移待处理消息，返回游标，并清理流条目已删除的 PEL 记录 |
 | `XINFO STREAM key [FULL [COUNT n]]` | 6.2 / 7.0 | `FULL` 输出条目、组、消费者与 PEL；摘要新增 `max-deleted-entry-id`、`entries-added`、`recorded-first-entry-id` |
+| `BITCOUNT key [start end [BYTE\|BIT]]` | 7.0 | 按字节或按位范围统计置位数量 |
+| `BITPOS key bit [start [end [BYTE\|BIT]]]` | 7.0 | 按字节或按位范围查找第一个 0/1 位 |
+| `BITFIELD_RO key GET type offset ...` | 6.2 | 只读 BITFIELD，只允许 GET（与 OVERFLOW） |
+| `LCS key1 key2 [LEN] [IDX] [MINMATCHLEN n] [WITHMATCHLEN]` | 7.0 | 最长公共子序列，可只取长度或输出匹配区间 |
+| `SORT_RO key [BY ...] [LIMIT ...] [GET ...] [ASC\|DESC] [ALPHA]` | 7.0 | 只读 SORT；带 STORE 报错 |
+| `EVAL_RO script numkeys key ...` / `EVALSHA_RO sha1 numkeys key ...` | 7.0 | 只读脚本入口，脚本里调用写命令直接报错 |
+| `CLIENT PAUSE timeout [WRITE\|ALL]`、`CLIENT UNPAUSE`、`CLIENT INFO` | 6.2 | 暂停写命令或全部命令、提前恢复、返回当前连接信息 |
+| `CONFIG GET pattern [pattern ...]`、`CONFIG SET param value [param value ...]` | 7.0 | 多模式查询（结果去重）与多参数设置；SET 按顺序应用，不是原子操作 |
+| `COMMAND LIST [FILTERBY PATTERN\|ACLCAT\|MODULE ...]`、`COMMAND GETKEYSANDFLAGS` | 7.0 | 列出命令名；键标志按命令级读写属性近似给出 |
 
 过期时间在秒数乘 1000、相对时间加当前时间之前做有符号 64 位溢出检查，非法值报错且不改动数据。
 
 ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`>password`、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`。没有 Redis 7 的多选择器（一个用户多套权限）和按键的读写权限位。配置了 `requirepass` 时，它仍然是 `default` 用户的口令，未认证的连接一律拒绝；不配置时连接直接以 `default` 用户身份进入，ACL 规则照常生效。
 
 命令语义参照 Redis `7.0.15`（BSD）手工适配，没有引入 Redis 8 的源码。完整说明见 [BACKPORT-RELEASE.md](BACKPORT-RELEASE.md)。
+
+`CLIENT PAUSE WRITE` 只拦写命令与 `EXEC`，`CLIENT PAUSE ALL` 连读命令一起拦；被暂停的连接在恢复后按原顺序执行已解析的命令。`CONFIG SET` 多参数时逐对应用，后面的参数非法时前面的已经生效。`COMMAND LIST FILTERBY ACLCAT` 用命令级读写标志近似 `read`/`write`/`keyspace` 分类；`COMMAND GETKEYSANDFLAGS` 只给出 `RO`/`RW`、`access`、`update` 三种标志，没有 Redis 7 的键规格。
 
 ## 没有合入的部分
 
