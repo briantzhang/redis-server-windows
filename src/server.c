@@ -41,6 +41,7 @@
 #include "bio.h"
 #include "latency.h"
 #include "atomicvar.h"
+#include "help.h"
 
 #include <time.h>
 #include <signal.h>
@@ -226,8 +227,8 @@ struct redisCommand redisCommandTable[] = {
     {"zscore",zscoreCommand,3,"rF",0,NULL,1,1,1,0,0},
     {"zmscore",zmscoreCommand,-3,"rF",0,NULL,1,1,1,0,0},
     {"zrandmember",zrandmemberCommand,-2,"rR",0,NULL,1,1,1,0,0},
-    {"zrank",zrankCommand,3,"rF",0,NULL,1,1,1,0,0},
-    {"zrevrank",zrevrankCommand,3,"rF",0,NULL,1,1,1,0,0},
+    {"zrank",zrankCommand,-3,"rF",0,NULL,1,1,1,0,0},
+    {"zrevrank",zrevrankCommand,-3,"rF",0,NULL,1,1,1,0,0},
     {"zscan",zscanCommand,-3,"rR",0,NULL,1,1,1,0,0},
     {"zpopmin",zpopminCommand,-2,"wF",0,NULL,1,1,1,0,0},
     {"zpopmax",zpopmaxCommand,-2,"wF",0,NULL,1,1,1,0,0},
@@ -3249,6 +3250,56 @@ void addReplyCommand(client *c, struct redisCommand *cmd) {
     }
 }
 
+/* Find a commandHelp entry by command name (case-insensitive). */
+static struct commandHelp *commandHelpLookup(const char *name) {
+    size_t i, n = sizeof(commandHelp)/sizeof(commandHelp[0]);
+    for (i = 0; i < n; i++) {
+        if (!strcasecmp(commandHelp[i].name, name))
+            return &commandHelp[i];
+    }
+    return NULL;
+}
+
+/* Emit one command's documentation as a flat field/value array.
+ * Fields come from help.h when available; otherwise from the live command. */
+static void addReplyCommandDocs(client *c, struct redisCommand *cmd) {
+    struct commandHelp *help = commandHelpLookup(cmd->name);
+    const char *summary = help ? help->summary : NULL;
+    const char *since = help ? help->since : NULL;
+    const char *group = "unknown";
+    int have_args = 0;
+    PORT_LONG maplen = 1; /* group always present */
+
+    if (help && help->group >= 0 &&
+        help->group < (int)(sizeof(commandGroups)/sizeof(commandGroups[0])))
+    {
+        group = commandGroups[help->group];
+    }
+    if (summary) maplen++;
+    if (since) maplen++;
+    if (help && help->params && help->params[0] != '-' && help->params[0] != '\0') {
+        have_args = 1;
+        maplen++; /* arguments as a simple string for this port */
+    }
+
+    addReplyMultiBulkLen(c, maplen*2);
+    if (summary) {
+        addReplyBulkCString(c,"summary");
+        addReplyBulkCString(c,summary);
+    }
+    if (since) {
+        addReplyBulkCString(c,"since");
+        addReplyBulkCString(c,since);
+    }
+    addReplyBulkCString(c,"group");
+    addReplyBulkCString(c,group);
+    if (have_args) {
+        /* Keep arguments as a single string so RESP2 clients stay flat. */
+        addReplyBulkCString(c,"arguments");
+        addReplyBulkCString(c,help->params);
+    }
+}
+
 /* COMMAND <subcommand> <args> */
 void commandCommand(client *c) {
     dictIterator *di;
@@ -3258,6 +3309,7 @@ void commandCommand(client *c) {
         const char *help[] = {
 "(no subcommand) -- Return details about all Redis commands.",
 "COUNT -- Return the total number of commands in this Redis server.",
+"DOCS [command-name ...] -- Return documentation for commands.",
 "GETKEYS <full-command> -- Return the keys from a full Redis command.",
 "GETKEYSANDFLAGS <full-command> -- Return the keys and their flags from a full Redis command.",
 "INFO [command-name ...] -- Return details about multiple Redis commands.",
@@ -3411,6 +3463,33 @@ NULL
             if (match) addReplyBulkCString(c,cmd->name);
         }
         dictReleaseIterator(di);
+    } else if (!strcasecmp(c->argv[1]->ptr,"docs")) {
+        /* COMMAND DOCS [command-name ...] — RESP2 map of name -> docs fields.
+         * Docs come from help.h (summary/since/group/params). Commands with no
+         * help entry still appear with group=unknown so clients can discover them. */
+        void *replylen = addDeferredMultiBulkLength(c);
+        PORT_LONG emitted = 0;
+
+        if (c->argc == 2) {
+            di = dictGetIterator(server.commands);
+            while ((de = dictNext(di)) != NULL) {
+                struct redisCommand *cmd = dictGetVal(de);
+                addReplyBulkCString(c, cmd->name);
+                addReplyCommandDocs(c, cmd);
+                emitted++;
+            }
+            dictReleaseIterator(di);
+        } else {
+            int i;
+            for (i = 2; i < c->argc; i++) {
+                struct redisCommand *cmd = lookupCommand(c->argv[i]->ptr);
+                if (!cmd) continue;
+                addReplyBulkCString(c, cmd->name);
+                addReplyCommandDocs(c, cmd);
+                emitted++;
+            }
+        }
+        setDeferredMultiBulkLength(c, replylen, emitted*2);
     } else {
         addReplySubcommandSyntaxError(c);
     }

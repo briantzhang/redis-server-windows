@@ -2056,6 +2056,48 @@ class BackportRegression(unittest.TestCase):
         with self.assertRaises(RedisError):
             self.cmd("COMMAND", "GETKEYSANDFLAGS", "PING")
 
+        docs = self.flat_map(self.cmd("COMMAND", "DOCS", "get", "zrank",
+                                      "nosuchcommand"))
+        self.assertIn(b"get", docs)
+        get_docs = self.flat_map(docs[b"get"])
+        self.assertEqual(get_docs[b"group"], b"string")
+        self.assertIn(b"value", get_docs[b"summary"].lower())
+        self.assertEqual(get_docs[b"since"], b"1.0.0")
+        self.assertEqual(get_docs[b"arguments"], b"key")
+        zrank_docs = self.flat_map(docs[b"zrank"])
+        self.assertEqual(zrank_docs[b"group"], b"sorted_set")
+        self.assertIn(b"WITHSCORE", zrank_docs[b"arguments"])
+        self.assertNotIn(b"nosuchcommand", docs)
+
+        help_text = self.cmd("COMMAND", "HELP")
+        self.assertTrue(any(b"DOCS" in line for line in help_text))
+
+    def test_zrank_withscore(self):
+        key = self.key("zrank:ws")
+        missing = self.key("zrank:missing")
+        plain = self.key("zrank:string")
+        self.cmd("DEL", key, missing, plain)
+        self.cmd("ZADD", key, "1", "a", "2", "b", "3", "c")
+
+        self.assertEqual(self.cmd("ZRANK", key, "a"), 0)
+        self.assertEqual(self.cmd("ZREVRANK", key, "a"), 2)
+        self.assertEqual(self.cmd("ZRANK", key, "b", "WITHSCORE"),
+                         [1, b"2"])
+        self.assertEqual(self.cmd("ZREVRANK", key, "b", "WITHSCORE"),
+                         [1, b"2"])
+        self.assertIsNone(self.cmd("ZRANK", key, "missing"))
+        self.assertIsNone(self.cmd("ZRANK", key, "missing", "WITHSCORE"))
+        self.assertIsNone(self.cmd("ZRANK", missing, "a"))
+        self.assertIsNone(self.cmd("ZRANK", missing, "a", "WITHSCORE"))
+
+        self.cmd("SET", plain, "x")
+        with self.assertRaises(RedisError):
+            self.cmd("ZRANK", plain, "a")
+        with self.assertRaises(RedisError):
+            self.cmd("ZRANK", key, "a", "WITHSCORES")
+        with self.assertRaises(RedisError):
+            self.cmd("ZRANK", key, "a", "WITHSCORE", "extra")
+
     def test_geosearch_geosearchstore(self):
         g = self.key("geo:search")
         self.assertEqual(self.cmd("GEOADD", g,
@@ -2154,6 +2196,12 @@ class BackportRegression(unittest.TestCase):
 
         self.assertEqual(self.cmd("ACL", "DELUSER", name), 1)
         self.assertNotIn(name.encode(), self.cmd("ACL", "USERS"))
+
+        self.assertEqual(self.cmd("ACL", "WHOAMI"), b"default")
+        help_text = self.cmd("ACL", "HELP")
+        self.assertTrue(any(b"WHOAMI" in line for line in help_text))
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "WHOAMI", "extra")
 
     def test_client_kill_options_and_list_fields(self):
         if self.server is None:

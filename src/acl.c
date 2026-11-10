@@ -322,10 +322,11 @@ static int ACLCheckCommandInternal(client *c, int reply) {
         if (reply) addReplyError(c,"user is disabled");
         return C_ERR;
     }
-    /* ACL WHOAMI reports the caller's own identity, so Redis 6 allows it for
-     * every authenticated user regardless of the acl command bit. */
+    /* ACL WHOAMI / HELP report the caller's own identity or usage, so Redis 6
+     * allows them for every authenticated user regardless of the acl bit. */
     if (c->cmd->proc == aclCommand && c->argc == 2 &&
-        !strcasecmp(c->argv[1]->ptr,"whoami")) return C_OK;
+        (!strcasecmp(c->argv[1]->ptr,"whoami") ||
+         !strcasecmp(c->argv[1]->ptr,"help"))) return C_OK;
     if (!(u->flags & USER_ALLCMD) && !aclCommandBit(u, c->cmd->id)) {
         ACLAddLogEntry(c,ACL_DENIED_CMD,0,NULL);
         if (reply)
@@ -1188,6 +1189,37 @@ void aclCommand(client *c) {
             addReplyError(c,err);
             sdsfree(err);
         }
+        return;
+    }
+    if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
+        const char *help[] = {
+"CAT [<category>]",
+"    List the ACL categories, or the commands inside a category.",
+"DELUSER <username> [<username> ...]",
+"    Delete one or more users.",
+"DRYRUN <username> <command> [<arg> ...]",
+"    Check whether a user can run a command without executing it.",
+"GENPASS [<bits>]",
+"    Generate a secure random password string.",
+"GETUSER <username>",
+"    Return the rules describing a user.",
+"LIST",
+"    Show user configurations as ACL rule strings.",
+"LOAD",
+"    Reload users from the configured ACL file.",
+"LOG [<count>|RESET]",
+"    Show or clear recent ACL security events.",
+"SAVE",
+"    Save the current ACL rules to the configured ACL file.",
+"SETUSER <username> [<rule> ...]",
+"    Create or modify a user.",
+"USERS",
+"    List all registered usernames.",
+"WHOAMI",
+"    Return the username of the current connection.",
+NULL
+        };
+        addReplyHelp(c, help);
         return;
     }
     addReplyError(c,"unknown ACL subcommand or wrong number of arguments");

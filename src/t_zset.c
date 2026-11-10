@@ -3457,17 +3457,44 @@ void zrankGenericCommand(client *c, int reverse) {
     robj *key = c->argv[1];
     robj *ele = c->argv[2];
     robj *zobj;
+    robj *nilreply;
     PORT_LONG rank;
+    int withscore = 0;
+    double score;
 
-    if ((zobj = lookupKeyReadOrReply(c,key,shared.nullbulk)) == NULL ||
+    /* ZRANK key member [WITHSCORE] / ZREVRANK key member [WITHSCORE] */
+    if (c->argc > 4) {
+        addReply(c,shared.syntaxerr);
+        return;
+    }
+    if (c->argc == 4) {
+        if (strcasecmp(c->argv[3]->ptr,"withscore")) {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+        withscore = 1;
+    }
+
+    nilreply = withscore ? shared.nullmultibulk : shared.nullbulk;
+    if ((zobj = lookupKeyReadOrReply(c,key,nilreply)) == NULL ||
         checkType(c,zobj,OBJ_ZSET)) return;
 
     serverAssertWithInfo(c,ele,sdsEncodedObject(ele));
     rank = zsetRank(zobj,ele->ptr,reverse);
     if (rank >= 0) {
-        addReplyLongLong(c,rank);
+        if (withscore) {
+            if (zsetScore(zobj,ele->ptr,&score) == C_ERR) {
+                /* Rank found the member; score lookup must succeed. */
+                serverPanic("zsetScore failed after zsetRank");
+            }
+            addReplyMultiBulkLen(c,2);
+            addReplyLongLong(c,rank);
+            addReplyDouble(c,score);
+        } else {
+            addReplyLongLong(c,rank);
+        }
     } else {
-        addReply(c,shared.nullbulk);
+        addReply(c,nilreply);
     }
 }
 

@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp10
+# Redis for Windows 5.0.14.1-bp11
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp10`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp11`。
 
 ## 这个版本新增了什么
 
@@ -76,6 +76,9 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | ACL 频道权限：`&pattern`、`allchannels`、`resetchannels` | 6.0 | 对 `SUBSCRIBE`/`PSUBSCRIBE`/`PUBLISH`/`SSUBSCRIBE`/`SPUBLISH` 生效 |
 | 脚本内的 ACL 检查 | 6.0 | `EVAL`/`EVALSHA` 里的 `redis.call` 按调用者的用户权限校验命令、键与频道 |
 | `SCRIPT FLUSH [ASYNC\|SYNC]` | 6.2 | 两个选项都接受；本版在两种情况下都同步清空脚本缓存 |
+| `COMMAND DOCS [command ...]` | 7.0 | 返回命令文档（summary/since/group/arguments）；无帮助条目的命令仍给出 `group=unknown` |
+| `ZRANK` / `ZREVRANK` 的 `WITHSCORE` | 7.2 | 排名同时返回分数；成员或键不存在时返回空数组 |
+| `ACL HELP` | 6.0 | 列出 ACL 子命令；`ACL WHOAMI` 继续对已认证用户放行 |
 
 过期时间在秒数乘 1000、相对时间加当前时间之前做有符号 64 位溢出检查，非法值报错且不改动数据。
 
@@ -91,6 +94,7 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 
 - RESP3、客户端缓存追踪（`CLIENT TRACKING`）、Redis Functions
 - Redis 7 的 ACL 选择器与按键权限位（本版 ACL 停在 Redis 6 的单权限集）
+- `COMMAND DOCS` 的完整参数树与 complexity/history 字段（本版用 `help.h` 的扁平字段近似）
 - TLS、线程化 I/O
 - 客户端内存驱逐（`maxmemory-clients`）。`CLIENT NO-EVICT` 只为兼容而接受并记录标志，本版不会因为内存压力驱逐客户端
 - 多段 AOF（`appenddirname`）、新版 RDB 格式
@@ -112,13 +116,13 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 
 ## 验证
 
-在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，68 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
+在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，69 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
 
 ```bash
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮新增延迟直方图与 `INFO latencystats` 及两种重置路径、`latency-tracking` 开关、ACL 频道权限（字面/模式订阅、发布、分片频道、日志与 `ACL GETUSER`）、脚本内的 ACL 检查、`ACL SAVE`/`LOAD` 保留频道规则，以及 `SCRIPT FLUSH ASYNC`/`SYNC` 与非法参数。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮新增 `COMMAND DOCS`、`ZRANK`/`ZREVRANK WITHSCORE`、`ACL HELP`/`WHOAMI`，并保留此前的延迟直方图、ACL 频道权限、脚本内 ACL、`SCRIPT FLUSH` 选项等用例。
 
 这轮验证不等于已合入上游全部安全补丁，也没有做生产压力测试。
 
