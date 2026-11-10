@@ -786,6 +786,10 @@ void loadServerConfigFromString(char* config) {
                 err = "The latency threshold can't be negative";
                 goto loaderr;
             }
+        } else if (!strcasecmp(argv[0],"latency-tracking") && argc == 2) {
+            if ((server.latency_tracking = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
         } else if (!strcasecmp(argv[0],"slowlog-max-len") && argc == 2) {
             server.slowlog_max_len = (PORT_ULONG)(strtoll(argv[1],NULL,10));    WIN_PORT_FIX /* cast (PORT_ULONG) */
         } else if (!strcasecmp(argv[0],"client-output-buffer-limit") &&
@@ -1253,6 +1257,8 @@ static int configSetOne(client *c, robj *nameobj, robj *o) {
     } config_set_bool_field(
       "stop-writes-on-bgsave-error",server.stop_writes_on_bgsave_err) {
     } config_set_bool_field(
+      "latency-tracking",server.latency_tracking) {
+    } config_set_bool_field(
       "lazyfree-lazy-eviction",server.lazyfree_lazy_eviction) {
     } config_set_bool_field(
       "lazyfree-lazy-expire",server.lazyfree_lazy_expire) {
@@ -1652,6 +1658,8 @@ void configGetCommand(client *c) {
             server.aof_load_truncated);
     config_get_bool_field("aof-use-rdb-preamble",
             server.aof_use_rdb_preamble);
+    config_get_bool_field("latency-tracking",
+            server.latency_tracking);
     config_get_bool_field("lazyfree-lazy-eviction",
             server.lazyfree_lazy_eviction);
     config_get_bool_field("lazyfree-lazy-expire",
@@ -2426,6 +2434,7 @@ int rewriteConfig(char *path) {
     rewriteConfigYesNoOption(state,"aof-load-truncated",server.aof_load_truncated,CONFIG_DEFAULT_AOF_LOAD_TRUNCATED);
     rewriteConfigYesNoOption(state,"aof-use-rdb-preamble",server.aof_use_rdb_preamble,CONFIG_DEFAULT_AOF_USE_RDB_PREAMBLE);
     rewriteConfigEnumOption(state,"supervised",server.supervised_mode,supervised_mode_enum,SUPERVISED_NONE);
+    rewriteConfigYesNoOption(state,"latency-tracking",server.latency_tracking,1);
     rewriteConfigYesNoOption(state,"lazyfree-lazy-eviction",server.lazyfree_lazy_eviction,CONFIG_DEFAULT_LAZYFREE_LAZY_EVICTION);
     rewriteConfigYesNoOption(state,"lazyfree-lazy-expire",server.lazyfree_lazy_expire,CONFIG_DEFAULT_LAZYFREE_LAZY_EXPIRE);
     rewriteConfigYesNoOption(state,"lazyfree-lazy-server-del",server.lazyfree_lazy_server_del,CONFIG_DEFAULT_LAZYFREE_LAZY_SERVER_DEL);

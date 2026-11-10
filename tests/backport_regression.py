@@ -172,7 +172,7 @@ class ManagedServer:
         if self.aclfile:
             acl = self.directory / "acl.conf"
             acl.write_text(
-                "user default on %s ~* +@all\n" % (
+                "user default on %s ~* &* +@all\n" % (
                     ">%s" % self.requirepass if self.requirepass else "nopass"),
                 encoding="ascii",
             )
@@ -2140,7 +2140,7 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(len(info[b"passwords"]), 1)
         self.assertIn(b"-@all", info[b"commands"])
         self.assertIn(b"+get", info[b"commands"])
-        self.assertEqual(info[b"channels"], b"")
+        self.assertEqual(info[b"channels"], [])
 
         self.assertEqual(len(self.cmd("ACL", "GENPASS")), 64)
         self.assertEqual(len(self.cmd("ACL", "GENPASS", "8")), 2)
@@ -2318,12 +2318,14 @@ class BackportRegression(unittest.TestCase):
             self.skipTest("ACL file test requires --server")
         self.assertIn(b"default", self.cmd("ACL", "USERS"))
         self.assertEqual(self.cmd("ACL", "SETUSER", "bp9file", "on", ">pw",
-                                  "~x:*", "+get"), b"OK")
+                                  "~x:*", "+get", "resetchannels",
+                                  "&x:*"), b"OK")
         self.assertEqual(self.cmd("ACL", "SAVE"), b"OK")
 
         text = (self.server.directory / "acl.conf").read_text()
         self.assertIn("user bp9file on", text)
         self.assertIn("~x:*", text)
+        self.assertIn("resetchannels &x:*", text)
         self.assertIn("-@all +get", text)
 
         self.assertEqual(self.cmd("ACL", "DELUSER", "bp9file"), 1)
@@ -2332,6 +2334,7 @@ class BackportRegression(unittest.TestCase):
         self.assertIn(b"bp9file", self.cmd("ACL", "USERS"))
         info = self.flat_map(self.cmd("ACL", "GETUSER", "bp9file"))
         self.assertEqual(info[b"keys"], [b"~x:*"])
+        self.assertEqual(info[b"channels"], [b"&x:*"])
         self.assertIn(b"+get", info[b"commands"])
 
         probe = self.connect()
@@ -2451,6 +2454,124 @@ class BackportRegression(unittest.TestCase):
         with self.assertRaises((OSError, EOFError)):
             victim.command("PING")
         self.assertEqual(self.cmd("PING"), b"PONG")
+
+    def test_latency_histogram_and_latencystats(self):
+        if self.server is None:
+            self.skipTest("latency tracking test requires --server")
+        self.assertEqual(self.cmd("CONFIG", "GET", "latency-tracking"),
+                         [b"latency-tracking", b"yes"])
+        for _ in range(3):
+            self.cmd("GET", "missing:bp10")
+
+        histogram = self.flat_map(self.cmd("LATENCY", "HISTOGRAM", "get"))
+        self.assertIn(b"get", histogram)
+        entry = self.flat_map(histogram[b"get"])
+        self.assertGreaterEqual(entry[b"calls"], 3)
+        buckets = entry[b"histogram_usec"]
+        self.assertTrue(buckets)
+        self.assertEqual(len(buckets) % 2, 0)
+        micros, counts = buckets[0::2], buckets[1::2]
+        self.assertEqual(micros, sorted(micros))
+        self.assertEqual(counts, sorted(counts))
+        self.assertEqual(counts[-1], entry[b"calls"])
+
+        info = self.cmd("INFO", "latencystats")
+        self.assertIn(b"latency_percentiles_usec_get:p50=", info)
+
+        # Both reset paths clear the histograms.
+        self.cmd("CONFIG", "RESETSTAT")
+        self.assertEqual(self.cmd("LATENCY", "HISTOGRAM", "get"), [])
+        self.cmd("GET", "missing:bp10")
+        self.assertTrue(self.cmd("LATENCY", "HISTOGRAM", "get"))
+        self.cmd("LATENCY", "RESET")
+        self.assertEqual(self.cmd("LATENCY", "HISTOGRAM", "get"), [])
+
+        # Turning tracking off stops new samples without clearing old ones.
+        self.cmd("GET", "missing:bp10")
+        before = self.flat_map(self.flat_map(
+            self.cmd("LATENCY", "HISTOGRAM", "get"))[b"get"])[b"calls"]
+        self.assertEqual(self.cmd("CONFIG", "SET", "latency-tracking", "no"),
+                         b"OK")
+        for _ in range(3):
+            self.cmd("GET", "missing:bp10")
+        after = self.flat_map(self.flat_map(
+            self.cmd("LATENCY", "HISTOGRAM", "get"))[b"get"])[b"calls"]
+        self.assertEqual(before, after)
+        self.assertEqual(self.cmd("CONFIG", "SET", "latency-tracking", "yes"),
+                         b"OK")
+
+    def test_acl_channel_permissions(self):
+        self.assertEqual(self.cmd("ACL", "SETUSER", "bp10pub", "on", ">pw",
+                                  "~*", "+@all", "resetchannels",
+                                  "&news:*"), b"OK")
+        line = [entry for entry in self.cmd("ACL", "LIST")
+                if entry.startswith(b"user bp10pub")][0]
+        self.assertIn(b"resetchannels", line)
+        self.assertIn(b"&news:*", line)
+        info = self.flat_map(self.cmd("ACL", "GETUSER", "bp10pub"))
+        self.assertEqual(info[b"channels"], [b"&news:*"])
+
+        pub = self.connect()
+        self.addCleanup(pub.close)
+        self.assertEqual(pub.command("AUTH", "bp10pub", "pw"), b"OK")
+        self.assertEqual(pub.command("PUBLISH", "news:1", "x"), 0)
+        with self.assertRaises(RedisError):
+            pub.command("PUBLISH", "other", "x")
+        with self.assertRaises(RedisError):
+            pub.command("SPUBLISH", "other", "x")
+        self.assertEqual(pub.command("SUBSCRIBE", "news:1")[0],
+                         b"subscribe")
+        with self.assertRaises(RedisError):
+            pub.command("SUBSCRIBE", "other")
+        self.assertEqual(pub.command("PSUBSCRIBE", "news:*")[0],
+                         b"psubscribe")
+        with self.assertRaises(RedisError):
+            pub.command("PSUBSCRIBE", "news:1")
+        self.assertEqual(pub.command("SSUBSCRIBE", "news:2")[0],
+                         b"ssubscribe")
+        # All channels are checked before anything is subscribed.
+        with self.assertRaises(RedisError):
+            pub.command("SUBSCRIBE", "news:3", "other")
+
+        log = self.cmd("ACL", "LOG")
+        channel_entry = [self.flat_map(entry) for entry in log
+                         if self.flat_map(entry)[b"reason"] == b"channel"][0]
+        self.assertEqual(channel_entry[b"object"], b"other")
+        self.assertEqual(channel_entry[b"username"], b"bp10pub")
+        default = self.flat_map(self.cmd("ACL", "GETUSER", "default"))
+        self.assertEqual(default[b"channels"], [b"&*"])
+
+    def test_script_flush_options(self):
+        sha = self.cmd("SCRIPT", "LOAD", "return 1")
+        self.assertEqual(self.cmd("SCRIPT", "EXISTS", sha), [1])
+        self.assertEqual(self.cmd("SCRIPT", "FLUSH", "ASYNC"), b"OK")
+        self.assertEqual(self.cmd("SCRIPT", "EXISTS", sha), [0])
+        sha = self.cmd("SCRIPT", "LOAD", "return 2")
+        self.assertEqual(self.cmd("SCRIPT", "FLUSH", "SYNC"), b"OK")
+        self.assertEqual(self.cmd("SCRIPT", "EXISTS", sha), [0])
+        with self.assertRaises(RedisError):
+            self.cmd("SCRIPT", "FLUSH", "BOGUS")
+
+    def test_acl_applies_inside_scripts(self):
+        self.assertEqual(self.cmd("ACL", "SETUSER", "bp10lua", "on", ">pw",
+                                  "~ok:*", "+eval", "+get"), b"OK")
+        lua = self.connect()
+        self.addCleanup(lua.close)
+        self.assertEqual(lua.command("AUTH", "bp10lua", "pw"), b"OK")
+        self.assertIsNone(lua.command(
+            "EVAL", "return redis.call('get','ok:1')", 0))
+        with self.assertRaises(RedisError):
+            lua.command("EVAL", "return redis.call('set','ok:1','x')", 0)
+        with self.assertRaises(RedisError):
+            lua.command("EVAL", "return redis.call('get','bad:1')", 0)
+        # The same rule applies to channels used from a script.
+        self.assertEqual(self.cmd("ACL", "SETUSER", "bp10lua", "+publish"),
+                         b"OK")
+        with self.assertRaises(RedisError):
+            lua.command("EVAL", "return redis.call('publish','any','x')", 0)
+        log = self.cmd("ACL", "LOG")
+        contexts = {self.flat_map(entry)[b"context"] for entry in log}
+        self.assertIn(b"lua", contexts)
 
     def test_requirepass_rejects_wrong_password(self):
         if self.server is None:

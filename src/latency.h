@@ -61,8 +61,20 @@ struct latencyStats {
     time_t period;          /* Number of seconds since first event and now. */
 };
 
+/* Per-command latency histogram. Samples are recorded in nanoseconds and
+ * grouped in power-of-two buckets starting at 1024ns, so the reply can expose
+ * microsecond bucket boundaries without keeping every sample. */
+#define LATENCY_HISTOGRAM_BUCKETS 32
+struct latencyHistogram {
+    uint64_t count;                              /* Samples recorded. */
+    uint64_t buckets[LATENCY_HISTOGRAM_BUCKETS]; /* Per-bucket counts. */
+};
+
 void latencyMonitorInit(void);
 void latencyAddSample(char *event, mstime_t latency);
+void latencyHistogramAddSample(struct latencyHistogram *h, uint64_t ns);
+void latencyHistogramReset(struct latencyHistogram *h);
+double latencyHistogramPercentile(struct latencyHistogram *h, double p);
 int THPIsEnabled(void);
 
 /* Latency monitoring macros. */

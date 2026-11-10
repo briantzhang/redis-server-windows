@@ -515,6 +515,21 @@ int luaRedisGenericCommand(lua_State *lua, int raise_error) {
         goto cleanup;
     }
 
+    /* Commands called from Lua obey the caller's ACL permissions. The Lua
+     * pseudo-client has no socket, so a refusal becomes a script error. */
+    if (server.lua_caller && server.lua_caller->user) {
+        int acl_ok;
+        c->user = server.lua_caller->user;
+        acl_ok = ACLCheckCommandQuiet(c) == C_OK &&
+                 ACLCheckChannelPermissionsQuiet(c) == C_OK;
+        c->user = NULL;
+        if (!acl_ok) {
+            luaPushError(lua,"NOPERM this user has no permissions to run "
+                             "the command called from the script");
+            goto cleanup;
+        }
+    }
+
     /* Write commands are forbidden from read-only scripts. */
     if (lua_ro && (cmd->flags & CMD_WRITE)) {
         luaPushError(lua, "Write commands are not allowed from read-only scripts.");
@@ -1540,13 +1555,18 @@ void scriptCommand(client *c) {
         const char *help[] = {
 "DEBUG (yes|sync|no) -- Set the debug mode for subsequent scripts executed.",
 "EXISTS <sha1> [<sha1> ...] -- Return information about the existence of the scripts in the script cache.",
-"FLUSH -- Flush the Lua scripts cache. Very dangerous on replicas.",
+"FLUSH [ASYNC|SYNC] -- Flush the Lua scripts cache. Very dangerous on replicas.",
 "KILL -- Kill the currently executing Lua script.",
 "LOAD <script> -- Load a script into the scripts cache, without executing it.",
 NULL
         };
         addReplyHelp(c, help);
-    } else if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"flush")) {
+    } else if ((c->argc == 2 || c->argc == 3) &&
+               !strcasecmp(c->argv[1]->ptr,"flush") &&
+               (c->argc == 2 || !strcasecmp(c->argv[2]->ptr,"async") ||
+                !strcasecmp(c->argv[2]->ptr,"sync"))) {
+        /* ASYNC is accepted for compatibility; this build resets the
+         * script cache synchronously in both cases. */
         scriptingReset();
         addReply(c,shared.ok);
         replicationScriptCacheFlush();

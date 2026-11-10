@@ -480,6 +480,7 @@ static RedisParameterMapper g_redisArgMap =
     { "lua-replicate-commands",         &fp1 },    // lua-replicate-commands [yes/no]
     { "slowlog-log-slower-than",        &fp1 },    // slowlog-log-slower-than [number]
     { "latency-monitor-threshold",      &fp1 },    // latency-monitor-threshold [number]
+    { "latency-tracking",               &fp1 },    // latency-tracking [yes/no]
     { "slowlog-max-len",                &fp1 },    // slowlog-max-len [number]
     { "client-output-buffer-limit",     &fp4 },    // client-output-buffer-limit [class] [hard limit] [soft limit] [soft seconds]
     { "stop-writes-on-bgsave-error",    &fp1 },    // stop-writes-on-bgsave-error [yes/no]

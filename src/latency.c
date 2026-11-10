@@ -91,6 +91,45 @@ void latencyMonitorInit(void) {
     server.latency_events = dictCreate(&latencyTimeSeriesDictType,NULL);
 }
 
+/* ---------------------- Per-command latency histograms -------------------- */
+
+/* Record a command duration in nanoseconds. Bucket zero holds everything up
+ * to 1024ns, bucket N holds up to 1024<<N, and the last bucket is open. */
+void latencyHistogramAddSample(struct latencyHistogram *h, uint64_t ns) {
+    uint64_t bound = 1024;
+    int bucket = 0;
+
+    while (ns > bound && bucket < LATENCY_HISTOGRAM_BUCKETS-1) {
+        bound <<= 1;
+        bucket++;
+    }
+    h->buckets[bucket]++;
+    h->count++;
+}
+
+void latencyHistogramReset(struct latencyHistogram *h) {
+    memset(h->buckets,0,sizeof(h->buckets));
+    h->count = 0;
+}
+
+/* Value at percentile p (0..1) in microseconds, using the bucket upper
+ * bound. Buckets are coarse by design, like the upstream log2 histogram. */
+double latencyHistogramPercentile(struct latencyHistogram *h, double p) {
+    uint64_t target, cumulative = 0;
+    int j;
+
+    if (h == NULL || h->count == 0) return 0;
+    target = (uint64_t)(p * (double)h->count);
+    if (target == 0) target = 1;
+    if (target > h->count) target = h->count;
+    for (j = 0; j < LATENCY_HISTOGRAM_BUCKETS; j++) {
+        cumulative += h->buckets[j];
+        if (cumulative >= target)
+            return (double)((1024ULL << j) / 1000.0);
+    }
+    return (double)((1024ULL << (LATENCY_HISTOGRAM_BUCKETS-1)) / 1000.0);
+}
+
 /* Add the specified sample to the specified time series "event".
  * This function is usually called via latencyAddSampleIfNeeded(), that
  * is a macro that only adds the sample if the latency is higher than
@@ -473,6 +512,63 @@ sds createLatencyReport(void) {
 
 /* ---------------------- Latency command implementation -------------------- */
 
+/* Reply with one command histogram: calls plus cumulative microsecond
+ * buckets, represented as a flat array because this build speaks RESP2. */
+static void latencyCommandReplyWithHistogram(client *c,
+                                             struct redisCommand *cmd)
+{
+    struct latencyHistogram *h = cmd->latency_histogram;
+    uint64_t cumulative = 0, previous = 0;
+    void *histlen;
+    int j, emitted = 0;
+
+    addReplyMultiBulkLen(c,4);
+    addReplyBulkCString(c,"calls");
+    addReplyLongLong(c,(PORT_LONGLONG)h->count);
+    addReplyBulkCString(c,"histogram_usec");
+    histlen = addDeferredMultiBulkLength(c);
+    for (j = 0; j < LATENCY_HISTOGRAM_BUCKETS; j++) {
+        cumulative += h->buckets[j];
+        if (cumulative == previous) continue;
+        addReplyLongLong(c,(PORT_LONGLONG)((1024ULL << j)/1000));
+        addReplyLongLong(c,(PORT_LONGLONG)cumulative);
+        previous = cumulative;
+        emitted++;
+    }
+    setDeferredMultiBulkLength(c,histlen,emitted*2);
+}
+
+/* LATENCY HISTOGRAM [command ...]: all commands with samples, or only the
+ * named ones. Unknown and never-called commands are silently skipped. */
+static void latencyCommandReplyWithHistograms(client *c, int start, int end) {
+    void *replylen = addDeferredMultiBulkLength(c);
+    int emitted = 0, j;
+
+    if (start == end) {
+        dictIterator *di = dictGetSafeIterator(server.commands);
+        dictEntry *de;
+        while ((de = dictNext(di)) != NULL) {
+            struct redisCommand *cmd = dictGetVal(de);
+            if (cmd->latency_histogram == NULL ||
+                cmd->latency_histogram->count == 0) continue;
+            addReplyBulkCString(c,cmd->name);
+            latencyCommandReplyWithHistogram(c,cmd);
+            emitted++;
+        }
+        dictReleaseIterator(di);
+    } else {
+        for (j = start; j < end; j++) {
+            struct redisCommand *cmd = lookupCommand(c->argv[j]->ptr);
+            if (cmd == NULL || cmd->latency_histogram == NULL ||
+                cmd->latency_histogram->count == 0) continue;
+            addReplyBulkCString(c,cmd->name);
+            latencyCommandReplyWithHistogram(c,cmd);
+            emitted++;
+        }
+    }
+    setDeferredMultiBulkLength(c,replylen,emitted*2);
+}
+
 /* latencyCommand() helper to produce a time-delay reply for all the samples
  * in memory for the specified time series. */
 void latencyCommandReplyWithSamples(client *c, struct latencyTimeSeries *ts) {
@@ -570,6 +666,7 @@ void latencyCommand(client *c) {
     const char *help[] = {
 "DOCTOR              -- Returns a human readable latency analysis report.",
 "GRAPH   <event>     -- Returns an ASCII latency graph for the event class.",
+"HISTOGRAM [command ...] -- Returns latency histograms of commands.",
 "HISTORY <event>     -- Returns time-latency samples for the event class.",
 "LATEST              -- Returns the latest latency samples for all events.",
 "RESET   [event ...] -- Resets latency data of one or more event classes.",
@@ -610,9 +707,20 @@ NULL
 
         addReplyBulkCBuffer(c,report,sdslen(report));
         sdsfree(report);
+    } else if (!strcasecmp(c->argv[1]->ptr,"histogram") && c->argc >= 2) {
+        /* LATENCY HISTOGRAM [command ...] */
+        latencyCommandReplyWithHistograms(c,2,c->argc);
     } else if (!strcasecmp(c->argv[1]->ptr,"reset") && c->argc >= 2) {
         /* LATENCY RESET */
         if (c->argc == 2) {
+            dictIterator *di = dictGetSafeIterator(server.commands);
+            dictEntry *de;
+            while ((de = dictNext(di)) != NULL) {
+                struct redisCommand *cmd = dictGetVal(de);
+                if (cmd->latency_histogram)
+                    latencyHistogramReset(cmd->latency_histogram);
+            }
+            dictReleaseIterator(di);
             addReplyLongLong(c,latencyResetEvent(NULL));
         } else {
             int j, resets = 0;

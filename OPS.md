@@ -1,6 +1,6 @@
 # 运维手册
 
-适用版本：Redis for Windows `5.0.14.1-bp9`，仅 Windows x64，单机、非集群。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
+适用版本：Redis for Windows `5.0.14.1-bp10`，仅 Windows x64，单机、非集群。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
 
 本文只覆盖这一个可执行文件的日常操作。它不包含 TLS、多段 AOF 和集群，那些配置项写进 `redis.conf` 也不会生效，启动时会报未知配置。ACL 已按 Redis 6 的范围实现，见第 3 节。
 
@@ -38,7 +38,7 @@
 .\redis-server.exe --version
 ```
 
-应看到 `v=5.0.14.1-bp9`。如果不是这个版本号，说明运行的不是这份回移。
+应看到 `v=5.0.14.1-bp10`。如果不是这个版本号，说明运行的不是这份回移。
 
 另开一个窗口检查存活：
 
@@ -131,7 +131,9 @@ ACL DRYRUN reader get cache:1   -- 预检权限，不执行命令
 - 配置了 `requirepass` 时，未认证连接收到 `NOAUTH`；没有配置时，连接以 `default` 用户进入，`default` 默认拥有全部权限。
 - `ACL DELUSER default` 会被拒绝。删掉一个用户后，仍以该用户身份在线的连接会立即被断开。
 - `ACL LOG [条数]` 查看最近的拒绝记录（命令、键、认证失败），相同条目在 60 秒内合并计数；`ACL LOG RESET` 清空。`acllog-max-len` 控制条数上限，设为 0 关闭记录。
-- 需要重启后保留用户时，在配置里设置 `aclfile <路径>`，文件每行一个 `user <名称> <规则...>`。启动时自动加载；运行期用 `ACL SAVE` 写回、`ACL LOAD` 重新加载。加载失败时保留内存中的旧用户并返回错误。`aclfile` 不能在运行期用 `CONFIG SET` 修改。
+- 需要重启后保留用户时，在配置里设置 `aclfile <路径>`，文件每行一个 `user <名称> <规则...>`。启动时自动加载；运行期用 `ACL SAVE` 写回、`ACL LOAD` 重新加载。加载失败时保留内存中的旧用户并返回错误。`aclfile` 不能在运行期用 `CONFIG SET` 修改。ACL 文件里的 `default` 行要带上 `&*`（或 `allchannels`），否则默认用户不能订阅和发布。
+- 频道权限用 `&pattern` 设置，例如 `ACL SETUSER reader on >secret ~cache:* &news:* +@all`。字面频道按通配符匹配，`PSUBSCRIBE` 的模式必须与 ACL 模式字面一致。新建用户默认没有任何频道权限，`default` 用户默认 `allchannels`。`&*` 与 `allchannels` 等价，`resetchannels` 清空。已经在 `allchannels` 状态时再添加 `&pattern` 会报错，需要先 `resetchannels`。
+- 脚本里的 `redis.call` 也按调用者的用户检查命令、键和频道；越权时脚本直接报错。
 
 ### 大键删除与清库
 
@@ -352,6 +354,18 @@ CLIENT KILL LADDR 127.0.0.1:6379  -- 命中该监听地址上的全部连接
 
 `CLIENT KILL` 默认跳过发起命令的连接；`LADDR` 是服务端本地地址，不是客户端地址，所以同一监听端口上的连接都会命中。`MAXAGE` 按连接建立至今的秒数计算，`-1` 会被拒绝。`INFO everything` 与 `INFO all` 输出相同；`INFO errorstats` 按错误码给出计数，`CONFIG RESETSTAT` 会清零。客户端库可以用 `CLIENT SETINFO lib-name <名称>` 和 `CLIENT SETINFO lib-ver <版本>` 登记自己，`CLIENT LIST` 的 `lib-name=`、`lib-ver=` 会显示出来。
 
+命令延迟统计：
+
+```text
+LATENCY HISTOGRAM              -- 所有有样本的命令
+LATENCY HISTOGRAM get set      -- 只看指定命令
+INFO latencystats              -- 每条命令的 p50/p99/p99.9（微秒）
+LATENCY RESET                  -- 清空事件与直方图
+CONFIG SET latency-tracking no -- 停止采集，已有数据保留
+```
+
+直方图按 1024ns 起、2 的幂分桶，`histogram_usec` 是“桶上界 → 累计次数”的扁平数组。它适合判断延迟量级，不是精确的尾延迟分布。直方图只存在内存里，重启或 `CONFIG RESETSTAT` 后从零开始。
+
 ## 5. 持久化与恢复
 
 RDB 是某个时间点的快照，AOF 是写命令日志。两者同时开启时，重启优先用 AOF 恢复，因为它更接近停机前的状态。
@@ -406,7 +420,7 @@ BGREWRITEAOF
 
 等 `INFO persistence` 里两次后台任务的状态都变成 `ok`，再复制 `dir` 下的 `dump.rdb` 和 `appendonly.aof`。复制过程中不要 `SHUTDOWN`，也不要再手动触发保存。
 
-备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp9-20261109.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
+备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp10-20261109.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
 
 流的 `entries-added` 和 `max-deleted-entry-id` 不写入 RDB 快照：从 `dump.rdb` 恢复后前者按当前长度重算、后者归零；从 AOF 恢复（含 AOF 重写）会保留。若业务依赖这两个计数，恢复时优先使用 AOF，或在恢复后用 `XSETID <key> <id> ENTRIESADDED <n> MAXDELETEDID <id>` 校正。
 

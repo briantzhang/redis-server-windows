@@ -1349,6 +1349,7 @@ struct redisServer {
     int lazyfree_lazy_user_flush;
     /* Latency monitor */
     PORT_LONGLONG latency_monitor_threshold;
+    int latency_tracking; /* Collect per-command latency histograms. */
     dict *latency_events;
     /* Assert & bug reporting */
     const char *assert_failed;
@@ -1392,6 +1393,7 @@ struct redisCommand {
     int keystep;  /* The step between first and last key */
     PORT_LONGLONG microseconds, calls;
     int id;       /* Position in the ACL command bitmap, assigned at startup. */
+    struct latencyHistogram *latency_histogram; /* Created on first call. */
 };
 
 struct redisFunctionSym {
@@ -2060,6 +2062,9 @@ void ACLUpdateDefaultUserPassword(const char *password);
 sds ACLLoadFromFile(const char *filename);
 int ACLSaveToFile(const char *filename);
 int ACLCheckCommand(client *c);
+int ACLCheckCommandQuiet(client *c);
+int ACLCheckChannelPermissions(client *c);
+int ACLCheckChannelPermissionsQuiet(client *c);
 void ACLInitDefaultUser(void);
 void ACLAssignCommandIDs(void);
 void resetCommand(client *c);

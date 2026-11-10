@@ -1839,6 +1839,7 @@ void initServerConfig(void) {
     server.errors = raxNew();
 
     /* Slow log */
+    server.latency_tracking = 1;
     server.slowlog_log_slower_than = CONFIG_DEFAULT_SLOWLOG_LOG_SLOWER_THAN;
     server.slowlog_max_len = CONFIG_DEFAULT_SLOWLOG_MAX_LEN;
 
@@ -2433,6 +2434,7 @@ void resetCommandTableStats(void) {
         c = (struct redisCommand *) dictGetVal(de);
         c->microseconds = 0;
         c->calls = 0;
+        if (c->latency_histogram) latencyHistogramReset(c->latency_histogram);
     }
     dictReleaseIterator(di);
 
@@ -2680,6 +2682,13 @@ void call(client *c, int flags) {
          * EXPIRE, GEOADD, etc. */
         real_cmd->microseconds += duration;
         real_cmd->calls++;
+        if (server.latency_tracking) {
+            if (real_cmd->latency_histogram == NULL)
+                real_cmd->latency_histogram =
+                    zcalloc(sizeof(struct latencyHistogram));
+            latencyHistogramAddSample(real_cmd->latency_histogram,
+                                      (uint64_t)duration*1000);
+        }
     }
 
     /* Propagate the command into the AOF and replication link */
@@ -2796,6 +2805,10 @@ int processCommand(client *c) {
         return C_OK;
     }
     if (c->user && c->cmd->proc != authCommand && ACLCheckCommand(c) == C_ERR) {
+        flagTransaction(c);
+        return C_OK;
+    }
+    if (c->user && ACLCheckChannelPermissions(c) == C_ERR) {
         flagTransaction(c);
         return C_OK;
     }
@@ -3968,6 +3981,28 @@ sds genRedisInfoString(char *section) {
                 "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f\r\n",
                 c->name, c->calls, c->microseconds,
                 (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls));
+        }
+        dictReleaseIterator(di);
+    }
+
+    /* Latency statistics */
+    if (allsections || !strcasecmp(section,"latencystats")) {
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info, "# Latencystats\r\n");
+
+        struct redisCommand *c;
+        dictEntry *de;
+        dictIterator *di;
+        di = dictGetSafeIterator(server.commands);
+        while((de = dictNext(di)) != NULL) {
+            c = (struct redisCommand *) dictGetVal(de);
+            if (!c->latency_histogram || !c->latency_histogram->count) continue;
+            info = sdscatprintf(info,
+                "latency_percentiles_usec_%s:p50=%.3f,p99=%.3f,p99.9=%.3f\r\n",
+                c->name,
+                latencyHistogramPercentile(c->latency_histogram,0.5),
+                latencyHistogramPercentile(c->latency_histogram,0.99),
+                latencyHistogramPercentile(c->latency_histogram,0.999));
         }
         dictReleaseIterator(di);
     }
