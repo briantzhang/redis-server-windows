@@ -25,6 +25,16 @@ typedef struct {
 static dict *Users;
 static user *DefaultUser;
 static rax *CommandIds;
+static list *ACLLog;
+
+#define ACL_LOG_CTX_TOPLEVEL 0
+#define ACL_LOG_CTX_LUA 1
+#define ACL_LOG_CTX_MULTI 2
+#define ACL_LOG_GROUPING_MAX_TIME_DELTA 60000
+
+#define ACL_DENIED_CMD 0
+#define ACL_DENIED_KEY 1
+#define ACL_DENIED_AUTH 2
 
 void *ACLDefaultUser(void) { return DefaultUser; }
 
@@ -46,6 +56,9 @@ static int aclUserCompare(void *privdata, const void *key1, const void *key2) {
 static dictType usersDictType;
 
 static void aclFreeUser(void *privdata, void *ptr);
+static void ACLFreeLogEntry(void *leptr);
+static void ACLAddLogEntry(client *c, int reason, int argpos,
+                           const char *username);
 
 void ACLInit(void) {
     usersDictType = hashDictType;
@@ -55,6 +68,8 @@ void ACLInit(void) {
     Users = dictCreate(&usersDictType, NULL);
     CommandIds = raxNew();
     DefaultUser = NULL;
+    ACLLog = listCreate();
+    listSetFreeMethod(ACLLog,ACLFreeLogEntry);
 }
 
 /* privdata is the dict's private pointer. The destructor is called as
@@ -216,7 +231,27 @@ int ACLSetUser(user *u, const char *op) {
         u->flags &= ~USER_ALLKEYS;
         return C_OK;
     }
+    /* Pub/Sub channel permissions do not exist in this build, but accept the
+     * Redis 6 syntax so ACL files written by other versions still load. */
+    if (op[0] == '&' || !strcasecmp(op,"allchannels") ||
+        !strcasecmp(op,"resetchannels"))
+        return C_OK;
     return C_ERR;
+}
+
+/* Keep the default user in sync with CONFIG SET requirepass. */
+void ACLUpdateDefaultUserPassword(const char *password) {
+    user *u = DefaultUser;
+    if (u == NULL) return;
+    listEmpty(u->passwords);
+    u->flags &= ~USER_NOPASS;
+    if (password && password[0]) {
+        sds rule = sdscatprintf(sdsempty(), ">%s", password);
+        ACLSetUser(u, rule);
+        sdsfree(rule);
+    } else {
+        u->flags |= USER_NOPASS;
+    }
 }
 
 /* The default user mirrors the historical requirepass behaviour: everything
@@ -267,6 +302,7 @@ int ACLCheckCommand(client *c) {
     if (c->cmd->proc == aclCommand && c->argc == 2 &&
         !strcasecmp(c->argv[1]->ptr,"whoami")) return C_OK;
     if (!(u->flags & USER_ALLCMD) && !aclCommandBit(u, c->cmd->id)) {
+        ACLAddLogEntry(c,ACL_DENIED_CMD,0,NULL);
         addReplyErrorFormat(c,"user has no permission to run '%s'", c->cmd->name);
         return C_ERR;
     }
@@ -284,6 +320,7 @@ int ACLCheckCommand(client *c) {
                 allowed = 1;
         }
         if (!allowed) {
+            ACLAddLogEntry(c,ACL_DENIED_KEY,keys[i],NULL);
             getKeysFreeResult(keys);
             addReplyError(c,"key access denied");
             return C_ERR;
@@ -310,6 +347,7 @@ void authCommand(client *c) {
     u = ACLGetUser((sds)username);
     if (u == NULL || !(u->flags & USER_ENABLED) ||
         ACLCheckPassword(u, password, strlen(password)) != C_OK) {
+        ACLAddLogEntry(c,ACL_DENIED_AUTH,0,username);
         c->authenticated = 0;
         c->user = NULL;
         addReplyError(c,"invalid username-password pair or user is disabled");
@@ -386,6 +424,371 @@ static int aclCheckUserPerm(user *u, struct redisCommand *cmd,
     return C_OK;
 }
 
+/* =============================================================================
+ * ACL log
+ * ==========================================================================*/
+
+typedef struct ACLLogEntry {
+    uint64_t count;
+    int reason;
+    int context;
+    sds object;
+    sds username;
+    mstime_t ctime;
+    sds cinfo;
+} ACLLogEntry;
+
+static void ACLFreeLogEntry(void *leptr) {
+    ACLLogEntry *le = leptr;
+    sdsfree(le->object);
+    sdsfree(le->username);
+    sdsfree(le->cinfo);
+    zfree(le);
+}
+
+static int ACLLogMatchEntry(ACLLogEntry *a, ACLLogEntry *b) {
+    if (a->reason != b->reason) return 0;
+    if (a->context != b->context) return 0;
+    mstime_t delta = a->ctime - b->ctime;
+    if (delta < 0) delta = -delta;
+    if (delta > ACL_LOG_GROUPING_MAX_TIME_DELTA) return 0;
+    if (sdscmp(a->object,b->object) != 0) return 0;
+    if (sdscmp(a->username,b->username) != 0) return 0;
+    return 1;
+}
+
+/* Record a denied operation. argpos is the argument index of the key that was
+ * refused; username is only used for failed authentication. */
+static void ACLAddLogEntry(client *c, int reason, int argpos,
+                           const char *username)
+{
+    ACLLogEntry *le = zmalloc(sizeof(*le));
+    le->count = 1;
+    le->reason = reason;
+    le->username = sdsnew(reason == ACL_DENIED_AUTH ? username :
+                          ((user*)c->user)->name);
+    le->ctime = mstime();
+
+    switch(reason) {
+    case ACL_DENIED_CMD: le->object = sdsnew(c->cmd->name); break;
+    case ACL_DENIED_KEY: le->object = sdsdup(c->argv[argpos]->ptr); break;
+    case ACL_DENIED_AUTH: le->object = sdsnew(username); break;
+    default: le->object = sdsempty();
+    }
+
+    client *realclient = c;
+    if (realclient->flags & CLIENT_LUA && server.lua_caller)
+        realclient = server.lua_caller;
+    le->cinfo = catClientInfoString(sdsempty(),realclient);
+    if (c->flags & CLIENT_MULTI) {
+        le->context = ACL_LOG_CTX_MULTI;
+    } else if (c->flags & CLIENT_LUA) {
+        le->context = ACL_LOG_CTX_LUA;
+    } else {
+        le->context = ACL_LOG_CTX_TOPLEVEL;
+    }
+
+    if (server.acllog_max_len == 0) {
+        ACLFreeLogEntry(le);
+        return;
+    }
+
+    /* Only a few recent entries are scanned for a duplicate. */
+    long toscan = 10;
+    listIter li;
+    listNode *ln;
+    listRewind(ACLLog,&li);
+    while (toscan-- && (ln = listNext(&li)) != NULL) {
+        ACLLogEntry *current = listNodeValue(ln);
+        if (ACLLogMatchEntry(current,le)) {
+            current->count++;
+            current->ctime = le->ctime;
+            sdsfree(current->cinfo);
+            current->cinfo = le->cinfo;
+            le->cinfo = NULL;
+            /* Move the entry to the head without freeing its value: the
+             * list has a free method, which listDelNode() would invoke. */
+            void (*freefn)(void*) = ACLLog->free;
+            ACLLog->free = NULL;
+            listDelNode(ACLLog,ln);
+            ACLLog->free = freefn;
+            listAddNodeHead(ACLLog,current);
+            ACLFreeLogEntry(le);
+            return;
+        }
+    }
+
+    listAddNodeHead(ACLLog,le);
+    while (listLength(ACLLog) > server.acllog_max_len) {
+        listNode *tail = listLast(ACLLog);
+        listDelNode(ACLLog,tail);
+    }
+}
+
+static const char *aclLogReasonName(int reason) {
+    switch(reason) {
+    case ACL_DENIED_CMD: return "command";
+    case ACL_DENIED_KEY: return "key";
+    case ACL_DENIED_AUTH: return "auth";
+    default: return "unknown";
+    }
+}
+
+static const char *aclLogContextName(int context) {
+    switch(context) {
+    case ACL_LOG_CTX_TOPLEVEL: return "toplevel";
+    case ACL_LOG_CTX_LUA: return "lua";
+    case ACL_LOG_CTX_MULTI: return "multi";
+    default: return "unknown";
+    }
+}
+
+/* =============================================================================
+ * ACL file persistence
+ * ==========================================================================*/
+
+static user *ACLCreateUserIn(dict *users, const char *name) {
+    user *u = zcalloc(sizeof(*u));
+    u->name = sdsnew(name);
+    u->passwords = listCreate();
+    u->patterns = listCreate();
+    listSetFreeMethod(u->passwords, (void (*)(void*))sdsfree);
+    listSetFreeMethod(u->patterns, (void (*)(void*))sdsfree);
+    dictAdd(users, sdsnew(name), u);
+    return u;
+}
+
+static list *aclCopySdsList(list *src) {
+    list *dst = listCreate();
+    listIter li;
+    listNode *ln;
+    listSetFreeMethod(dst, (void (*)(void*))sdsfree);
+    listRewind(src,&li);
+    while ((ln = listNext(&li))) listAddNodeTail(dst,sdsdup(ln->value));
+    return dst;
+}
+
+/* Copy every rule of src into dst, keeping dst's name and address. */
+static void ACLCopyUser(user *dst, user *src) {
+    listRelease(dst->passwords);
+    listRelease(dst->patterns);
+    dst->passwords = aclCopySdsList(src->passwords);
+    dst->patterns = aclCopySdsList(src->patterns);
+    dst->flags = src->flags;
+    memcpy(dst->commands,src->commands,sizeof(dst->commands));
+}
+
+/* Delete a user and disconnect every client authenticated as it. Clients keep
+ * a pointer to their user, so the user cannot be freed underneath them. */
+static void ACLFreeUserAndKillClients(user *u) {
+    listIter li;
+    listNode *ln;
+    listRewind(server.clients,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        client *c = listNodeValue(ln);
+        if (c->user == u) {
+            c->user = DefaultUser;
+            c->authenticated = 0;
+            if (c == server.current_client)
+                c->flags |= CLIENT_CLOSE_AFTER_REPLY;
+            else
+                freeClientAsync(c);
+        }
+    }
+    aclFreeUser(NULL,u);
+}
+
+/* Describe all rules of a user in the syntax accepted by ACL SETUSER. */
+static sds ACLDescribeUser(user *u) {
+    sds d = sdsempty();
+    listIter li;
+    listNode *ln;
+
+    d = sdscat(d,(u->flags & USER_ENABLED) ? "on" : "off");
+    if (u->flags & USER_NOPASS) d = sdscat(d," nopass");
+    listRewind(u->passwords,&li);
+    while ((ln = listNext(&li)))
+        d = sdscatprintf(d," #%s",(char*)ln->value);
+    if (u->flags & USER_ALLKEYS) d = sdscat(d," ~*");
+    listRewind(u->patterns,&li);
+    while ((ln = listNext(&li)))
+        d = sdscatprintf(d," ~%s",(char*)ln->value);
+    sds rules = ACLDescribeUserCommandRules(u);
+    d = sdscat(d," ");
+    d = sdscatsds(d,rules);
+    sdsfree(rules);
+    return d;
+}
+
+int ACLSaveToFile(const char *filename) {
+    sds acl = sdsempty();
+    dictIterator *di = dictGetIterator(Users);
+    dictEntry *de;
+
+    while ((de = dictNext(di)) != NULL) {
+        user *u = dictGetVal(de);
+        sds descr = ACLDescribeUser(u);
+        acl = sdscatprintf(acl,"user %s %s\n",u->name,descr);
+        sdsfree(descr);
+    }
+    dictReleaseIterator(di);
+
+    sds tmp = sdscatprintf(sdsempty(),"%s.tmp-%d-%lld",filename,
+                           (int)getpid(),(long long)mstime());
+    FILE *fp = fopen(tmp,"wb");
+    if (fp == NULL) {
+        serverLog(LL_WARNING,"Opening temp ACL file for ACL SAVE: %s",
+                  strerror(errno));
+        sdsfree(tmp);
+        sdsfree(acl);
+        return C_ERR;
+    }
+    size_t acllen = sdslen(acl);
+    size_t written = fwrite(acl,1,acllen,fp);
+    int closeerr = fclose(fp);
+    sdsfree(acl);
+    if (written != acllen || closeerr != 0) {
+        serverLog(LL_WARNING,"Writing ACL file for ACL SAVE failed");
+        unlink(tmp);
+        sdsfree(tmp);
+        return C_ERR;
+    }
+    if (rename(tmp,filename) == -1) {
+#ifdef _WIN32
+        /* MSVC rename() does not replace an existing destination. */
+        unlink(filename);
+        if (rename(tmp,filename) == -1) {
+#endif
+            serverLog(LL_WARNING,"Renaming ACL file for ACL SAVE: %s",
+                      strerror(errno));
+            unlink(tmp);
+            sdsfree(tmp);
+            return C_ERR;
+#ifdef _WIN32
+        }
+#endif
+    }
+    sdsfree(tmp);
+    return C_OK;
+}
+
+/* Load users from an ACL file. Returns NULL on success, or an error message
+ * the caller must free. Existing users keep their addresses so authenticated
+ * clients stay valid; users missing from the file are disconnected. */
+sds ACLLoadFromFile(const char *filename) {
+    FILE *fp = fopen(filename,"r");
+    if (fp == NULL) {
+        serverLog(LL_WARNING,"Error loading ACLs, opening file '%s': %s",
+                  filename,strerror(errno));
+        return C_ERR;
+    }
+    sds acls = sdsempty();
+    char buf[1024];
+    while (fgets(buf,sizeof(buf),fp) != NULL) acls = sdscat(acls,buf);
+    fclose(fp);
+
+    int totlines;
+    sds *lines = sdssplitlen(acls,sdslen(acls),"\n",1,&totlines);
+    sdsfree(acls);
+
+    dict *newusers = dictCreate(&usersDictType,NULL);
+    user *newdefault = ACLCreateUserIn(newusers,"default");
+    aclAllowAll(newdefault);
+    newdefault->flags |= USER_ENABLED | USER_ALLKEYS | USER_NOPASS;
+    if (server.requirepass) {
+        sds rule = sdscatprintf(sdsempty(), ">%s", server.requirepass);
+        ACLSetUser(newdefault, rule);
+        sdsfree(rule);
+        newdefault->flags &= ~USER_NOPASS;
+    }
+
+    sds errors = sdsempty();
+    int sawdefault = 0;
+    for (int i = 0; i < totlines; i++) {
+        sds line = sdstrim(lines[i]," \t\r\n");
+        if (line[0] == '\0') continue;
+
+        int argc;
+        sds *argv = sdssplitlen(line,sdslen(line)," ",1,&argc);
+        if (argv == NULL) {
+            errors = sdscatprintf(errors,"%s:%d: unbalanced quotes. ",
+                                  filename,i+1);
+            continue;
+        }
+        if (argc == 0 || strcasecmp(argv[0],"user") != 0) {
+            errors = sdscatprintf(errors,
+                "%s:%d: line should start with 'user'. ",filename,i+1);
+            sdsfreesplitres(argv,argc);
+            continue;
+        }
+        if (argc < 2) {
+            errors = sdscatprintf(errors,"%s:%d: missing user name. ",
+                                  filename,i+1);
+            sdsfreesplitres(argv,argc);
+            continue;
+        }
+        user *u = dictFetchValue(newusers,argv[1]);
+        if (u == NULL) u = ACLCreateUserIn(newusers,argv[1]);
+        if (!strcmp(argv[1],"default")) sawdefault = 1;
+        for (int j = 2; j < argc; j++) {
+            if (argv[j][0] == '\0') continue;
+            if (ACLSetUser(u,argv[j]) != C_OK) {
+                errors = sdscatprintf(errors,"%s:%d: invalid rule '%s'. ",
+                                      filename,i+1,argv[j]);
+            }
+        }
+        sdsfreesplitres(argv,argc);
+    }
+
+    if (sdslen(errors) == 0 && !sawdefault) {
+        errors = sdscatprintf(errors,
+            "%s: ACL file must contain a 'user default' line. ",filename);
+    }
+
+    if (sdslen(errors) != 0) {
+        dictRelease(newusers);
+        sdsfreesplitres(lines,totlines);
+        return errors;
+    }
+
+    /* Copy rules into the live users, creating the ones that are new. */
+    dictIterator *di = dictGetIterator(newusers);
+    dictEntry *de;
+    while ((de = dictNext(di)) != NULL) {
+        const char *name = dictGetKey(de);
+        user *nu = dictGetVal(de);
+        if (!strcmp(name,"default")) continue;
+        user *old = ACLGetUser((sds)name);
+        if (old) {
+            ACLCopyUser(old,nu);
+        } else {
+            user *created = ACLCreateUser(name);
+            ACLCopyUser(created,nu);
+        }
+    }
+    dictReleaseIterator(di);
+    ACLCopyUser(DefaultUser,newdefault);
+
+    /* Remove users that no longer appear in the file. */
+    di = dictGetSafeIterator(Users);
+    while ((de = dictNext(di)) != NULL) {
+        sds name = dictGetKey(de);
+        if (!strcmp(name,"default")) continue;
+        if (dictFind(newusers,name) != NULL) continue;
+        user *u = dictGetVal(de);
+        dictEntry *he = dictUnlink(Users,name);
+        if (he == NULL) continue;
+        ACLFreeUserAndKillClients(u);
+        sdsfree(dictGetKey(he));
+        zfree(he);
+    }
+    dictReleaseIterator(di);
+    dictRelease(newusers);
+
+    sdsfreesplitres(lines,totlines);
+    return NULL;
+}
+
 void aclCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"list")) {
         dictIterator *di = dictGetIterator(Users);
@@ -393,15 +796,91 @@ void aclCommand(client *c) {
         addReplyMultiBulkLen(c, dictSize(Users));
         while ((de = dictNext(di)) != NULL) {
             user *u = dictGetVal(de);
-            sds line = sdscatprintf(sdsempty(), "user %s %s",
-                u->name, (u->flags & USER_ENABLED) ? "on" : "off");
-            line = sdscat(line, (u->flags & USER_NOPASS) ? " nopass" : "");
-            line = sdscat(line, (u->flags & USER_ALLKEYS) ? " ~*" : "");
-            line = sdscat(line, (u->flags & USER_ALLCMD) ? " +@all" : "");
+            sds descr = ACLDescribeUser(u);
+            sds line = sdscatprintf(sdsempty(), "user %s %s", u->name, descr);
             addReplyBulkCBuffer(c, line, sdslen(line));
             sdsfree(line);
+            sdsfree(descr);
         }
         dictReleaseIterator(di);
+        return;
+    }
+    if (!strcasecmp(c->argv[1]->ptr,"log") &&
+        (c->argc == 2 || c->argc == 3))
+    {
+        long count = 10;
+        if (c->argc == 3) {
+            if (!strcasecmp(c->argv[2]->ptr,"reset")) {
+                listEmpty(ACLLog);
+                addReply(c,shared.ok);
+                return;
+            }
+            if (getLongFromObjectOrReply(c,c->argv[2],&count,NULL) != C_OK)
+                return;
+            if (count < 0) {
+                addReplyError(c,"count must be positive");
+                return;
+            }
+        }
+        PORT_LONG n = (PORT_LONG)listLength(ACLLog);
+        if (count < n) n = count;
+        addReplyMultiBulkLen(c,n);
+        listIter li;
+        listNode *ln;
+        listRewind(ACLLog,&li);
+        while (n-- && (ln = listNext(&li)) != NULL) {
+            ACLLogEntry *le = listNodeValue(ln);
+            addReplyMultiBulkLen(c,14);
+            addReplyBulkCString(c,"count");
+            addReplyLongLong(c,le->count);
+            addReplyBulkCString(c,"reason");
+            addReplyBulkCString(c,aclLogReasonName(le->reason));
+            addReplyBulkCString(c,"context");
+            addReplyBulkCString(c,aclLogContextName(le->context));
+            addReplyBulkCString(c,"object");
+            addReplyBulkCBuffer(c,le->object,sdslen(le->object));
+            addReplyBulkCString(c,"username");
+            addReplyBulkCBuffer(c,le->username,sdslen(le->username));
+            addReplyBulkCString(c,"age-seconds");
+            addReplyDouble(c,(double)(mstime()-le->ctime)/1000);
+            addReplyBulkCString(c,"client-info");
+            addReplyBulkCBuffer(c,le->cinfo,sdslen(le->cinfo));
+        }
+        return;
+    }
+    if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"save")) {
+        if (server.acl_filename == NULL) {
+            addReplyError(c,"This Redis instance is not configured to use an "
+                            "ACL file. You can only use ACL SAVE if you have "
+                            "configured an aclfile in the Redis "
+                            "configuration.");
+            return;
+        }
+        if (ACLSaveToFile(server.acl_filename) == C_OK) {
+            addReply(c,shared.ok);
+        } else {
+            addReplyError(c,"There was an error trying to save the ACLs. "
+                            "Please check the server logs for more "
+                            "information");
+        }
+        return;
+    }
+    if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"load")) {
+        if (server.acl_filename == NULL) {
+            addReplyError(c,"This Redis instance is not configured to use an "
+                            "ACL file. You can only use ACL LOAD if you have "
+                            "configured an aclfile in the Redis "
+                            "configuration.");
+            return;
+        }
+        sds err = ACLLoadFromFile(server.acl_filename);
+        if (err) {
+            addReplyErrorFormat(c,"Error loading ACL file %s, %s",
+                                server.acl_filename, err);
+            sdsfree(err);
+        } else {
+            addReply(c,shared.ok);
+        }
         return;
     }
     if (c->argc == 3 && !strcasecmp(c->argv[1]->ptr,"whoami")) {
@@ -429,12 +908,23 @@ void aclCommand(client *c) {
         addReply(c, shared.ok);
         return;
     }
-    if (c->argc == 3 && !strcasecmp(c->argv[1]->ptr,"deluser")) {
-        if (!strcasecmp(c->argv[2]->ptr,"default")) {
-            addReplyError(c,"the default user cannot be removed");
-            return;
+    if (c->argc >= 3 && !strcasecmp(c->argv[1]->ptr,"deluser")) {
+        int deleted = 0, j;
+        for (j = 2; j < c->argc; j++) {
+            if (!strcasecmp(c->argv[j]->ptr,"default")) {
+                addReplyError(c,"the default user cannot be removed");
+                return;
+            }
+            user *u = ACLGetUser(c->argv[j]->ptr);
+            if (u == NULL) continue;
+            dictEntry *he = dictUnlink(Users,c->argv[j]->ptr);
+            if (he == NULL) continue;
+            ACLFreeUserAndKillClients(u);
+            sdsfree(dictGetKey(he));
+            zfree(he);
+            deleted++;
         }
-        addReplyLongLong(c, dictDelete(Users, c->argv[2]->ptr) == DICT_OK);
+        addReplyLongLong(c,deleted);
         return;
     }
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"users")) {

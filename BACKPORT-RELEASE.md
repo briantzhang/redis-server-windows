@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp8
+# Redis for Windows 5.0.14.1-bp9
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -56,8 +56,14 @@
 | `INFO everything` | 7.0 | 与 `INFO all` 等价地输出全部区段 |
 | `WAITAOF` | 7.2 | 同步刷盘并返回 `[本机确认, 0]`；不阻塞等待，不跟踪副本 AOF |
 | `SHUTDOWN` 的 `NOW` / `FORCE` / `ABORT` | 7.0 | NOW 不等副本，FORCE 在保存失败时仍退出，ABORT 取消已置位的关闭请求 |
+| `ACL LOG [count\|RESET]` | 6.0 | 记录命令、键与认证拒绝；相同条目在 60 秒内合并计数，`acllog-max-len` 限制长度 |
+| `ACL SAVE` / `ACL LOAD` / `aclfile` | 6.0 | 用户规则写入文件并在启动或手动加载时恢复；加载失败保留旧用户，缺失用户会断开其连接 |
+| `CLIENT SETINFO lib-name\|lib-ver` | 7.2 | 客户端库属性，长度上限 128，显示在 `CLIENT LIST`/`CLIENT INFO` |
+| `XGROUP SETID ... ENTRIESREAD` / `XINFO GROUPS` 的 `entries-read`、`lag` | 7.0 | 记录消费组已读条目数并计算积压；阻塞读取也会累加 |
+| `INFO errorstats` | 6.2 | 按错误码统计回复，包含共享错误对象；`CONFIG RESETSTAT` 清零 |
+| 分片 Pub/Sub | 7.0 | `SSUBSCRIBE`/`SUNSUBSCRIBE`/`SPUBLISH` 与 `PUBSUB SHARDCHANNELS`/`SHARDNUMSUB`；单机按本节点投递 |
 
-ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并提供 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN`。没有 Redis 7 的多选择器，也没有按键的读写权限位。`requirepass` 成为 `default` 用户的口令，设置后未认证连接被拒绝；不设置时连接以 `default` 用户进入。`ACL WHOAMI` 对任何已认证用户放行。
+ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并提供 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN`、`ACL LOG` 与 `ACL SAVE`/`ACL LOAD`。没有 Redis 7 的多选择器，也没有按键的读写权限位；`&channel` 规则被接受但不生效。`requirepass` 成为 `default` 用户的口令，设置后未认证连接被拒绝，`CONFIG SET requirepass` 会同步更新该用户；不设置时连接以 `default` 用户进入。`ACL WHOAMI` 对任何已认证用户放行。删除用户或从 ACL 文件移除用户时，仍以该用户认证的连接会被断开，避免悬空指针。
 
 代码参照 Redis `7.0.15` 与 `7.2.5`（BSD）中的相关命令语义，按旧版 API 手工适配；没有引入 Redis 8 的源码或模块。
 
@@ -97,7 +103,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-09 在 Windows 11、MSVC 14.44（v143）上跑完 55 项全部通过，包括此前会崩溃的 AOF 重启，以及新增的 GEOSEARCH/GEOSEARCHSTORE 两种区域与结果选项、ACL 子命令、CLIENT KILL 的 LADDR/USER/MAXAGE 与 LIST 新字段、INFO everything、WAITAOF 的 AOF 开/关两种情形、SHUTDOWN 选项校验及附加实例真实退出，另有此前各轮的有序集合运算、COPY 深拷贝、列表查找移动、多键弹出、流命令和 AOF 计数保留用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-10 在 Windows 11、MSVC 14.44（v143）上跑完 64 项全部通过，包括此前会崩溃的 AOF 重启，以及本轮新增的 ACL LOG 分组与上限、ACL 文件的保存/加载与启动加载、删除用户时断开连接、`CLIENT SETINFO`、`XGROUP SETID ENTRIESREAD` 与 `XINFO GROUPS` 的积压字段、`INFO errorstats` 及重置、分片 Pub/Sub 全流程、`requirepass` 错误口令与运行期轮换，另有此前各轮的 GEOSEARCH、ACL 查询、CLIENT KILL、WAITAOF、有序集合运算、COPY 深拷贝、多键弹出、流命令和 AOF 计数保留用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 

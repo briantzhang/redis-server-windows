@@ -53,6 +53,15 @@ int clientSubscriptionsCount(client *c) {
            listLength(c->pubsub_patterns));
 }
 
+int clientShardSubscriptionsCount(client *c) {
+    return (int)dictSize(c->pubsubshard_channels);
+}
+
+/* Total subscriptions of every kind, used to decide CLIENT_PUBSUB. */
+int clientTotalPubSubSubscriptionCount(client *c) {
+    return clientSubscriptionsCount(c) + clientShardSubscriptionsCount(c);
+}
+
 /* Subscribe a client to a channel. Returns 1 if the operation succeeded, or
  * 0 if the client was already subscribed to that channel. */
 int pubsubSubscribeChannel(client *c, robj *channel) {
@@ -221,6 +230,105 @@ int pubsubUnsubscribeAllPatterns(client *c, int notify) {
     return count;
 }
 
+/* Subscribe a client to a shard channel. Returns 1 if the operation
+ * succeeded, or 0 if the client was already subscribed to that channel. */
+int pubsubSubscribeShardChannel(client *c, robj *channel) {
+    dictEntry *de;
+    list *clients = NULL;
+    int retval = 0;
+
+    if (dictAdd(c->pubsubshard_channels,channel,NULL) == DICT_OK) {
+        retval = 1;
+        incrRefCount(channel);
+        de = dictFind(server.pubsubshard_channels,channel);
+        if (de == NULL) {
+            clients = listCreate();
+            dictAdd(server.pubsubshard_channels,channel,clients);
+            incrRefCount(channel);
+        } else {
+            clients = dictGetVal(de);
+        }
+        listAddNodeTail(clients,c);
+    }
+    addReply(c,shared.mbulkhdr[3]);
+    addReply(c,shared.ssubscribebulk);
+    addReplyBulk(c,channel);
+    addReplyLongLong(c,clientShardSubscriptionsCount(c));
+    return retval;
+}
+
+/* Unsubscribe a client from a shard channel. Returns 1 if the operation
+ * succeeded, or 0 if the client was not subscribed to that channel. */
+int pubsubUnsubscribeShardChannel(client *c, robj *channel, int notify) {
+    dictEntry *de;
+    list *clients;
+    listNode *ln;
+    int retval = 0;
+
+    incrRefCount(channel);
+    if (dictDelete(c->pubsubshard_channels,channel) == DICT_OK) {
+        retval = 1;
+        de = dictFind(server.pubsubshard_channels,channel);
+        serverAssertWithInfo(c,NULL,de != NULL);
+        clients = dictGetVal(de);
+        ln = listSearchKey(clients,c);
+        serverAssertWithInfo(c,NULL,ln != NULL);
+        listDelNode(clients,ln);
+        if (listLength(clients) == 0)
+            dictDelete(server.pubsubshard_channels,channel);
+    }
+    if (notify) {
+        addReply(c,shared.mbulkhdr[3]);
+        addReply(c,shared.sunsubscribebulk);
+        addReplyBulk(c,channel);
+        addReplyLongLong(c,clientShardSubscriptionsCount(c));
+    }
+    decrRefCount(channel);
+    return retval;
+}
+
+int pubsubUnsubscribeAllShardChannels(client *c, int notify) {
+    dictIterator *di = dictGetSafeIterator(c->pubsubshard_channels);
+    dictEntry *de;
+    int count = 0;
+
+    while ((de = dictNext(di)) != NULL) {
+        robj *channel = dictGetKey(de);
+        count += pubsubUnsubscribeShardChannel(c,channel,notify);
+    }
+    if (notify && count == 0) {
+        addReply(c,shared.mbulkhdr[3]);
+        addReply(c,shared.sunsubscribebulk);
+        addReply(c,shared.nullbulk);
+        addReplyLongLong(c,clientShardSubscriptionsCount(c));
+    }
+    dictReleaseIterator(di);
+    return count;
+}
+
+/* Publish a message to shard channel subscribers on this node. */
+int pubsubPublishShardMessage(robj *channel, robj *message) {
+    int receivers = 0;
+    dictEntry *de = dictFind(server.pubsubshard_channels,channel);
+
+    if (de) {
+        list *list = dictGetVal(de);
+        listNode *ln;
+        listIter li;
+
+        listRewind(list,&li);
+        while ((ln = listNext(&li)) != NULL) {
+            client *c = ln->value;
+            addReply(c,shared.mbulkhdr[3]);
+            addReply(c,shared.smessagebulk);
+            addReplyBulk(c,channel);
+            addReplyBulk(c,message);
+            receivers++;
+        }
+    }
+    return receivers;
+}
+
 /* Publish a message */
 int pubsubPublishMessage(robj *channel, robj *message) {
     int receivers = 0;
@@ -291,7 +399,34 @@ void unsubscribeCommand(client *c) {
         for (j = 1; j < c->argc; j++)
             pubsubUnsubscribeChannel(c,c->argv[j],1);
     }
-    if (clientSubscriptionsCount(c) == 0) c->flags &= ~CLIENT_PUBSUB;
+    if (clientTotalPubSubSubscriptionCount(c) == 0) c->flags &= ~CLIENT_PUBSUB;
+}
+
+void ssubscribeCommand(client *c) {
+    int j;
+
+    for (j = 1; j < c->argc; j++)
+        pubsubSubscribeShardChannel(c,c->argv[j]);
+    c->flags |= CLIENT_PUBSUB;
+}
+
+void sunsubscribeCommand(client *c) {
+    if (c->argc == 1) {
+        pubsubUnsubscribeAllShardChannels(c,1);
+    } else {
+        int j;
+
+        for (j = 1; j < c->argc; j++)
+            pubsubUnsubscribeShardChannel(c,c->argv[j],1);
+    }
+    if (clientTotalPubSubSubscriptionCount(c) == 0)
+        c->flags &= ~CLIENT_PUBSUB;
+}
+
+void spublishCommand(client *c) {
+    int receivers = pubsubPublishShardMessage(c->argv[1],c->argv[2]);
+    forceCommandPropagation(c,PROPAGATE_REPL);
+    addReplyLongLong(c,receivers);
 }
 
 void psubscribeCommand(client *c) {
@@ -311,7 +446,7 @@ void punsubscribeCommand(client *c) {
         for (j = 1; j < c->argc; j++)
             pubsubUnsubscribePattern(c,c->argv[j],1);
     }
-    if (clientSubscriptionsCount(c) == 0) c->flags &= ~CLIENT_PUBSUB;
+    if (clientTotalPubSubSubscriptionCount(c) == 0) c->flags &= ~CLIENT_PUBSUB;
 }
 
 void publishCommand(client *c) {
@@ -330,6 +465,8 @@ void pubsubCommand(client *c) {
 "CHANNELS [<pattern>] -- Return the currently active channels matching a pattern (default: all).",
 "NUMPAT -- Return number of subscriptions to patterns.",
 "NUMSUB [channel-1 .. channel-N] -- Returns the number of subscribers for the specified channels (excluding patterns, default: none).",
+"SHARDCHANNELS [<pattern>] -- Return the currently active shard channels matching a pattern (default: all).",
+"SHARDNUMSUB [shardchannel-1 .. shardchannel-N] -- Returns the number of subscribers for the specified shard channels.",
 NULL
         };
         addReplyHelp(c, help);
@@ -364,6 +501,40 @@ NULL
         addReplyMultiBulkLen(c,(c->argc-2)*2);
         for (j = 2; j < c->argc; j++) {
             list *l = dictFetchValue(server.pubsub_channels,c->argv[j]);
+
+            addReplyBulk(c,c->argv[j]);
+            addReplyLongLong(c,l ? listLength(l) : 0);
+        }
+    } else if (!strcasecmp(c->argv[1]->ptr,"shardchannels") &&
+               (c->argc == 2 || c->argc == 3))
+    {
+        /* PUBSUB SHARDCHANNELS [<pattern>] */
+        sds pat = (c->argc == 2) ? NULL : c->argv[2]->ptr;
+        dictIterator *di = dictGetIterator(server.pubsubshard_channels);
+        dictEntry *de;
+        PORT_LONG mblen = 0;
+        void *replylen = addDeferredMultiBulkLength(c);
+
+        while ((de = dictNext(di)) != NULL) {
+            robj *cobj = dictGetKey(de);
+            sds channel = cobj->ptr;
+
+            if (!pat || stringmatchlen(pat, (int)sdslen(pat),
+                                       channel, (int)sdslen(channel),0))
+            {
+                addReplyBulk(c,cobj);
+                mblen++;
+            }
+        }
+        dictReleaseIterator(di);
+        setDeferredMultiBulkLength(c,replylen,mblen);
+    } else if (!strcasecmp(c->argv[1]->ptr,"shardnumsub") && c->argc >= 2) {
+        /* PUBSUB SHARDNUMSUB [ShardChannel_1 ... ShardChannel_N] */
+        int j;
+
+        addReplyMultiBulkLen(c,(c->argc-2)*2);
+        for (j = 2; j < c->argc; j++) {
+            list *l = dictFetchValue(server.pubsubshard_channels,c->argv[j]);
 
             addReplyBulk(c,c->argv[j]);
             addReplyLongLong(c,l ? listLength(l) : 0);

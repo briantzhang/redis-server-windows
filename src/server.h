@@ -810,7 +810,10 @@ typedef struct client {
     PORT_LONGLONG woff;         /* Last write global replication offset. */
     list *watched_keys;     /* Keys WATCHED for MULTI/EXEC CAS */
     dict *pubsub_channels;  /* channels a client is interested in (SUBSCRIBE) */
+    dict *pubsubshard_channels; /* shard channels (SSUBSCRIBE) */
     list *pubsub_patterns;  /* patterns a client is interested in (SUBSCRIBE) */
+    sds lib_name;           /* CLIENT SETINFO lib-name, or NULL. */
+    sds lib_ver;            /* CLIENT SETINFO lib-ver, or NULL. */
     sds peerid;             /* Cached peer ID. */
     listNode *client_list_node; /* list node in client list */
     WIN32_ONLY(char replFileCopy[_MAX_PATH];)
@@ -838,7 +841,8 @@ struct sharedObjectsStruct {
     *outofrangeerr, *noscripterr, *loadingerr, *slowscripterr, *bgsaveerr,
     *masterdownerr, *roslaveerr, *execaborterr, *noautherr, *noreplicaserr,
     *busykeyerr, *oomerr, *plus, *messagebulk, *pmessagebulk, *subscribebulk,
-    *unsubscribebulk, *psubscribebulk, *punsubscribebulk, *del, *unlink,
+    *unsubscribebulk, *psubscribebulk, *punsubscribebulk,
+    *ssubscribebulk, *sunsubscribebulk, *smessagebulk, *del, *unlink,
     *rpop, *lpop, *lpush, *rpoplpush, *lmove, *left, *right,
     *zpopmin, *zpopmax, *emptyscan,
     *set, *pxat, *pexpireat, *persist,
@@ -1007,6 +1011,9 @@ struct redisServer {
     int activerehashing;        /* Incremental rehash in serverCron() */
     int active_defrag_running;  /* Active defragmentation running (holds current scan aggressiveness) */
     char *requirepass;          /* Pass for AUTH command, or NULL */
+    char *acl_filename;         /* ACL file path, or NULL. */
+    long long acllog_max_len;   /* Max number of ACL log entries. */
+    rax *errors;                /* Error code counters for INFO errorstats. */
     char *pidfile;              /* PID file path */
     int arch_bits;              /* 32 or 64 depending on sizeof(long) */
     int cronloops;              /* Number of times the cron function run */
@@ -1291,6 +1298,7 @@ struct redisServer {
     ustime_t ustime;            /* 'unixtime' in microseconds. */
     /* Pubsub */
     dict *pubsub_channels;  /* Map channels to list of subscribed clients */
+    dict *pubsubshard_channels; /* Map shard channels to subscribed clients */
     list *pubsub_patterns;  /* A list of pubsub_patterns */
     int notify_keyspace_events; /* Events to propagate via Pub/Sub. This is an
                                    xor of NOTIFY_... flags. */
@@ -1884,6 +1892,10 @@ int hashTypeSet(robj *o, sds field, sds value, int flags);
 /* Pub / Sub */
 int pubsubUnsubscribeAllChannels(client *c, int notify);
 int pubsubUnsubscribeAllPatterns(client *c, int notify);
+int pubsubUnsubscribeAllShardChannels(client *c, int notify);
+int pubsubPublishShardMessage(robj *channel, robj *message);
+int clientShardSubscriptionsCount(client *c);
+int clientTotalPubSubSubscriptionCount(client *c);
 void freePubsubPattern(void *p);
 int listMatchPubsubPattern(void *a, void *b);
 int pubsubPublishMessage(robj *channel, robj *message);
@@ -2044,6 +2056,9 @@ void aclCommand(client *c);
 void ACLInit(void);
 void *ACLDefaultUser(void);
 const char *ACLUserName(void *user);
+void ACLUpdateDefaultUserPassword(const char *password);
+sds ACLLoadFromFile(const char *filename);
+int ACLSaveToFile(const char *filename);
 int ACLCheckCommand(client *c);
 void ACLInitDefaultUser(void);
 void ACLAssignCommandIDs(void);
@@ -2214,6 +2229,9 @@ void subscribeCommand(client *c);
 void unsubscribeCommand(client *c);
 void psubscribeCommand(client *c);
 void punsubscribeCommand(client *c);
+void ssubscribeCommand(client *c);
+void sunsubscribeCommand(client *c);
+void spublishCommand(client *c);
 void publishCommand(client *c);
 void pubsubCommand(client *c);
 void watchCommand(client *c);
@@ -2240,6 +2258,8 @@ void bitposCommand(client *c);
 void replconfCommand(client *c);
 void waitCommand(client *c);
 void waitaofCommand(client *c);
+struct redisError;
+void incrementErrorCount(const char *fullerr, size_t namelen);
 void geoencodeCommand(client *c);
 void geodecodeCommand(client *c);
 void georadiusbymemberCommand(client *c);

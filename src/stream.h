@@ -63,6 +63,8 @@ typedef struct streamCG {
     rax *consumers;         /* A radix tree representing the consumers by name
                                and their associated representation in the form
                                of streamConsumer structures. */
+    long long entries_read; /* Number of entries served to the group; used to
+                               report lag in XINFO GROUPS. */
 } streamCG;
 
 /* A specific consumer in a consumer group.  */

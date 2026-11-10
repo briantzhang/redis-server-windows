@@ -1856,10 +1856,13 @@ void xreadCommand(client *c) {
             int flags = 0;
             if (noack) flags |= STREAM_RWR_NOACK;
             if (serve_history) flags |= STREAM_RWR_HISTORY;
-            streamReplyWithRange(c,s,&start,NULL,count,0,
+            size_t served = streamReplyWithRange(c,s,&start,NULL,count,0,
                                  groups ? groups[i] : NULL,
                                  consumer, flags, &spi);
-            if (groups) server.dirty++;
+            if (groups) {
+                if (!serve_history) groups[i]->entries_read += (long long)served;
+                server.dirty++;
+            }
         }
     }
 
@@ -1960,6 +1963,7 @@ streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id) {
     cg->pel = raxNew();
     cg->consumers = raxNew();
     cg->last_id = *id;
+    cg->entries_read = 0;
     raxInsert(s->cgroups,(unsigned char*)name,namelen,cg,NULL);
     return cg;
 }
@@ -2124,6 +2128,8 @@ NULL
 
         streamCG *cg = streamCreateCG(s,grpname,sdslen(grpname),&id);
         if (cg) {
+            /* "$" means everything produced so far was already read. */
+            if (!strcmp(c->argv[4]->ptr,"$")) cg->entries_read = s->entries_added;
             addReply(c,shared.ok);
             server.dirty++;
             notifyKeyspaceEvent(NOTIFY_STREAM,"xgroup-create",
@@ -2132,14 +2138,31 @@ NULL
             addReplySds(c,
                 sdsnew("-BUSYGROUP Consumer Group name already exists\r\n"));
         }
-    } else if (!strcasecmp(opt,"SETID") && c->argc == 5) {
+    } else if (!strcasecmp(opt,"SETID") &&
+               (c->argc == 5 || c->argc == 7))
+    {
         streamID id;
+        PORT_LONGLONG entries_read = -1;
+
         if (!strcmp(c->argv[4]->ptr,"$")) {
             id = s->last_id;
         } else if (streamParseIDOrReply(c,c->argv[4],&id,0) != C_OK) {
             return;
         }
+        if (c->argc == 7) {
+            if (strcasecmp(c->argv[5]->ptr,"ENTRIESREAD")) {
+                addReply(c,shared.syntaxerr);
+                return;
+            }
+            if (getLongLongFromObjectOrReply(c,c->argv[6],&entries_read,
+                                             NULL) != C_OK) return;
+            if (entries_read < 0) {
+                addReplyError(c,"entries_read must be positive");
+                return;
+            }
+        }
         cg->last_id = id;
+        if (entries_read != -1) cg->entries_read = entries_read;
         addReply(c,shared.ok);
         server.dirty++;
         notifyKeyspaceEvent(NOTIFY_STREAM,"xgroup-setid",c->argv[2],c->db->id);
@@ -3167,13 +3190,19 @@ static void xinfoReplyWithStreamInfo(client *c, stream *s) {
     while (raxNext(&ri)) {
         streamCG *cg = ri.data;
 
-        addReplyMultiBulkLen(c,5*2);
+        long long lag = (long long)s->entries_added - cg->entries_read;
+        if (lag < 0) lag = 0;
+        addReplyMultiBulkLen(c,7*2);
         addReplyBulkCString(c,"name");
         addReplyBulkCBuffer(c,ri.key,ri.key_len);
         addReplyBulkCString(c,"last-delivered-id");
         addReplyStreamID(c,&cg->last_id);
         addReplyBulkCString(c,"pel-count");
         addReplyLongLong(c,raxSize(cg->pel));
+        addReplyBulkCString(c,"entries-read");
+        addReplyLongLong(c,cg->entries_read);
+        addReplyBulkCString(c,"lag");
+        addReplyLongLong(c,lag);
 
         addReplyBulkCString(c,"pending");
         {
@@ -3322,7 +3351,9 @@ NULL
         raxSeek(&ri,"^",NULL,0);
         while(raxNext(&ri)) {
             streamCG *cg = ri.data;
-            addReplyMultiBulkLen(c,8);
+            long long lag = (long long)s->entries_added - cg->entries_read;
+            if (lag < 0) lag = 0;
+            addReplyMultiBulkLen(c,12);
             addReplyBulkCString(c,"name");
             addReplyBulkCBuffer(c,ri.key,ri.key_len);
             addReplyBulkCString(c,"consumers");
@@ -3331,6 +3362,10 @@ NULL
             addReplyLongLong(c,raxSize(cg->pel));
             addReplyBulkCString(c,"last-delivered-id");
             addReplyStreamID(c,&cg->last_id);
+            addReplyBulkCString(c,"entries-read");
+            addReplyLongLong(c,cg->entries_read);
+            addReplyBulkCString(c,"lag");
+            addReplyLongLong(c,lag);
         }
         raxStop(&ri);
     } else if (!strcasecmp(opt,"STREAM")) {

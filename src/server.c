@@ -307,6 +307,9 @@ struct redisCommand redisCommandTable[] = {
     {"unsubscribe",unsubscribeCommand,-1,"pslt",0,NULL,0,0,0,0,0},
     {"psubscribe",psubscribeCommand,-2,"pslt",0,NULL,0,0,0,0,0},
     {"punsubscribe",punsubscribeCommand,-1,"pslt",0,NULL,0,0,0,0,0},
+    {"ssubscribe",ssubscribeCommand,-2,"pslt",0,NULL,0,0,0,0,0},
+    {"sunsubscribe",sunsubscribeCommand,-1,"pslt",0,NULL,0,0,0,0,0},
+    {"spublish",spublishCommand,3,"pltF",0,NULL,0,0,0,0,0},
     {"publish",publishCommand,3,"pltF",0,NULL,0,0,0,0,0},
     {"pubsub",pubsubCommand,-2,"pltR",0,NULL,0,0,0,0,0},
     {"watch",watchCommand,-2,"sF",0,NULL,1,-1,1,0,0},
@@ -1586,6 +1589,9 @@ void createSharedObjects(void) {
     shared.unsubscribebulk = createStringObject("$11\r\nunsubscribe\r\n",18);
     shared.psubscribebulk = createStringObject("$10\r\npsubscribe\r\n",17);
     shared.punsubscribebulk = createStringObject("$12\r\npunsubscribe\r\n",19);
+    shared.ssubscribebulk = createStringObject("$10\r\nssubscribe\r\n",17);
+    shared.sunsubscribebulk = createStringObject("$12\r\nsunsubscribe\r\n",19);
+    shared.smessagebulk = createStringObject("$8\r\nsmessage\r\n",14);
     shared.set = createStringObject("SET",3);
     shared.pxat = createStringObject("PXAT",4);
     shared.pexpireat = createStringObject("PEXPIREAT",9);
@@ -1703,6 +1709,8 @@ void initServerConfig(void) {
     server.rdb_filename = zstrdup(CONFIG_DEFAULT_RDB_FILENAME);
     server.aof_filename = zstrdup(CONFIG_DEFAULT_AOF_FILENAME);
     server.requirepass = NULL;
+    server.acl_filename = NULL;
+    server.acllog_max_len = 128;
     server.rdb_compression = CONFIG_DEFAULT_RDB_COMPRESSION;
     server.rdb_checksum = CONFIG_DEFAULT_RDB_CHECKSUM;
     server.stop_writes_on_bgsave_err = CONFIG_DEFAULT_STOP_WRITES_ON_BGSAVE_ERROR;
@@ -1828,8 +1836,7 @@ void initServerConfig(void) {
     server.pexpireatCommand = lookupCommandByCString("pexpireat");
     server.xclaimCommand = lookupCommandByCString("xclaim");
     server.xgroupCommand = lookupCommandByCString("xgroup");
-    /* requirepass has been parsed by now, so the default user can mirror it. */
-    ACLInitDefaultUser();
+    server.errors = raxNew();
 
     /* Slow log */
     server.slowlog_log_slower_than = CONFIG_DEFAULT_SLOWLOG_LOG_SLOWER_THAN;
@@ -2108,6 +2115,23 @@ int listenToPort(int port, int *fds, int *count) {
 /* Resets the stats that we expose via INFO or other means that we want
  * to reset via CONFIG RESETSTAT. The function is also used in order to
  * initialize these fields in initServer() at server startup. */
+struct redisError {
+    long long count;
+};
+
+/* Track replies of the form "-<code> ..." so INFO errorstats can report how
+ * often each error code was produced. */
+void incrementErrorCount(const char *fullerr, size_t namelen) {
+    struct redisError *error = raxFind(server.errors,
+                                       (unsigned char*)fullerr,namelen);
+    if (error == raxNotFound) {
+        error = zmalloc(sizeof(*error));
+        error->count = 0;
+        raxInsert(server.errors,(unsigned char*)fullerr,namelen,error,NULL);
+    }
+    error->count++;
+}
+
 void resetServerStats(void) {
     int j;
 
@@ -2140,6 +2164,8 @@ void resetServerStats(void) {
     server.stat_net_input_bytes = 0;
     server.stat_net_output_bytes = 0;
     server.aof_delayed_fsync = 0;
+    raxFreeWithCallback(server.errors,(void (*)(void*))zfree);
+    server.errors = raxNew();
 }
 
 void initServer(void) {
@@ -2175,6 +2201,19 @@ void initServer(void) {
     server.fixed_time_expire = 0;
     server.clients = listCreate();
     server.clients_index = raxNew();
+
+    /* The configuration file has been parsed by now, so requirepass is known
+     * when the default ACL user is built. An aclfile, when configured, then
+     * replaces the users it defines. */
+    ACLInitDefaultUser();
+    if (server.acl_filename) {
+        sds err = ACLLoadFromFile(server.acl_filename);
+        if (err) {
+            serverLog(LL_WARNING,"%s",err);
+            sdsfree(err);
+            exit(1);
+        }
+    }
     server.clients_to_close = listCreate();
     server.slaves = listCreate();
     server.monitors = listCreate();
@@ -2236,6 +2275,7 @@ void initServer(void) {
     }
     evictionPoolAlloc(); /* Initialize the LRU keys pool. */
     server.pubsub_channels = dictCreate(&keylistDictType,NULL);
+    server.pubsubshard_channels = dictCreate(&keylistDictType,NULL);
     server.pubsub_patterns = listCreate();
     listSetFreeMethod(server.pubsub_patterns,freePubsubPattern);
     listSetMatchMethod(server.pubsub_patterns,listMatchPubsubPattern);
@@ -2865,8 +2905,11 @@ int processCommand(client *c) {
         c->cmd->proc != subscribeCommand &&
         c->cmd->proc != unsubscribeCommand &&
         c->cmd->proc != psubscribeCommand &&
-        c->cmd->proc != punsubscribeCommand) {
-        addReplyError(c,"only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context");
+        c->cmd->proc != punsubscribeCommand &&
+        c->cmd->proc != ssubscribeCommand &&
+        c->cmd->proc != sunsubscribeCommand &&
+        c->cmd->proc != resetCommand) {
+        addReplyError(c,"only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET allowed in this context");
         return C_OK;
     }
 
@@ -3927,6 +3970,21 @@ sds genRedisInfoString(char *section) {
                 (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls));
         }
         dictReleaseIterator(di);
+    }
+
+    /* Error statistics */
+    if (allsections || defsections || !strcasecmp(section,"errorstats")) {
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info, "# Errorstats\r\n");
+        raxIterator ri;
+        raxStart(&ri,server.errors);
+        raxSeek(&ri,"^",NULL,0);
+        while (raxNext(&ri)) {
+            struct redisError *e = ri.data;
+            info = sdscatprintf(info,"errorstat_%.*s:count=%lld\r\n",
+                                (int)ri.key_len,ri.key,e->count);
+        }
+        raxStop(&ri);
     }
 
     /* Cluster */

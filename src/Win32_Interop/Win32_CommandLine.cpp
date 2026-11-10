@@ -441,6 +441,8 @@ static RedisParameterMapper g_redisArgMap =
     { "aof-load-truncated",             &fp1 },    // aof-load-truncated [yes/no]
     { "aof-use-rdb-preamble",           &fp1 },    // aof-use-rdb-preamble [yes/no]
     { "requirepass",                    &fp1 },    // requirepass [string]
+    { "aclfile",                        &fp1 },    // aclfile [file]
+    { "acllog-max-len",                 &fp1 },    // acllog-max-len [number]
     { "pidfile",                        &fp1 },    // pidfile [file]
     { "dbfilename",                     &fp1 },    // dbfilename [filename]
     { "active-defrag-threshold-lower",  &fp1 },    // active-defrag-threshold-lower [number]

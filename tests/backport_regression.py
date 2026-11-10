@@ -138,13 +138,14 @@ def reserve_port():
 
 class ManagedServer:
     def __init__(self, executable, directory, timeout, startup_timeout, aof=False,
-                 requirepass=None):
+                 requirepass=None, aclfile=False):
         self.executable = executable
         self.directory = Path(directory)
         self.timeout = timeout
         self.startup_timeout = startup_timeout
         self.aof = aof
         self.requirepass = requirepass
+        self.aclfile = aclfile
         self.port = reserve_port()
         self.process = None
         self.output = None
@@ -167,15 +168,25 @@ class ManagedServer:
         # Port reservation cannot be transferred to Redis. Never trust PING alone:
         # verify INFO's PID before considering this port to be our child server.
         config = self.directory / "redis.conf"
+        aclfile_line = ""
+        if self.aclfile:
+            acl = self.directory / "acl.conf"
+            acl.write_text(
+                "user default on %s ~* +@all\n" % (
+                    ">%s" % self.requirepass if self.requirepass else "nopass"),
+                encoding="ascii",
+            )
+            aclfile_line = "aclfile %s\n" % acl.as_posix()
         config.write_text(
             "bind 127.0.0.1\nprotected-mode yes\nport %d\n"
             "daemonize no\nsave \"\"\ndir .\ndbfilename dump.rdb\n"
             "logfile server.log\nloglevel notice\n"
             "appendonly %s\nappendfilename appendonly.aof\n"
             "appendfsync always\naof-use-rdb-preamble no\n"
-            "auto-aof-rewrite-percentage 0\n%s" % (
+            "auto-aof-rewrite-percentage 0\n%s%s" % (
                 self.port, "yes" if self.aof else "no",
-                "requirepass %s\n" % self.requirepass if self.requirepass else ""),
+                "requirepass %s\n" % self.requirepass if self.requirepass else "",
+                aclfile_line),
             encoding="ascii",
         )
         self.output = (self.directory / "stdout.log").open("ab", buffering=0)
@@ -260,6 +271,7 @@ class BackportRegression(unittest.TestCase):
             self.server = ManagedServer(
                 OPTIONS.server, self.temp.name, OPTIONS.timeout,
                 OPTIONS.startup_timeout, aof="aof" in self._testMethodName,
+                aclfile="aclfile" in self._testMethodName,
             )
             self.addCleanup(self.server.close)
             self.server.start()
@@ -2238,6 +2250,231 @@ class BackportRegression(unittest.TestCase):
         while time.monotonic() < deadline and extra.process.poll() is None:
             time.sleep(0.05)
         self.assertIsNotNone(extra.process.poll())
+
+    def test_acl_log_and_acl_list(self):
+        self.assertEqual(self.cmd("ACL", "SETUSER", "bp9limited", "on", ">pw",
+                                  "~ok:*", "+get"), b"OK")
+        line = [entry for entry in self.cmd("ACL", "LIST")
+                if entry.startswith(b"user bp9limited")][0]
+        self.assertIn(b"~ok:*", line)
+        self.assertIn(b"-@all", line)
+        self.assertIn(b"+get", line)
+
+        limited = self.connect()
+        self.addCleanup(limited.close)
+        self.assertEqual(limited.command("AUTH", "bp9limited", "pw"), b"OK")
+        with self.assertRaises(RedisError):
+            limited.command("SET", "ok:1", "1")
+        with self.assertRaises(RedisError):
+            limited.command("GET", "bad:1")
+
+        log = self.cmd("ACL", "LOG")
+        reasons = {self.flat_map(entry)[b"reason"] for entry in log}
+        self.assertEqual(reasons, {b"command", b"key"})
+        command_entry = [self.flat_map(entry) for entry in log
+                         if self.flat_map(entry)[b"reason"] == b"command"][0]
+        self.assertEqual(command_entry[b"object"], b"set")
+        self.assertEqual(command_entry[b"username"], b"bp9limited")
+        self.assertIn(b"client-info", command_entry)
+        self.assertEqual(command_entry[b"context"], b"toplevel")
+
+        # Identical denials are grouped into one entry.
+        for _ in range(2):
+            with self.assertRaises(RedisError):
+                limited.command("SET", "ok:1", "1")
+        log = self.cmd("ACL", "LOG")
+        command_entry = [self.flat_map(entry) for entry in log
+                         if self.flat_map(entry)[b"reason"] == b"command"][0]
+        self.assertEqual(command_entry[b"count"], 3)
+
+        failed = self.connect()
+        with self.assertRaises(RedisError):
+            failed.command("AUTH", "bp9limited", "wrong")
+        failed.close()
+        log = self.cmd("ACL", "LOG")
+        auth_entry = [self.flat_map(entry) for entry in log
+                      if self.flat_map(entry)[b"reason"] == b"auth"][0]
+        self.assertEqual(auth_entry[b"object"], b"bp9limited")
+
+        self.assertEqual(len(self.cmd("ACL", "LOG", "1")), 1)
+        self.assertEqual(self.cmd("ACL", "LOG", "RESET"), b"OK")
+        self.assertEqual(self.cmd("ACL", "LOG"), [])
+
+        # acllog-max-len 0 disables logging.
+        self.cmd("CONFIG", "SET", "acllog-max-len", "0")
+        with self.assertRaises(RedisError):
+            limited.command("SET", "ok:1", "1")
+        self.assertEqual(self.cmd("ACL", "LOG"), [])
+        self.cmd("CONFIG", "SET", "acllog-max-len", "128")
+        self.assertEqual(self.cmd("ACL", "DELUSER", "bp9limited"), 1)
+
+    def test_acl_save_load_without_file(self):
+        for subcommand in ("SAVE", "LOAD"):
+            with self.assertRaises(RedisError):
+                self.cmd("ACL", subcommand)
+
+    def test_aclfile_save_and_load(self):
+        if self.server is None:
+            self.skipTest("ACL file test requires --server")
+        self.assertIn(b"default", self.cmd("ACL", "USERS"))
+        self.assertEqual(self.cmd("ACL", "SETUSER", "bp9file", "on", ">pw",
+                                  "~x:*", "+get"), b"OK")
+        self.assertEqual(self.cmd("ACL", "SAVE"), b"OK")
+
+        text = (self.server.directory / "acl.conf").read_text()
+        self.assertIn("user bp9file on", text)
+        self.assertIn("~x:*", text)
+        self.assertIn("-@all +get", text)
+
+        self.assertEqual(self.cmd("ACL", "DELUSER", "bp9file"), 1)
+        self.assertNotIn(b"bp9file", self.cmd("ACL", "USERS"))
+        self.assertEqual(self.cmd("ACL", "LOAD"), b"OK")
+        self.assertIn(b"bp9file", self.cmd("ACL", "USERS"))
+        info = self.flat_map(self.cmd("ACL", "GETUSER", "bp9file"))
+        self.assertEqual(info[b"keys"], [b"~x:*"])
+        self.assertIn(b"+get", info[b"commands"])
+
+        probe = self.connect()
+        self.addCleanup(probe.close)
+        self.assertEqual(probe.command("AUTH", "bp9file", "pw"), b"OK")
+        self.assertEqual(probe.command("GET", "x:1"), None)
+
+    def test_client_setinfo_and_list(self):
+        if self.server is None:
+            self.skipTest("CLIENT test requires --server")
+        info = self.cmd("CLIENT", "INFO")
+        self.assertIn(b"lib-name=", info)
+        self.assertIn(b"lib-ver=", info)
+
+        self.assertEqual(self.cmd("CLIENT", "SETINFO", "lib-name", "myapp"),
+                         b"OK")
+        self.assertEqual(self.cmd("CLIENT", "SETINFO", "lib-ver", "9.9.9"),
+                         b"OK")
+        info = self.cmd("CLIENT", "INFO")
+        self.assertIn(b"lib-name=myapp", info)
+        self.assertIn(b"lib-ver=9.9.9", info)
+        listing = self.cmd("CLIENT", "LIST")
+        self.assertIn(b"lib-name=myapp lib-ver=9.9.9", listing)
+
+        with self.assertRaises(RedisError):
+            self.cmd("CLIENT", "SETINFO", "lib-name", "x" * 129)
+        with self.assertRaises(RedisError):
+            self.cmd("CLIENT", "SETINFO", "lib-name", "has space")
+        with self.assertRaises(RedisError):
+            self.cmd("CLIENT", "SETINFO", "bogus", "x")
+
+        self.assertEqual(self.cmd("RESET"), b"OK")
+        info = self.cmd("CLIENT", "INFO")
+        self.assertIn(b"lib-name= ", info)
+        self.assertIn(b"lib-ver=", info)
+
+    def test_xgroup_setid_entriesread(self):
+        key = self.key("stream:entriesread")
+        for ms in (1, 2, 3):
+            self.cmd("XADD", key, "%d-1" % ms, "f", ms)
+        self.assertEqual(self.cmd("XGROUP", "CREATE", key, "g", "0"), b"OK")
+        groups = self.flat_map(self.cmd("XINFO", "GROUPS", key)[0])
+        self.assertEqual(groups[b"entries-read"], 0)
+        self.assertEqual(groups[b"lag"], 3)
+
+        self.assertEqual(self.cmd("XGROUP", "SETID", key, "g", "2-1",
+                                  "ENTRIESREAD", "2"), b"OK")
+        groups = self.flat_map(self.cmd("XINFO", "GROUPS", key)[0])
+        self.assertEqual(groups[b"last-delivered-id"], b"2-1")
+        self.assertEqual(groups[b"entries-read"], 2)
+        self.assertEqual(groups[b"lag"], 1)
+
+        reply = self.cmd("XREADGROUP", "GROUP", "g", "c", "COUNT", "1",
+                         "STREAMS", key, ">")
+        self.assertEqual(reply[0][1][0][0], b"3-1")
+        groups = self.flat_map(self.cmd("XINFO", "GROUPS", key)[0])
+        self.assertEqual(groups[b"entries-read"], 3)
+        self.assertEqual(groups[b"lag"], 0)
+
+        with self.assertRaises(RedisError):
+            self.cmd("XGROUP", "SETID", key, "g", "2-1", "ENTRIESREAD", "-1")
+        with self.assertRaises(RedisError):
+            self.cmd("XGROUP", "SETID", key, "g", "2-1", "BOGUS", "1")
+
+    def test_info_errorstats(self):
+        key = self.key("errorstats")
+        self.cmd("SET", key, "value")
+        with self.assertRaises(RedisError):
+            self.cmd("LPUSH", key, "x")
+        with self.assertRaises(RedisError):
+            self.cmd("GET")
+        info = self.cmd("INFO", "errorstats")
+        self.assertIn(b"# Errorstats", info)
+        self.assertIn(b"errorstat_WRONGTYPE:count=", info)
+        self.assertIn(b"errorstat_ERR:count=", info)
+
+        self.assertEqual(self.cmd("CONFIG", "RESETSTAT"), b"OK")
+        info = self.cmd("INFO", "errorstats")
+        self.assertNotIn(b"errorstat_WRONGTYPE", info)
+
+    def test_sharded_pubsub(self):
+        if self.server is None:
+            self.skipTest("Pub/Sub test requires --server")
+        sub = self.connect()
+        self.addCleanup(sub.close)
+        reply = sub.command("SSUBSCRIBE", "shard:1")
+        self.assertEqual(reply[0], b"ssubscribe")
+        self.assertEqual(reply[1], b"shard:1")
+        self.assertEqual(reply[2], 1)
+        self.assertEqual(self.cmd("PUBSUB", "SHARDCHANNELS"), [b"shard:1"])
+        self.assertEqual(self.cmd("PUBSUB", "SHARDNUMSUB", "shard:1", "none"),
+                         [b"shard:1", 1, b"none", 0])
+        self.assertEqual(self.cmd("SPUBLISH", "shard:1", "hello"), 1)
+        self.assertEqual(sub._read(), [b"smessage", b"shard:1", b"hello"])
+        # Shard channels are separate from regular channels.
+        self.assertNotIn(b"shard:1", self.cmd("PUBSUB", "CHANNELS"))
+
+        reply = sub.command("SUNSUBSCRIBE", "shard:1")
+        self.assertEqual(reply[0], b"sunsubscribe")
+        self.assertEqual(reply[1], b"shard:1")
+        self.assertEqual(self.cmd("PUBSUB", "SHARDCHANNELS"), [])
+
+        # RESET is allowed from the Pub/Sub context and drops subscriptions.
+        sub.command("SSUBSCRIBE", "shard:2")
+        self.assertEqual(sub.command("RESET"), b"OK")
+        self.assertEqual(self.cmd("PUBSUB", "SHARDCHANNELS"), [])
+
+    def test_acl_deluser_disconnects_clients(self):
+        if self.server is None:
+            self.skipTest("CLIENT test requires --server")
+        self.assertEqual(self.cmd("ACL", "SETUSER", "bp9victim", "on", ">pw",
+                                  "+@all", "~*"), b"OK")
+        victim = self.connect()
+        self.addCleanup(victim.close)
+        self.assertEqual(victim.command("AUTH", "bp9victim", "pw"), b"OK")
+        self.assertEqual(self.cmd("ACL", "DELUSER", "bp9victim"), 1)
+        with self.assertRaises((OSError, EOFError)):
+            victim.command("PING")
+        self.assertEqual(self.cmd("PING"), b"PONG")
+
+    def test_requirepass_rejects_wrong_password(self):
+        if self.server is None:
+            self.skipTest("requirepass test requires --server")
+        directory = Path(self.temp.name) / "requirepass"
+        directory.mkdir()
+        server = ManagedServer(OPTIONS.server, directory, OPTIONS.timeout,
+                               OPTIONS.startup_timeout, requirepass="admin")
+        self.addCleanup(server.close)
+        server.start()
+        with self.assertRaises(RedisError):
+            RESP2("127.0.0.1", server.port, OPTIONS.timeout, "wrong")
+        admin = RESP2("127.0.0.1", server.port, OPTIONS.timeout, "admin")
+        self.addCleanup(admin.close)
+        self.assertEqual(admin.command("PING"), b"PONG")
+
+        # CONFIG SET requirepass updates the default ACL user as well.
+        self.assertEqual(admin.command("CONFIG", "SET", "requirepass",
+                                       "newpass"), b"OK")
+        with self.assertRaises(RedisError):
+            RESP2("127.0.0.1", server.port, OPTIONS.timeout, "admin")
+        rotated = RESP2("127.0.0.1", server.port, OPTIONS.timeout, "newpass")
+        self.addCleanup(rotated.close)
+        self.assertEqual(rotated.command("PING"), b"PONG")
 
 
 def parse_args(argv):

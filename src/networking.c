@@ -166,7 +166,10 @@ client *createClient(int fd) {
     c->woff = 0;
     c->watched_keys = listCreate();
     c->pubsub_channels = dictCreate(&objectKeyPointerValueDictType,NULL);
+    c->pubsubshard_channels = dictCreate(&objectKeyPointerValueDictType,NULL);
     c->pubsub_patterns = listCreate();
+    c->lib_name = NULL;
+    c->lib_ver = NULL;
     c->peerid = NULL;
     c->client_list_node = NULL;
     listSetFreeMethod(c->pubsub_patterns,decrRefCountVoid);
@@ -310,8 +313,30 @@ void _addReplyStringToList(client *c, const char *s, size_t len) {
  * -------------------------------------------------------------------------- */
 
 /* Add the object 'obj' string representation to the client output buffer. */
+/* Shared error replies bypass addReplyErrorLength; recognize them so their
+ * error code can be counted for INFO errorstats. */
+static int isSharedErrorObject(robj *o) {
+    return o == shared.wrongtypeerr || o == shared.nokeyerr ||
+           o == shared.syntaxerr || o == shared.sameobjecterr ||
+           o == shared.outofrangeerr || o == shared.noscripterr ||
+           o == shared.loadingerr || o == shared.slowscripterr ||
+           o == shared.bgsaveerr || o == shared.masterdownerr ||
+           o == shared.roslaveerr || o == shared.execaborterr ||
+           o == shared.noautherr || o == shared.noreplicaserr ||
+           o == shared.busykeyerr || o == shared.oomerr;
+}
+
 void addReply(client *c, robj *obj) {
     if (prepareClientToWrite(c) != C_OK) return;
+
+    if (isSharedErrorObject(obj)) {
+        char *s = obj->ptr;
+        size_t len = sdslen(obj->ptr);
+        char *end = memchr(s,' ',len);
+        if (end == NULL) end = memchr(s,'\r',len);
+        size_t errlen = end ? (size_t)(end-s) : len;
+        if (errlen > 1 && s[0] == '-') incrementErrorCount(s+1,errlen-1);
+    }
 
     if (sdsEncodedObject(obj)) {
         if (_addReplyToBuffer(c,obj->ptr,sdslen(obj->ptr)) != C_OK)
@@ -370,6 +395,17 @@ void addReplyErrorLength(client *c, const char *s, size_t len) {
     if (!len || s[0] != '-') addReplyString(c,"-ERR ",5);
     addReplyString(c,s,len);
     addReplyString(c,"\r\n",2);
+
+    /* Count the error code (the part between "-" and the first space). */
+    if (len) {
+        if (s[0] == '-') {
+            const char *spaceloc = memchr(s,' ',len);
+            size_t errlen = spaceloc ? (size_t)(spaceloc-s) : len;
+            if (errlen > 1) incrementErrorCount(s+1,errlen-1);
+        } else {
+            incrementErrorCount("ERR",3);
+        }
+    }
 
     /* Sometimes it could be normal that a slave replies to a master with
      * an error and this function gets called. Actually the error will never
@@ -925,8 +961,12 @@ void freeClient(client *c) {
     /* Unsubscribe from all the pubsub channels */
     pubsubUnsubscribeAllChannels(c,0);
     pubsubUnsubscribeAllPatterns(c,0);
+    pubsubUnsubscribeAllShardChannels(c,0);
     dictRelease(c->pubsub_channels);
+    dictRelease(c->pubsubshard_channels);
     listRelease(c->pubsub_patterns);
+    sdsfree(c->lib_name);
+    sdsfree(c->lib_ver);
 
     /* Free data structures. */
     listRelease(c->reply);
@@ -1826,7 +1866,7 @@ sds catClientInfoString(sds s, client *client) {
     if (emask & AE_WRITABLE) *p++ = 'w';
     *p = '\0';
     return sdscatfmt(s,
-        "id=%U addr=%s laddr=%s fd=%i name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i multi=%i qbuf=%U qbuf-free=%U obl=%U oll=%U omem=%U events=%s cmd=%s user=%s",
+        "id=%U addr=%s laddr=%s fd=%i name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i ssub=%i multi=%i qbuf=%U qbuf-free=%U obl=%U oll=%U omem=%U events=%s cmd=%s user=%s lib-name=%s lib-ver=%s",
         (PORT_ULONGLONG) client->id,
         getClientPeerId(client),
         laddr,
@@ -1838,6 +1878,7 @@ sds catClientInfoString(sds s, client *client) {
         client->db->id,
         (int) dictSize(client->pubsub_channels),
         (int) listLength(client->pubsub_patterns),
+        (int) dictSize(client->pubsubshard_channels),
         (client->flags & CLIENT_MULTI) ? client->mstate.count : -1,
         (PORT_ULONGLONG) sdslen(client->querybuf),
         (PORT_ULONGLONG) sdsavail(client->querybuf),
@@ -1846,7 +1887,9 @@ sds catClientInfoString(sds s, client *client) {
         (PORT_ULONGLONG) getClientOutputBufferMemoryUsage(client),
         events,
         client->lastcmd ? client->lastcmd->name : "NULL",
-        client->user ? ACLUserName(client->user) : "");
+        client->user ? ACLUserName(client->user) : "",
+        client->lib_name ? client->lib_name : "",
+        client->lib_ver ? client->lib_ver : "");
 }
 
 sds getAllClientsInfoString(int type) {
@@ -1895,6 +1938,11 @@ void resetCommand(client *c) {
     discardTransaction(c);
     pubsubUnsubscribeAllChannels(c,0);
     pubsubUnsubscribeAllPatterns(c,0);
+    pubsubUnsubscribeAllShardChannels(c,0);
+    sdsfree(c->lib_name);
+    c->lib_name = NULL;
+    sdsfree(c->lib_ver);
+    c->lib_ver = NULL;
     c->flags &= ~CLIENT_PUBSUB;
     selectDb(c,0);
     addReply(c,shared.ok);
@@ -1926,6 +1974,7 @@ void clientCommand(client *c) {
 "unpause                -- Resume all Redis clients that were paused.",
 "reply (on|off|skip)    -- Control the replies sent to the current connection.",
 "setname <name>         -- Assign the name <name> to the current connection.",
+"setinfo <attr> <value> -- Set client library attribute (lib-name|lib-ver).",
 "unblock <clientid> [TIMEOUT|ERROR] -- Unblock the specified blocked client.",
 NULL
         };
@@ -2114,6 +2163,38 @@ NULL
         } else {
             addReply(c,shared.czero);
         }
+    } else if (!strcasecmp(c->argv[1]->ptr,"setinfo") && c->argc == 4) {
+        char *attr = c->argv[2]->ptr;
+        sds val = c->argv[3]->ptr;
+        sds *target;
+        size_t j;
+
+        if (!strcasecmp(attr,"lib-name")) {
+            target = &c->lib_name;
+        } else if (!strcasecmp(attr,"lib-ver")) {
+            target = &c->lib_ver;
+        } else {
+            addReplyErrorFormat(c,"Unknown CLIENT SETINFO option '%s'",attr);
+            return;
+        }
+        if (sdslen(val) > 128) {
+            addReplyErrorFormat(c,"%s cannot be longer than 128 characters",
+                                attr);
+            return;
+        }
+        /* CLIENT LIST is split on spaces, so keep the value printable. */
+        for (j = 0; j < sdslen(val); j++) {
+            unsigned char ch = ((char*)val)[j];
+            if (ch < '!' || ch > '~') {
+                addReplyErrorFormat(c,
+                    "%s cannot contain spaces or non-printable characters",
+                    attr);
+                return;
+            }
+        }
+        sdsfree(*target);
+        *target = sdsdup(val);
+        addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"setname") && c->argc == 3) {
         int j, len = (int)sdslen(c->argv[2]->ptr);                              WIN_PORT_FIX /* cast (int) */
         char *p = c->argv[2]->ptr;

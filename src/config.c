@@ -601,6 +601,15 @@ void loadServerConfigFromString(char* config) {
                 goto loaderr;
             }
             server.requirepass = argv[1][0] ? zstrdup(argv[1]) : NULL;
+        } else if (!strcasecmp(argv[0],"aclfile") && argc == 2) {
+            zfree(server.acl_filename);
+            server.acl_filename = argv[1][0] ? zstrdup(argv[1]) : NULL;
+        } else if (!strcasecmp(argv[0],"acllog-max-len") && argc == 2) {
+            server.acllog_max_len = atoll(argv[1]);
+            if (server.acllog_max_len < 0) {
+                err = "acllog-max-len must be zero or positive";
+                goto loaderr;
+            }
         } else if (!strcasecmp(argv[0],"pidfile") && argc == 2) {
             zfree(server.pidfile);
             server.pidfile = zstrdup(argv[1]);
@@ -1027,6 +1036,13 @@ static int configSetOne(client *c, robj *nameobj, robj *o) {
     serverAssertWithInfo(c,nameobj,sdsEncodedObject(nameobj));
     serverAssertWithInfo(c,o,sdsEncodedObject(o));
 
+    /* aclfile is read at startup and by ACL LOAD; changing the path at
+     * runtime would make ACL SAVE/LOAD point somewhere else unexpectedly. */
+    if (!strcasecmp(nameobj->ptr,"aclfile")) {
+        addReplyError(c,"aclfile is immutable");
+        return C_ERR;
+    }
+
     if (0) { /* this starts the config_set macros else-if chain. */
 
     /* Special fields that can't be handled with general macros. */
@@ -1041,6 +1057,7 @@ static int configSetOne(client *c, robj *nameobj, robj *o) {
         if (sdslen(o->ptr) > CONFIG_AUTHPASS_MAX_LEN) goto badfmt;
         zfree(server.requirepass);
         server.requirepass = ((char*)o->ptr)[0] ? zstrdup(o->ptr) : NULL;
+        ACLUpdateDefaultUserPassword(server.requirepass);
     } config_set_special_field("masterauth") {
         zfree(server.masterauth);
         server.masterauth = ((char*)o->ptr)[0] ? zstrdup(o->ptr) : NULL;
@@ -1260,6 +1277,8 @@ static int configSetOne(client *c, robj *nameobj, robj *o) {
       "tcp-keepalive",server.tcpkeepalive,0,INT_MAX) {
     } config_set_numerical_field(
       "maxmemory-samples",server.maxmemory_samples,1,INT_MAX) {
+    } config_set_numerical_field(
+      "acllog-max-len",server.acllog_max_len,0,LLONG_MAX) {
     } config_set_numerical_field(
       "lfu-log-factor",server.lfu_log_factor,0,INT_MAX) {
     } config_set_numerical_field(
@@ -1509,6 +1528,8 @@ void configGetCommand(client *c) {
     /* String values */
     config_get_string_field("dbfilename",server.rdb_filename);
     config_get_string_field("requirepass",server.requirepass);
+    config_get_string_field("aclfile",server.acl_filename);
+    config_get_numerical_field("acllog-max-len",server.acllog_max_len);
     config_get_string_field("masterauth",server.masterauth);
     config_get_string_field("cluster-announce-ip",server.cluster_announce_ip);
     config_get_string_field("unixsocket",server.unixsocket);
@@ -2351,6 +2372,8 @@ int rewriteConfig(char *path) {
     rewriteConfigNumericalOption(state,"min-replicas-to-write",server.repl_min_slaves_to_write,CONFIG_DEFAULT_MIN_SLAVES_TO_WRITE);
     rewriteConfigNumericalOption(state,"min-replicas-max-lag",server.repl_min_slaves_max_lag,CONFIG_DEFAULT_MIN_SLAVES_MAX_LAG);
     rewriteConfigStringOption(state,"requirepass",server.requirepass,NULL);
+    rewriteConfigStringOption(state,"aclfile",server.acl_filename,NULL);
+    rewriteConfigNumericalOption(state,"acllog-max-len",server.acllog_max_len,128);
     rewriteConfigNumericalOption(state,"maxclients",server.maxclients,CONFIG_DEFAULT_MAX_CLIENTS);
     rewriteConfigBytesOption(state,"maxmemory",server.maxmemory,CONFIG_DEFAULT_MAXMEMORY);
     rewriteConfigBytesOption(state,"proto-max-bulk-len",server.proto_max_bulk_len,CONFIG_DEFAULT_PROTO_MAX_BULK_LEN);

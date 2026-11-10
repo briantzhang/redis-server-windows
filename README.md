@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp8
+# Redis for Windows 5.0.14.1-bp9
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp8`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp9`。
 
 ## 这个版本新增了什么
 
@@ -64,10 +64,16 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `INFO everything` | 7.0 | 与 `INFO all` 相同地输出全部区段 |
 | `WAITAOF numlocal numreplicas timeout` | 7.2 | 同步确认本机 AOF 已落盘；副本 AOF 计数固定为 0，见下方说明 |
 | `SHUTDOWN [NOSAVE\|SAVE] [NOW] [FORCE] [ABORT]` | 7.0 | `NOW` 不等副本，`FORCE` 保存失败也退出，`ABORT` 取消待执行的关闭 |
+| `ACL LOG [count\|RESET]` | 6.0 | 记录被拒绝的命令、键和认证失败，相同条目在 60 秒内合并计数；`acllog-max-len` 控制上限 |
+| `ACL SAVE` / `ACL LOAD` 与 `aclfile` 配置 | 6.0 | 把用户规则写入文件并在启动或手动加载时恢复；规则文件损坏时保留内存中的旧用户 |
+| `CLIENT SETINFO lib-name\|lib-ver` | 7.2 | 记录客户端库名称与版本，显示在 `CLIENT LIST`/`CLIENT INFO` 的 `lib-name=`、`lib-ver=` |
+| `XGROUP SETID ... [ENTRIESREAD n]`、`XINFO GROUPS` 的 `entries-read`/`lag` | 7.0 | 记录消费组已读条目数并据此计算积压 |
+| `INFO errorstats` | 6.2 | 按错误码统计回复数量，`CONFIG RESETSTAT` 清零 |
+| `SSUBSCRIBE`/`SUNSUBSCRIBE`/`SPUBLISH`、`PUBSUB SHARDCHANNELS`/`SHARDNUMSUB` | 7.0 | 分片频道订阅与发布；单机下按本节点投递，与普通频道互不影响 |
 
 过期时间在秒数乘 1000、相对时间加当前时间之前做有符号 64 位溢出检查，非法值报错且不改动数据。
 
-ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`>password`、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并可用 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN` 查看规则和预检权限。没有 Redis 7 的多选择器（一个用户多套权限）和按键的读写权限位。配置了 `requirepass` 时，它仍然是 `default` 用户的口令，未认证的连接一律拒绝；不配置时连接直接以 `default` 用户身份进入，ACL 规则照常生效。
+ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`>password`、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并可用 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN` 查看规则和预检权限，用 `ACL LOG` 查看拒绝记录，用 `ACL SAVE`/`ACL LOAD` 配合 `aclfile` 持久化规则。没有 Redis 7 的多选择器（一个用户多套权限）和按键的读写权限位，`&channel` 这类频道规则会被接受但不生效。配置了 `requirepass` 时，它仍然是 `default` 用户的口令，未认证的连接一律拒绝；`CONFIG SET requirepass` 会同步更新 `default` 用户，不配置时连接直接以 `default` 用户身份进入。删除用户会断开仍以该用户认证的连接，不会留下悬空引用。
 
 命令语义参照 Redis `7.0.15`（BSD）手工适配，没有引入 Redis 8 的源码。完整说明见 [BACKPORT-RELEASE.md](BACKPORT-RELEASE.md)。
 
@@ -100,13 +106,13 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 
 ## 验证
 
-在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，55 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
+在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，64 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
 
 ```bash
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮新增 GEOSEARCH/GEOSEARCHSTORE 的两种区域与结果选项、ACL 子命令、CLIENT KILL 的 LADDR/USER/MAXAGE、CLIENT LIST 新字段、INFO everything、WAITAOF 的 AOF 开/关两种情形，以及 SHUTDOWN 选项校验和一个真实退出的附加实例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮新增 ACL LOG 的分组与上限、ACL 文件的保存/加载与启动加载、ACL 删除用户时的连接断开、`CLIENT SETINFO`、`XGROUP SETID ENTRIESREAD` 与 `XINFO GROUPS` 的 `entries-read`/`lag`、`INFO errorstats` 及重置、分片 Pub/Sub 的订阅/发布/取消与 `RESET`，以及 `requirepass` 错误口令和运行期轮换。
 
 这轮验证不等于已合入上游全部安全补丁，也没有做生产压力测试。
 
