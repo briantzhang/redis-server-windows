@@ -172,6 +172,8 @@ client *createClient(int fd) {
     c->lib_ver = NULL;
     c->peerid = NULL;
     c->client_list_node = NULL;
+    c->client_tracking_redirection = 0;
+    c->client_tracking_prefixes = NULL;
     listSetFreeMethod(c->pubsub_patterns,decrRefCountVoid);
     listSetMatchMethod(c->pubsub_patterns,listMatchObjects);
     if (fd != -1) linkClient(c);
@@ -967,6 +969,9 @@ void freeClient(client *c) {
     listRelease(c->pubsub_patterns);
     sdsfree(c->lib_name);
     sdsfree(c->lib_ver);
+
+    /* Remove from client-side caching tables if needed. */
+    if (c->flags & CLIENT_TRACKING) disableTracking(c);
 
     /* Free data structures. */
     listRelease(c->reply);
@@ -1829,7 +1834,7 @@ char *getClientPeerId(client *c) {
 /* Concatenate a string representing the state of a client in an human
  * readable format, into the sds string 's'. */
 sds catClientInfoString(sds s, client *client) {
-    char flags[16], events[3], laddr[NET_PEER_ID_LEN], *p;
+    char flags[24], events[3], laddr[NET_PEER_ID_LEN], *p;
     int emask;
 
     if (client->fd == -1) {
@@ -1857,6 +1862,8 @@ sds catClientInfoString(sds s, client *client) {
     if (client->flags & CLIENT_READONLY) *p++ = 'r';
     if (client->flags & CLIENT_NO_EVICT) *p++ = 'e';
     if (client->flags & CLIENT_NO_TOUCH) *p++ = 'T';
+    if (client->flags & CLIENT_TRACKING) *p++ = 't';
+    if (client->flags & CLIENT_TRACKING_BROKEN_REDIR) *p++ = 'R';
     if (p == flags) *p++ = 'N';
     *p++ = '\0';
 
@@ -1976,6 +1983,11 @@ void clientCommand(client *c) {
 "setname <name>         -- Assign the name <name> to the current connection.",
 "setinfo <attr> <value> -- Set client library attribute (lib-name|lib-ver).",
 "unblock <clientid> [TIMEOUT|ERROR] -- Unblock the specified blocked client.",
+"tracking (on|off) [REDIRECT client-id] [BCAST] [PREFIX prefix ...] [OPTIN] [OPTOUT] [NOLOOP]",
+"                         -- Enable/disable client-side caching for this connection.",
+"caching (yes|no)        -- Enable/disable tracking of keys in the next command (OPTIN/OPTOUT).",
+"getredir                -- Return the client ID we are redirecting tracking invalidations to.",
+"trackinginfo            -- Return information about the current client tracking status.",
 NULL
         };
         addReplyHelp(c, help);
@@ -2279,6 +2291,217 @@ NULL
             addReply(c,shared.ok);
         } else {
             addReply(c,shared.syntaxerr);
+        }
+    } else if (!strcasecmp(c->argv[1]->ptr,"tracking") && c->argc >= 3) {
+        /* CLIENT TRACKING (on|off) [REDIRECT <id>] [BCAST] [PREFIX first]
+         *                          [PREFIX second] [OPTIN] [OPTOUT] [NOLOOP]... */
+        long long redir = 0;
+        uint64_t options = 0;
+        robj **prefix = NULL;
+        size_t numprefix = 0;
+
+        for (int j = 3; j < c->argc; j++) {
+            int moreargs = (c->argc-1) - j;
+
+            if (!strcasecmp(c->argv[j]->ptr,"redirect") && moreargs) {
+                j++;
+                if (redir != 0) {
+                    addReplyError(c,"A client can only redirect to a single "
+                                    "other client");
+                    zfree(prefix);
+                    return;
+                }
+
+                if (getLongLongFromObjectOrReply(c,c->argv[j],&redir,NULL) !=
+                    C_OK)
+                {
+                    zfree(prefix);
+                    return;
+                }
+                if (lookupClientByID(redir) == NULL) {
+                    addReplyError(c,"The client ID you want redirect to "
+                                    "does not exist");
+                    zfree(prefix);
+                    return;
+                }
+            } else if (!strcasecmp(c->argv[j]->ptr,"bcast")) {
+                options |= CLIENT_TRACKING_BCAST;
+            } else if (!strcasecmp(c->argv[j]->ptr,"optin")) {
+                options |= CLIENT_TRACKING_OPTIN;
+            } else if (!strcasecmp(c->argv[j]->ptr,"optout")) {
+                options |= CLIENT_TRACKING_OPTOUT;
+            } else if (!strcasecmp(c->argv[j]->ptr,"noloop")) {
+                options |= CLIENT_TRACKING_NOLOOP;
+            } else if (!strcasecmp(c->argv[j]->ptr,"prefix") && moreargs) {
+                j++;
+                prefix = zrealloc(prefix,sizeof(robj*)*(numprefix+1));
+                prefix[numprefix++] = c->argv[j];
+            } else {
+                zfree(prefix);
+                addReply(c,shared.syntaxerr);
+                return;
+            }
+        }
+
+        if (!strcasecmp(c->argv[2]->ptr,"on")) {
+            if (!(options & CLIENT_TRACKING_BCAST) && numprefix) {
+                addReplyError(c,
+                    "PREFIX option requires BCAST mode to be enabled");
+                zfree(prefix);
+                return;
+            }
+
+            if (c->flags & CLIENT_TRACKING) {
+                int oldbcast = !!(c->flags & CLIENT_TRACKING_BCAST);
+                int newbcast = !!(options & CLIENT_TRACKING_BCAST);
+                if (oldbcast != newbcast) {
+                    addReplyError(c,
+                    "You can't switch BCAST mode on/off before disabling "
+                    "tracking for this client, and then re-enabling it with "
+                    "a different mode.");
+                    zfree(prefix);
+                    return;
+                }
+            }
+
+            if (options & CLIENT_TRACKING_BCAST &&
+                options & (CLIENT_TRACKING_OPTIN|CLIENT_TRACKING_OPTOUT))
+            {
+                addReplyError(c,
+                "OPTIN and OPTOUT are not compatible with BCAST");
+                zfree(prefix);
+                return;
+            }
+
+            if (options & CLIENT_TRACKING_OPTIN && options & CLIENT_TRACKING_OPTOUT)
+            {
+                addReplyError(c,
+                "You can't specify both OPTIN mode and OPTOUT mode");
+                zfree(prefix);
+                return;
+            }
+
+            if ((options & CLIENT_TRACKING_OPTIN && c->flags & CLIENT_TRACKING_OPTOUT) ||
+                (options & CLIENT_TRACKING_OPTOUT && c->flags & CLIENT_TRACKING_OPTIN))
+            {
+                addReplyError(c,
+                "You can't switch OPTIN/OPTOUT mode before disabling "
+                "tracking for this client, and then re-enabling it with "
+                "a different mode.");
+                zfree(prefix);
+                return;
+            }
+
+            if (options & CLIENT_TRACKING_BCAST) {
+                if (!checkPrefixCollisionsOrReply(c,prefix,numprefix)) {
+                    zfree(prefix);
+                    return;
+                }
+            }
+
+            enableTracking(c,redir,options,prefix,numprefix);
+        } else if (!strcasecmp(c->argv[2]->ptr,"off")) {
+            disableTracking(c);
+        } else {
+            zfree(prefix);
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+        zfree(prefix);
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"caching") && c->argc >= 3) {
+        if (!(c->flags & CLIENT_TRACKING)) {
+            addReplyError(c,"CLIENT CACHING can be called only when the "
+                            "client is in tracking mode with OPTIN or "
+                            "OPTOUT mode enabled");
+            return;
+        }
+
+        char *opt = c->argv[2]->ptr;
+        if (!strcasecmp(opt,"yes")) {
+            if (c->flags & CLIENT_TRACKING_OPTIN) {
+                c->flags |= CLIENT_TRACKING_CACHING;
+            } else {
+                addReplyError(c,"CLIENT CACHING YES is only valid when tracking is enabled in OPTIN mode.");
+                return;
+            }
+        } else if (!strcasecmp(opt,"no")) {
+            if (c->flags & CLIENT_TRACKING_OPTOUT) {
+                c->flags |= CLIENT_TRACKING_CACHING;
+            } else {
+                addReplyError(c,"CLIENT CACHING NO is only valid when tracking is enabled in OPTOUT mode.");
+                return;
+            }
+        } else {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"getredir") && c->argc == 2) {
+        /* CLIENT GETREDIR */
+        if (c->flags & CLIENT_TRACKING) {
+            addReplyLongLong(c,c->client_tracking_redirection);
+        } else {
+            addReplyLongLong(c,-1);
+        }
+    } else if (!strcasecmp(c->argv[1]->ptr,"trackinginfo") && c->argc == 2) {
+        /* RESP2 flat map: flags / redirect / prefixes */
+        addReplyMultiBulkLen(c,6);
+
+        addReplyBulkCString(c,"flags");
+        void *arraylen_ptr = addDeferredMultiBulkLength(c);
+        int numflags = 0;
+        addReplyBulkCString(c,c->flags & CLIENT_TRACKING ? "on" : "off");
+        numflags++;
+        if (c->flags & CLIENT_TRACKING_BCAST) {
+            addReplyBulkCString(c,"bcast");
+            numflags++;
+        }
+        if (c->flags & CLIENT_TRACKING_OPTIN) {
+            addReplyBulkCString(c,"optin");
+            numflags++;
+            if (c->flags & CLIENT_TRACKING_CACHING) {
+                addReplyBulkCString(c,"caching-yes");
+                numflags++;
+            }
+        }
+        if (c->flags & CLIENT_TRACKING_OPTOUT) {
+            addReplyBulkCString(c,"optout");
+            numflags++;
+            if (c->flags & CLIENT_TRACKING_CACHING) {
+                addReplyBulkCString(c,"caching-no");
+                numflags++;
+            }
+        }
+        if (c->flags & CLIENT_TRACKING_NOLOOP) {
+            addReplyBulkCString(c,"noloop");
+            numflags++;
+        }
+        if (c->flags & CLIENT_TRACKING_BROKEN_REDIR) {
+            addReplyBulkCString(c,"broken_redirect");
+            numflags++;
+        }
+        setDeferredMultiBulkLength(c,arraylen_ptr,numflags);
+
+        addReplyBulkCString(c,"redirect");
+        if (c->flags & CLIENT_TRACKING) {
+            addReplyLongLong(c,c->client_tracking_redirection);
+        } else {
+            addReplyLongLong(c,-1);
+        }
+
+        addReplyBulkCString(c,"prefixes");
+        if (c->client_tracking_prefixes) {
+            addReplyMultiBulkLen(c,raxSize(c->client_tracking_prefixes));
+            raxIterator ri;
+            raxStart(&ri,c->client_tracking_prefixes);
+            raxSeek(&ri,"^",NULL,0);
+            while(raxNext(&ri)) {
+                addReplyBulkCBuffer(c,ri.key,ri.key_len);
+            }
+            raxStop(&ri);
+        } else {
+            addReplyMultiBulkLen(c,0);
         }
     } else {
         addReplyErrorFormat(c, "Unknown subcommand or wrong number of arguments for '%s'. Try CLIENT HELP", (char*)c->argv[1]->ptr);

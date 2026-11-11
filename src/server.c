@@ -1507,6 +1507,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Handle writes with pending output buffers. */
     handleClientsWithPendingWrites();
 
+    /* Client-side caching: broadcast BCAST invalidations and trim table. */
+    trackingBroadcastInvalidationMessages();
+    trackingLimitUsedSlots();
+
     /* Before we are going to sleep, let the threads access the dataset by
      * releasing the GIL. Redis main thread will not touch anything at this
      * time. */
@@ -1842,6 +1846,7 @@ void initServerConfig(void) {
 
     /* Slow log */
     server.latency_tracking = 1;
+    server.tracking_table_max_keys = 1000000; /* Same default as Redis 6+. */
     server.slowlog_log_slower_than = CONFIG_DEFAULT_SLOWLOG_LOG_SLOWER_THAN;
     server.slowlog_max_len = CONFIG_DEFAULT_SLOWLOG_MAX_LEN;
 
@@ -2225,6 +2230,7 @@ void initServer(void) {
     server.unblocked_clients = listCreate();
     server.paused_clients = listCreate();
     server.ready_keys = listCreate();
+    server.tracking_clients = 0;
     server.clients_waiting_acks = listCreate();
     server.get_ack_from_slaves = 0;
     server.clients_paused = 0;
@@ -2626,7 +2632,7 @@ void preventCommandReplication(client *c) {
 void call(client *c, int flags) {
     PORT_LONGLONG dirty;
     ustime_t start, duration;
-    int client_old_flags = c->flags;
+    uint64_t client_old_flags = c->flags;
     struct redisCommand *real_cmd = c->cmd;
 
     server.fixed_time_expire++;
@@ -2754,6 +2760,21 @@ void call(client *c, int flags) {
     server.also_propagate = prev_also_propagate;
     server.fixed_time_expire--;
     server.stat_numcommands++;
+
+    /* Client-side caching: remember keys of readonly commands when tracking. */
+    if ((c->flags & CLIENT_TRACKING) &&
+        !(c->flags & CLIENT_TRACKING_BCAST) &&
+        (c->cmd->flags & CMD_READONLY))
+    {
+        trackingRememberKeys(c);
+    }
+    /* CACHING yes/no is one-shot for the next command; keep it across the
+     * CLIENT CACHING command that sets the flag. */
+    if (!(c->cmd->proc == clientCommand && c->argc >= 2 &&
+          !strcasecmp(c->argv[1]->ptr,"caching")))
+    {
+        c->flags &= ~CLIENT_TRACKING_CACHING;
+    }
 }
 
 /* If this function gets called we already read a whole

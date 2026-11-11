@@ -27,6 +27,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import fnmatch
 from pathlib import Path
+import select
 import signal
 import socket
 import subprocess
@@ -2752,6 +2753,72 @@ class BackportRegression(unittest.TestCase):
         cfull = self.flat_map(group[b"consumers"][0])
         self.assertIn(b"active-time", cfull)
         self.assertGreater(cfull[b"active-time"], 0)
+
+    def test_client_tracking_pubsub_invalidate(self):
+        if self.server is None:
+            self.skipTest("CLIENT TRACKING test requires --server")
+
+        key = self.key("track:k")
+        self.cmd("DEL", key)
+
+        # Invalidation peer must be in Pub/Sub; TRACKING REDIRECT points here.
+        # CLIENT ID must be read before SUBSCRIBE (Pub/Sub context rejects it).
+        sub = self.connect()
+        self.addCleanup(sub.close)
+        redir_id = sub.command("CLIENT", "ID")
+        self.assertEqual(sub.command("SUBSCRIBE", "__redis__:invalidate")[0],
+                         b"subscribe")
+
+        data = self.connect()
+        self.addCleanup(data.close)
+        self.assertEqual(
+            data.command("CLIENT", "TRACKING", "ON", "REDIRECT", str(redir_id)),
+            b"OK")
+        self.assertEqual(data.command("CLIENT", "GETREDIR"), redir_id)
+
+        info = data.command("CLIENT", "TRACKINGINFO")
+        self.assertEqual(info[0], b"flags")
+        self.assertIn(b"on", info[1])
+        self.assertEqual(info[2], b"redirect")
+        self.assertEqual(info[3], redir_id)
+
+        self.assertEqual(data.command("GET", key), None)
+        self.assertEqual(self.cmd("SET", key, "v1"), b"OK")
+
+        # Invalidation is queued on the redirect client and flushed in beforeSleep.
+        time.sleep(0.05)
+        msg = sub._read()
+        self.assertEqual(msg[0], b"message")
+        self.assertEqual(msg[1], b"__redis__:invalidate")
+        self.assertEqual(msg[2], [key])
+
+        # OPTIN: keys are remembered only after CACHING YES.
+        data2 = self.connect()
+        self.addCleanup(data2.close)
+        self.assertEqual(
+            data2.command("CLIENT", "TRACKING", "ON", "OPTIN",
+                          "REDIRECT", str(redir_id)),
+            b"OK")
+        key2 = self.key("track:optin")
+        self.cmd("DEL", key2)
+        self.assertEqual(data2.command("GET", key2), None)
+        self.assertEqual(self.cmd("SET", key2, "x"), b"OK")
+        # No CACHING YES -> no invalidation. Probe with select so a timeout
+        # does not poison the buffered reader used by later asserts.
+        time.sleep(0.05)
+        readable, _, _ = select.select([sub.sock], [], [], 0.2)
+        self.assertEqual(readable, [])
+
+        self.assertEqual(data2.command("CLIENT", "CACHING", "YES"), b"OK")
+        self.assertEqual(data2.command("GET", key2), b"x")
+        self.assertEqual(self.cmd("SET", key2, "y"), b"OK")
+        time.sleep(0.05)
+        msg = sub._read()
+        self.assertEqual(msg[0], b"message")
+        self.assertEqual(msg[2], [key2])
+
+        self.assertEqual(data.command("CLIENT", "TRACKING", "OFF"), b"OK")
+        self.assertEqual(data.command("CLIENT", "GETREDIR"), -1)
 
 
 def parse_args(argv):

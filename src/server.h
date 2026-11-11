@@ -281,6 +281,15 @@ typedef PORT_LONGLONG ustime_t; /* microsecond time type. */
 #define CLIENT_LUA_DEBUG_SYNC (1<<26)  /* EVAL debugging without fork() */
 #define CLIENT_MODULE (1<<27) /* Non connected client used by some module. */
 #define CLIENT_PROTECTED (1<<28) /* Client should not be freed for now. */
+/* Client-side caching (CLIENT TRACKING). Stored in the upper half of
+ * client->flags (uint64_t) so existing 32-bit flags stay intact. */
+#define CLIENT_TRACKING (1ULL<<32)              /* Client tracking enabled. */
+#define CLIENT_TRACKING_BROKEN_REDIR (1ULL<<33) /* Tracking redirect target gone. */
+#define CLIENT_TRACKING_BCAST (1ULL<<34)        /* Tracking in broadcasting mode. */
+#define CLIENT_TRACKING_OPTIN (1ULL<<35)        /* Tracking in opt-in mode. */
+#define CLIENT_TRACKING_OPTOUT (1ULL<<36)       /* Tracking in opt-out mode. */
+#define CLIENT_TRACKING_CACHING (1ULL<<37)      /* CACHING yes/no given this cmd. */
+#define CLIENT_TRACKING_NOLOOP (1ULL<<38)       /* Don't notify self-modifications. */
 
 /* Client block type (btype field in client structure)
  * if CLIENT_BLOCKED flag is set. */
@@ -783,7 +792,7 @@ typedef struct client {
     time_t ctime;           /* Client creation time. */
     time_t lastinteraction; /* Time of the last interaction, used for timeout */
     time_t obuf_soft_limit_reached_time;
-    int flags;              /* Client flags: CLIENT_* macros. */
+    uint64_t flags;         /* Client flags: CLIENT_* macros. */
     int authenticated;      /* When requirepass is non-NULL. */
     void *user;             /* ACL user once authenticated, otherwise NULL. */
     int replstate;          /* Replication state if this is a slave. */
@@ -816,6 +825,9 @@ typedef struct client {
     sds lib_ver;            /* CLIENT SETINFO lib-ver, or NULL. */
     sds peerid;             /* Cached peer ID. */
     listNode *client_list_node; /* list node in client list */
+    /* Client-side caching: redirect target and BCAST prefixes. */
+    uint64_t client_tracking_redirection;
+    rax *client_tracking_prefixes;
     WIN32_ONLY(char replFileCopy[_MAX_PATH];)
 
     /* Response buffer */
@@ -1272,6 +1284,9 @@ struct redisServer {
     list *unblocked_clients; /* list of clients to unblock before next loop */
     list *paused_clients; /* clients blocked because of CLIENT PAUSE */
     list *ready_keys;        /* List of readyList structures for BLPOP & co */
+    /* Client-side caching (CLIENT TRACKING). */
+    unsigned int tracking_clients;   /* # of clients with tracking enabled. */
+    size_t tracking_table_max_keys;  /* Max keys in TrackingTable (0 = unlimited). */
     /* Sort parameters - qsort_r() is only available under BSD so we
      * have to take this state global, in order to pass it to sortCompare() */
     int sort_desc;
@@ -2056,6 +2071,18 @@ int time_independent_strcmp(char *a, char *b);
 void authCommand(client *c);
 int ACLAuthenticateUser(client *c, robj *username, robj *password);
 void helloCommand(client *c);
+client *lookupClientByID(uint64_t id);
+void enableTracking(client *c, uint64_t redirect_to, uint64_t options, robj **prefix, size_t numprefix);
+void disableTracking(client *c);
+int checkPrefixCollisionsOrReply(client *c, robj **prefix, size_t numprefix);
+void trackingRememberKeys(client *c);
+void trackingInvalidateKey(client *c, robj *keyobj, int bcast);
+void trackingInvalidateKeysOnFlush(int async);
+void trackingLimitUsedSlots(void);
+void trackingBroadcastInvalidationMessages(void);
+uint64_t trackingGetTotalItems(void);
+uint64_t trackingGetTotalKeys(void);
+uint64_t trackingGetTotalPrefixes(void);
 void aclCommand(client *c);
 void ACLInit(void);
 void *ACLDefaultUser(void);

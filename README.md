@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp12
+# Redis for Windows 5.0.14.1-bp13
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp12`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp13`。
 
 ## 这个版本新增了什么
 
@@ -81,6 +81,7 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `ACL HELP` | 6.0 | 列出 ACL 子命令；`ACL WHOAMI` 继续对已认证用户放行 |
 | `SCAN ... TYPE type` | 6.0 | 只返回指定类型的键；未知类型名返回空页 |
 | `HELLO [protover [AUTH user pass] [SETNAME name]]` | 6.0 | 握手；本版只接受协议 2，拒绝 3；回复为 RESP2 扁平字段数组 |
+| `CLIENT TRACKING` / `CACHING` / `GETREDIR` / `TRACKINGINFO` | 6.0 / 6.2 | 客户端缓存追踪；本版无 RESP3 push，失效经 Pub/Sub `__redis__:invalidate`（需 REDIRECT） |
 | `XINFO CONSUMERS` 的 `inactive` | 7.2 | 距上次成功投递的毫秒数；尚未成功投递时为 -1；`idle` 仍按上次尝试交互计算 |
 
 过期时间在秒数乘 1000、相对时间加当前时间之前做有符号 64 位溢出检查，非法值报错且不改动数据。
@@ -95,7 +96,7 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 
 以下能力不在本版中，调用会返回 `unknown command` 或沿用底座的旧行为：
 
-- RESP3（`HELLO 3` 返回 NOPROTO）、客户端缓存追踪（`CLIENT TRACKING`）、Redis Functions
+- RESP3（`HELLO 3` 返回 NOPROTO；TRACKING 失效也不走 RESP3 push）、Redis Functions
 - Redis 7 的 ACL 选择器与按键权限位（本版 ACL 停在 Redis 6 的单权限集）
 - `COMMAND DOCS` 的完整参数树与 complexity/history 字段（本版用 `help.h` 的扁平字段近似）
 - TLS、线程化 I/O
@@ -125,7 +126,7 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮新增 `SCAN TYPE`、`HELLO`（仅 RESP2）、`XINFO CONSUMERS inactive`，并保留此前的 COMMAND DOCS、ZRANK WITHSCORE、延迟直方图、ACL 与流命令等用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮新增 `CLIENT TRACKING`（Pub/Sub 失效），并保留 `SCAN TYPE`、`HELLO`、`XINFO CONSUMERS inactive`、COMMAND DOCS、ZRANK WITHSCORE、延迟直方图、ACL 与流命令等用例。
 
 这轮验证不等于已合入上游全部安全补丁，也没有做生产压力测试。
 

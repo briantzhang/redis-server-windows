@@ -412,10 +412,12 @@ int selectDb(client *c, int id) {
 
 void signalModifiedKey(redisDb *db, robj *key) {
     touchWatchedKey(db,key);
+    trackingInvalidateKey(server.current_client,key,1);
 }
 
 void signalFlushedDb(int dbid) {
     touchWatchedKeysOnFlush(dbid);
+    trackingInvalidateKeysOnFlush(0);
 }
 
 /*-----------------------------------------------------------------------------
@@ -1487,6 +1489,7 @@ int expireIfNeeded(redisDb *db, robj *key) {
     propagateExpire(db,key,server.lazyfree_lazy_expire);
     notifyKeyspaceEvent(NOTIFY_EXPIRED,
         "expired",key,db->id);
+    trackingInvalidateKey(NULL,key,1);
     return server.lazyfree_lazy_expire ? dbAsyncDelete(db,key) :
                                          dbSyncDelete(db,key);
 }
