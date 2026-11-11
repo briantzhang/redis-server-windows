@@ -3099,6 +3099,58 @@ class BackportRegression(unittest.TestCase):
         self.assertIn(channel.encode("ascii"), channels)
         self.assertGreaterEqual(self.cmd("PUBSUB", "NUMPAT"), 0)
 
+    def test_unlink_swapdb_wait_and_role(self):
+        # UNLINK always lazy-frees; returns the number of deleted keys.
+        k1 = self.key("unlink:a")
+        k2 = self.key("unlink:b")
+        missing = self.key("unlink:missing")
+        self.cmd("SET", k1, "1")
+        self.cmd("SET", k2, "2")
+        self.assertEqual(self.cmd("UNLINK", k1, missing, k2), 2)
+        self.assertIsNone(self.cmd("GET", k1))
+        self.assertIsNone(self.cmd("GET", k2))
+        self.assertEqual(self.cmd("UNLINK", missing), 0)
+
+        # SWAPDB exchanges dict/expires of two DBs; clients keep their SELECT.
+        a = self.key("swap:a")
+        b = self.key("swap:b")
+        self.cmd("SELECT", "0")
+        self.cmd("SET", a, "db0")
+        self.cmd("SELECT", "1")
+        self.cmd("SET", b, "db1")
+        self.cmd("SELECT", "0")
+        self.assertEqual(self.cmd("SWAPDB", "0", "1"), b"OK")
+        self.assertIsNone(self.cmd("GET", a))
+        self.assertEqual(self.cmd("GET", b), b"db1")
+        self.cmd("SELECT", "1")
+        self.assertEqual(self.cmd("GET", a), b"db0")
+        self.assertIsNone(self.cmd("GET", b))
+        # Swap back so cleanup (DEL on SELECT 0) can remove both keys.
+        self.cmd("SELECT", "0")
+        self.assertEqual(self.cmd("SWAPDB", "0", "1"), b"OK")
+        self.assertEqual(self.cmd("GET", a), b"db0")
+        self.cmd("SELECT", "1")
+        self.assertEqual(self.cmd("GET", b), b"db1")
+        self.cmd("DEL", b)
+        self.cmd("SELECT", "0")
+        with self.assertRaises(RedisError):
+            self.cmd("SWAPDB", "-1", "0")
+        with self.assertRaises(RedisError):
+            self.cmd("SWAPDB", "0", "999")
+
+        # Standalone ROLE reports master with offset and empty slave list.
+        role = self.cmd("ROLE")
+        self.assertEqual(role[0], b"master")
+        self.assertIsInstance(role[1], int)
+        self.assertEqual(role[2], [])
+
+        # Without replicas WAIT returns 0 immediately (including timeout 0).
+        self.cmd("SET", self.key("wait:probe"), "1")
+        self.assertEqual(self.cmd("WAIT", "1", "100"), 0)
+        self.assertEqual(self.cmd("WAIT", "0", "0"), 0)
+        with self.assertRaises(RedisError):
+            self.cmd("WAIT", "1", "not-a-timeout")
+
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__,
