@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp14
+# Redis for Windows 5.0.14.1-bp15
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp14`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp15`。
 
 ## 这个版本新增了什么
 
@@ -129,7 +129,7 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮新增 tracking CONFIG/INFO/MEMORY、BCAST+PREFIX、QUIT/SCRIPT HELP/COMMAND INFO 校验，并保留 bp13 的 `CLIENT TRACKING`（Pub/Sub 失效）及更早用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮补齐 LATENCY/MEMORY/SLOWLOG 可观测、DUMP/RESTORE 全选项、CLIENT REPLY/UNBLOCK、OBJECT/PUBSUB HELP 回归，并保留 bp14 tracking 收尾及更早用例。
 
 这轮验证不等于已合入上游全部安全补丁，也没有做生产压力测试。
 

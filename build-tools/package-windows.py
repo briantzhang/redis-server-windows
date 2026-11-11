@@ -8,7 +8,7 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '5.0.14.1-bp14'
+VERSION = '5.0.14.1-bp15'
 NAME = 'Redis-x64-' + VERSION
 DIST = ROOT / 'dist'
 PKG = DIST / NAME
@@ -91,7 +91,7 @@ if not exist data mkdir data
 "%~dp0redis-server.exe" "%~dp0redis.windows.conf" --dir "%~dp0data"
 popd
 ''', encoding='ascii', newline='\r\n')
-    (PKG/'README.md').write_text('''# Redis Windows 5.0.14.1-bp14
+    (PKG/'README.md').write_text('''# Redis Windows 5.0.14.1-bp15
 
 Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；关闭窗口或 Ctrl+C 停止。
 默认监听 127.0.0.1:6379，AOF 每秒同步，数据保存在同目录 data/。
@@ -142,6 +142,12 @@ Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；
   redis-cli.exe CLIENT TRACKING ON BCAST PREFIX cache:
   redis-cli.exe CONFIG GET tracking-table-max-keys
   redis-cli.exe INFO clients
+  redis-cli.exe LATENCY DOCTOR
+  redis-cli.exe MEMORY DOCTOR
+  redis-cli.exe DUMP key
+  redis-cli.exe CLIENT REPLY ON
+  redis-cli.exe OBJECT ENCODING key
+  redis-cli.exe PUBSUB HELP
   redis-cli.exe QUIT
   redis-cli.exe XINFO CONSUMERS mystream mygroup
 

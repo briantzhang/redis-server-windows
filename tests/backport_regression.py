@@ -2913,6 +2913,192 @@ class BackportRegression(unittest.TestCase):
         sock.close()
         self.assertEqual(self.cmd("PING"), b"PONG")
 
+    def test_ops_observability_helpers(self):
+        if self.server is None:
+            self.skipTest("ops observability tests require --server")
+
+        # Seed a latency sample: threshold is ms; DEBUG SLEEP uses seconds.
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "latency-monitor-threshold", "50"), b"OK")
+        self.cmd("DEBUG", "SLEEP", "0.15")
+        history = self.cmd("LATENCY", "HISTORY", "command")
+        self.assertIsInstance(history, list)
+        self.assertTrue(history)
+        latest = self.cmd("LATENCY", "LATEST")
+        self.assertIsInstance(latest, list)
+        self.assertTrue(any(row and row[0] == b"command" for row in latest))
+        graph = self.cmd("LATENCY", "GRAPH", "command")
+        self.assertIsInstance(graph, (bytes, bytearray))
+        self.assertIn(b"command", graph)
+        doctor = self.cmd("LATENCY", "DOCTOR")
+        self.assertIsInstance(doctor, (bytes, bytearray))
+        help_txt = b" ".join(self.cmd("LATENCY", "HELP")).lower()
+        self.assertIn(b"doctor", help_txt)
+        self.assertIn(b"graph", help_txt)
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "latency-monitor-threshold", "0"), b"OK")
+
+        mem_help = b" ".join(self.cmd("MEMORY", "HELP")).lower()
+        self.assertIn(b"stats", mem_help)
+        self.assertIn(b"doctor", mem_help)
+        doctor_mem = self.cmd("MEMORY", "DOCTOR")
+        self.assertIsInstance(doctor_mem, (bytes, bytearray))
+        self.assertTrue(len(doctor_mem) > 0)
+        malloc_stats = self.cmd("MEMORY", "MALLOC-STATS")
+        self.assertIsInstance(malloc_stats, (bytes, bytearray))
+        self.assertEqual(self.cmd("MEMORY", "PURGE"), b"OK")
+
+        slow_help = b" ".join(self.cmd("SLOWLOG", "HELP")).lower()
+        self.assertIn(b"get", slow_help)
+        self.assertEqual(self.cmd("CONFIG", "SET", "slowlog-log-slower-than", "1"),
+                         b"OK")
+        self.cmd("DEBUG", "SLEEP", "0.05")
+        self.assertGreaterEqual(self.cmd("SLOWLOG", "LEN"), 1)
+        entries = self.cmd("SLOWLOG", "GET", "1")
+        self.assertEqual(len(entries), 1)
+        # Raise the threshold before RESET so RESET itself is not re-logged.
+        self.assertEqual(self.cmd("CONFIG", "SET", "slowlog-log-slower-than",
+                                  "10000"), b"OK")
+        self.assertEqual(self.cmd("SLOWLOG", "RESET"), b"OK")
+        self.assertEqual(self.cmd("SLOWLOG", "LEN"), 0)
+
+        # RESETSTAT already covered by errorstats; keep a smoke check here.
+        self.assertEqual(self.cmd("CONFIG", "RESETSTAT"), b"OK")
+
+    def test_dump_restore_options(self):
+        src = self.key("dump:src")
+        dst = self.key("dump:dst")
+        occupied = self.key("dump:busy")
+        self.cmd("DEL", src, dst, occupied)
+        self.cmd("SET", src, "payload")
+        self.cmd("PEXPIRE", src, "60000")
+        dump = self.cmd("DUMP", src)
+        self.assertIsInstance(dump, (bytes, bytearray))
+        self.assertTrue(dump)
+
+        self.assertEqual(self.cmd("RESTORE", dst, "0", dump), b"OK")
+        self.assertEqual(self.cmd("GET", dst), b"payload")
+
+        self.cmd("SET", occupied, "old")
+        with self.assertRaises(RedisError):
+            self.cmd("RESTORE", occupied, "0", dump)
+        self.assertEqual(self.cmd("RESTORE", occupied, "0", dump, "REPLACE"),
+                         b"OK")
+        self.assertEqual(self.cmd("GET", occupied), b"payload")
+
+        # Absolute deadline in the past deletes immediately when ABSTTL is set.
+        past = self.now_ms() - 1000
+        gone = self.key("dump:past")
+        self.cmd("DEL", gone)
+        self.assertEqual(self.cmd("RESTORE", gone, str(past), dump, "ABSTTL"),
+                         b"OK")
+        self.assertEqual(self.cmd("EXISTS", gone), 0)
+
+        future = self.key("dump:future")
+        self.cmd("DEL", future)
+        deadline = self.now_ms() + 120000
+        self.assertEqual(
+            self.cmd("RESTORE", future, str(deadline), dump, "ABSTTL"), b"OK")
+        self.assert_ttl(future, low=1000, high=180000)
+
+        idle = self.key("dump:idle")
+        self.cmd("DEL", idle)
+        self.assertEqual(
+            self.cmd("RESTORE", idle, "0", dump, "IDLETIME", "7"), b"OK")
+        self.assertGreaterEqual(self.cmd("OBJECT", "IDLETIME", idle), 7)
+
+        with self.assertRaises(RedisError):
+            self.cmd("RESTORE", self.key("dump:bad"), "0", dump,
+                     "IDLETIME", "1", "FREQ", "1")
+        with self.assertRaises(RedisError):
+            self.cmd("RESTORE", self.key("dump:badfreq"), "0", dump,
+                     "FREQ", "999")
+
+    def test_client_reply_and_unblock(self):
+        if self.server is None:
+            self.skipTest("CLIENT REPLY/UNBLOCK tests require --server")
+
+        quiet = self.connect()
+        self.addCleanup(quiet.close)
+        # REPLY OFF itself produces no reply; send raw and probe with select.
+        quiet.sock.sendall(quiet.encode(("CLIENT", "REPLY", "OFF")))
+        time.sleep(0.05)
+        readable, _, _ = select.select([quiet.sock], [], [], 0.2)
+        self.assertEqual(readable, [])
+        quiet.sock.sendall(quiet.encode(("PING",)))
+        time.sleep(0.05)
+        readable, _, _ = select.select([quiet.sock], [], [], 0.2)
+        self.assertEqual(readable, [])
+        # ON restores replies and itself answers OK.
+        quiet.sock.sendall(quiet.encode(("CLIENT", "REPLY", "ON")))
+        self.assertEqual(quiet._read(), b"OK")
+        self.assertEqual(quiet.command("PING"), b"PONG")
+
+        skip = self.connect()
+        self.addCleanup(skip.close)
+        skip.sock.sendall(skip.encode(("CLIENT", "REPLY", "SKIP")))
+        time.sleep(0.05)
+        readable, _, _ = select.select([skip.sock], [], [], 0.2)
+        self.assertEqual(readable, [])
+        skip.sock.sendall(skip.encode(("PING",)))  # skipped
+        time.sleep(0.05)
+        readable, _, _ = select.select([skip.sock], [], [], 0.2)
+        self.assertEqual(readable, [])
+        self.assertEqual(skip.command("ECHO", "after-skip"), b"after-skip")
+
+        blocker = self.connect()
+        self.addCleanup(blocker.close)
+        blocker_id = blocker.command("CLIENT", "ID")
+        blkey = self.key("unblock:list")
+        self.cmd("DEL", blkey)
+        blocker.sock.sendall(blocker.encode(("BLPOP", blkey, "5")))
+        time.sleep(0.1)
+        self.assertEqual(self.cmd("CLIENT", "UNBLOCK", str(blocker_id)), 1)
+        self.assertIsNone(blocker._read())
+        self.assertEqual(self.cmd("CLIENT", "UNBLOCK", str(blocker_id)), 0)
+
+        blocker2 = self.connect()
+        self.addCleanup(blocker2.close)
+        blocker2_id = blocker2.command("CLIENT", "ID")
+        blocker2.sock.sendall(blocker2.encode(("BLPOP", blkey, "5")))
+        time.sleep(0.1)
+        self.assertEqual(
+            self.cmd("CLIENT", "UNBLOCK", str(blocker2_id), "ERROR"), 1)
+        err = blocker2._read()
+        self.assertIsInstance(err, RedisError)
+        self.assertIn("UNBLOCKED", str(err).upper())
+
+    def test_object_and_pubsub_help(self):
+        key = self.key("object:help")
+        self.cmd("SET", key, "v")
+        help_txt = b" ".join(self.cmd("OBJECT", "HELP")).lower()
+        self.assertIn(b"encoding", help_txt)
+        self.assertIn(b"idletime", help_txt)
+        self.assertEqual(self.cmd("OBJECT", "ENCODING", key), b"embstr")
+        self.assertGreaterEqual(self.cmd("OBJECT", "REFCOUNT", key), 1)
+        # Default maxmemory-policy is noeviction / allkeys-lru style without LFU,
+        # so FREQ should error while IDLETIME works.
+        with self.assertRaises(RedisError):
+            self.cmd("OBJECT", "FREQ", key)
+        self.assertGreaterEqual(self.cmd("OBJECT", "IDLETIME", key), 0)
+
+        pub_help = b" ".join(self.cmd("PUBSUB", "HELP")).lower()
+        self.assertIn(b"channels", pub_help)
+        self.assertIn(b"numsub", pub_help)
+        self.assertIn(b"shardchannels", pub_help)
+
+        if self.server is None:
+            return
+        sub = self.connect()
+        self.addCleanup(sub.close)
+        channel = self.key("pubsub:ch").decode("ascii")
+        self.assertEqual(sub.command("SUBSCRIBE", channel)[0], b"subscribe")
+        self.assertEqual(self.cmd("PUBSUB", "NUMSUB", channel),
+                         [channel.encode("ascii"), 1])
+        channels = self.cmd("PUBSUB", "CHANNELS", channel)
+        self.assertIn(channel.encode("ascii"), channels)
+        self.assertGreaterEqual(self.cmd("PUBSUB", "NUMPAT"), 0)
+
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__,

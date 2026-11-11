@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp14
+# Redis for Windows 5.0.14.1-bp15
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -122,7 +122,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。本轮新增 tracking CONFIG/INFO/MEMORY 统计、BCAST+PREFIX、`QUIT`/`SCRIPT HELP`/`COMMAND INFO` 校验，并保留 bp13 的 `CLIENT TRACKING`（Pub/Sub 失效）及更早用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。本轮补齐运维可观测与边角回归：LATENCY DOCTOR/GRAPH/LATEST/HISTORY、MEMORY DOCTOR/PURGE/MALLOC-STATS、SLOWLOG、DUMP/RESTORE 全选项、CLIENT REPLY/UNBLOCK、OBJECT/PUBSUB HELP；并保留 bp14 tracking 收尾及更早用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 
