@@ -278,6 +278,7 @@ struct redisCommand redisCommandTable[] = {
     {"reset",resetCommand,1,"as",0,NULL,0,0,0,0,0},
     {"ping",pingCommand,-1,"tF",0,NULL,0,0,0,0,0},
     {"echo",echoCommand,2,"F",0,NULL,0,0,0,0,0},
+    {"quit",quitCommand,-1,"stF",0,NULL,0,0,0,0,0},
     {"save",saveCommand,1,"as",0,NULL,0,0,0,0,0},
     {"bgsave",bgsaveCommand,-1,"as",0,NULL,0,0,0,0,0},
     {"bgrewriteaof",bgrewriteaofCommand,1,"as",0,NULL,0,0,0,0,0},
@@ -1846,7 +1847,7 @@ void initServerConfig(void) {
 
     /* Slow log */
     server.latency_tracking = 1;
-    server.tracking_table_max_keys = 1000000; /* Same default as Redis 6+. */
+    server.tracking_table_max_keys = CONFIG_DEFAULT_TRACKING_TABLE_MAX_KEYS;
     server.slowlog_log_slower_than = CONFIG_DEFAULT_SLOWLOG_LOG_SLOWER_THAN;
     server.slowlog_max_len = CONFIG_DEFAULT_SLOWLOG_MAX_LEN;
 
@@ -2788,16 +2789,6 @@ void call(client *c, int flags) {
 int processCommand(client *c) {
     moduleCallCommandFilters(c);
 
-    /* The QUIT command is handled separately. Normal command procs will
-     * go through checking for replication and QUIT will cause trouble
-     * when FORCE_REPLICATION is enabled and would be implemented in
-     * a regular command proc. */
-    if (!strcasecmp(c->argv[0]->ptr,"quit")) {
-        addReply(c,shared.ok);
-        c->flags |= CLIENT_CLOSE_AFTER_REPLY;
-        return C_ERR;
-    }
-
     /* Now lookup the command and check ASAP about trivial error conditions
      * such as wrong arity, bad command name and so forth. */
     c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
@@ -2822,13 +2813,15 @@ int processCommand(client *c) {
     /* Check if the user is authenticated. ACL is consulted only once a
      * user is attached; until then requirepass keeps its old meaning. */
     if (server.requirepass && !c->authenticated &&
-        c->cmd->proc != authCommand && c->cmd->proc != helloCommand)
+        c->cmd->proc != authCommand && c->cmd->proc != helloCommand &&
+        c->cmd->proc != quitCommand)
     {
         flagTransaction(c);
         addReply(c,shared.noautherr);
         return C_OK;
     }
     if (c->user && c->cmd->proc != authCommand && c->cmd->proc != helloCommand &&
+        c->cmd->proc != quitCommand &&
         ACLCheckCommand(c) == C_ERR) {
         flagTransaction(c);
         return C_OK;
@@ -2946,7 +2939,8 @@ int processCommand(client *c) {
         c->cmd->proc != punsubscribeCommand &&
         c->cmd->proc != ssubscribeCommand &&
         c->cmd->proc != sunsubscribeCommand &&
-        c->cmd->proc != resetCommand) {
+        c->cmd->proc != resetCommand &&
+        c->cmd->proc != quitCommand) {
         addReplyError(c,"only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET allowed in this context");
         return C_OK;
     }
@@ -3214,6 +3208,13 @@ void pingCommand(client *c) {
 
 void echoCommand(client *c) {
     addReplyBulk(c,c->argv[1]);
+}
+
+/* QUIT is a normal command so COMMAND/ACL can see it; closing happens after
+ * the OK reply is written. */
+void quitCommand(client *c) {
+    addReply(c,shared.ok);
+    c->flags |= CLIENT_CLOSE_AFTER_REPLY;
 }
 
 void timeCommand(client *c) {
@@ -3654,10 +3655,12 @@ sds genRedisInfoString(char *section) {
             "connected_clients:%Iu\r\n"                      WIN_PORT_FIX /* %lu -> %Iu */
             "client_recent_max_input_buffer:%Iu\r\n"         WIN_PORT_FIX /* %zu -> %Iu */
             "client_recent_max_output_buffer:%Iu\r\n"        WIN_PORT_FIX /* %zu -> %Iu */
-            "blocked_clients:%d\r\n",
+            "blocked_clients:%d\r\n"
+            "tracking_clients:%u\r\n",
             listLength(server.clients)-listLength(server.slaves),
             maxin, maxout,
-            server.blocked_clients);
+            server.blocked_clients,
+            server.tracking_clients);
     }
 
     /* Memory */
@@ -3897,7 +3900,10 @@ sds genRedisInfoString(char *section) {
             "active_defrag_hits:%lld\r\n"
             "active_defrag_misses:%lld\r\n"
             "active_defrag_key_hits:%lld\r\n"
-            "active_defrag_key_misses:%lld\r\n",
+            "active_defrag_key_misses:%lld\r\n"
+            "tracking_total_keys:%llu\r\n"
+            "tracking_total_items:%llu\r\n"
+            "tracking_total_prefixes:%llu\r\n",
             server.stat_numconnections,
             server.stat_numcommands,
             getInstantaneousMetric(STATS_METRIC_COMMAND),
@@ -3923,7 +3929,10 @@ sds genRedisInfoString(char *section) {
             server.stat_active_defrag_hits,
             server.stat_active_defrag_misses,
             server.stat_active_defrag_key_hits,
-            server.stat_active_defrag_key_misses);
+            server.stat_active_defrag_key_misses,
+            (unsigned long long) trackingGetTotalKeys(),
+            (unsigned long long) trackingGetTotalItems(),
+            (unsigned long long) trackingGetTotalPrefixes());
     }
 
     /* Replication */

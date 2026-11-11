@@ -792,6 +792,8 @@ void loadServerConfigFromString(char* config) {
             }
         } else if (!strcasecmp(argv[0],"slowlog-max-len") && argc == 2) {
             server.slowlog_max_len = (PORT_ULONG)(strtoll(argv[1],NULL,10));    WIN_PORT_FIX /* cast (PORT_ULONG) */
+        } else if (!strcasecmp(argv[0],"tracking-table-max-keys") && argc == 2) {
+            server.tracking_table_max_keys = (size_t)strtoll(argv[1],NULL,10);
         } else if (!strcasecmp(argv[0],"client-output-buffer-limit") &&
                    argc == 5)
         {
@@ -1336,6 +1338,9 @@ static int configSetOne(client *c, robj *nameobj, robj *o) {
     } config_set_numerical_field(
       "latency-monitor-threshold",server.latency_monitor_threshold,0,LLONG_MAX){
     } config_set_numerical_field(
+      "tracking-table-max-keys",ll,0,LLONG_MAX) {
+        server.tracking_table_max_keys = (size_t)ll;
+    } config_set_numerical_field(
       "repl-ping-slave-period",server.repl_ping_slave_period,1,INT_MAX) {
     } config_set_numerical_field(
       "repl-ping-replica-period",server.repl_ping_slave_period,1,INT_MAX) {
@@ -1589,6 +1594,8 @@ void configGetCommand(client *c) {
             server.latency_monitor_threshold);
     config_get_numerical_field("slowlog-max-len",
             server.slowlog_max_len);
+    config_get_numerical_field("tracking-table-max-keys",
+            server.tracking_table_max_keys);
     config_get_numerical_field("port",server.port);
     config_get_numerical_field("cluster-announce-port",server.cluster_announce_port);
     config_get_numerical_field("cluster-announce-bus-port",server.cluster_announce_bus_port);
@@ -2413,6 +2420,7 @@ int rewriteConfig(char *path) {
     rewriteConfigNumericalOption(state,"slowlog-log-slower-than",server.slowlog_log_slower_than,CONFIG_DEFAULT_SLOWLOG_LOG_SLOWER_THAN);
     rewriteConfigNumericalOption(state,"latency-monitor-threshold",server.latency_monitor_threshold,CONFIG_DEFAULT_LATENCY_MONITOR_THRESHOLD);
     rewriteConfigNumericalOption(state,"slowlog-max-len",server.slowlog_max_len,CONFIG_DEFAULT_SLOWLOG_MAX_LEN);
+    rewriteConfigNumericalOption(state,"tracking-table-max-keys",server.tracking_table_max_keys,CONFIG_DEFAULT_TRACKING_TABLE_MAX_KEYS);
     rewriteConfigNotifykeyspaceeventsOption(state);
     rewriteConfigNumericalOption(state,"hash-max-ziplist-entries",server.hash_max_ziplist_entries,OBJ_HASH_MAX_ZIPLIST_ENTRIES);
     rewriteConfigNumericalOption(state,"hash-max-ziplist-value",server.hash_max_ziplist_value,OBJ_HASH_MAX_ZIPLIST_VALUE);

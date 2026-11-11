@@ -2227,7 +2227,10 @@ class BackportRegression(unittest.TestCase):
         with self.connect() as victim:
             self.assertEqual(victim.command("PING"), b"PONG")
             self.assertEqual(self.cmd("CLIENT", "KILL", "MAXAGE", "99999"), 0)
-            self.assertEqual(self.cmd("CLIENT", "KILL", "MAXAGE", "0"), 1)
+            # MAXAGE 0 matches every other connection; count can include a
+            # peer that is already closing after KILL USER on Windows.
+            killed = self.cmd("CLIENT", "KILL", "MAXAGE", "0")
+            self.assertGreaterEqual(killed, 1)
             with self.assertRaises((OSError, EOFError)):
                 victim.command("PING")
         with self.assertRaises(RedisError):
@@ -2746,7 +2749,8 @@ class BackportRegression(unittest.TestCase):
                  "STREAMS", key, ">")
         rows = self.cmd("XINFO", "CONSUMERS", key, "g")
         consumer = self.flat_map(rows[0])
-        self.assertGreaterEqual(consumer[b"inactive"], consumer[b"idle"])
+        # Empty XREADGROUP refreshes idle only; allow 2ms Windows timer jitter.
+        self.assertGreaterEqual(consumer[b"inactive"] + 2, consumer[b"idle"])
 
         full = self.flat_map(self.cmd("XINFO", "STREAM", key, "FULL", "COUNT", "1"))
         group = self.flat_map(full[b"groups"][0])
@@ -2819,6 +2823,95 @@ class BackportRegression(unittest.TestCase):
 
         self.assertEqual(data.command("CLIENT", "TRACKING", "OFF"), b"OK")
         self.assertEqual(data.command("CLIENT", "GETREDIR"), -1)
+
+    def test_client_tracking_bcast_config_and_stats(self):
+        if self.server is None:
+            self.skipTest("CLIENT TRACKING BCAST test requires --server")
+
+        # CONFIG GET/SET for tracking-table-max-keys
+        self.assertEqual(
+            self.cmd("CONFIG", "GET", "tracking-table-max-keys"),
+            [b"tracking-table-max-keys", b"1000000"])
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "tracking-table-max-keys", "42"), b"OK")
+        self.assertEqual(
+            self.cmd("CONFIG", "GET", "tracking-table-max-keys"),
+            [b"tracking-table-max-keys", b"42"])
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "tracking-table-max-keys", "1000000"),
+            b"OK")
+
+        # BCAST + PREFIX invalidation via Pub/Sub redirect.
+        prefix = self.key("bcast:")
+        key = prefix + b"one"
+        self.cmd("DEL", key)
+
+        sub = self.connect()
+        self.addCleanup(sub.close)
+        redir_id = sub.command("CLIENT", "ID")
+        self.assertEqual(sub.command("SUBSCRIBE", "__redis__:invalidate")[0],
+                         b"subscribe")
+
+        data = self.connect()
+        self.addCleanup(data.close)
+        self.assertEqual(
+            data.command("CLIENT", "TRACKING", "ON", "BCAST",
+                         "PREFIX", prefix,
+                         "REDIRECT", str(redir_id)),
+            b"OK")
+
+        info = data.command("CLIENT", "TRACKINGINFO")
+        self.assertEqual(info[0], b"flags")
+        self.assertIn(b"on", info[1])
+        self.assertIn(b"bcast", info[1])
+
+        clients = self.cmd("INFO", "clients")
+        self.assertIn(b"tracking_clients:", clients)
+        self.assertRegex(clients, br"tracking_clients:[1-9]")
+
+        self.assertEqual(self.cmd("SET", key, "v1"), b"OK")
+        time.sleep(0.05)
+        msg = sub._read()
+        self.assertEqual(msg[0], b"message")
+        self.assertEqual(msg[1], b"__redis__:invalidate")
+        self.assertEqual(msg[2], [key])
+
+        stats = self.cmd("INFO", "stats")
+        self.assertIn(b"tracking_total_keys:", stats)
+        self.assertIn(b"tracking_total_items:", stats)
+        self.assertIn(b"tracking_total_prefixes:", stats)
+        self.assertRegex(stats, br"tracking_total_prefixes:[1-9]")
+
+        mem = self.flat_map(self.cmd("MEMORY", "STATS"))
+        self.assertIn(b"clients.tracking.table.keys", mem)
+        self.assertIn(b"clients.tracking.table.items", mem)
+        self.assertIn(b"clients.tracking.table.prefixes", mem)
+        self.assertGreaterEqual(mem[b"clients.tracking.table.prefixes"], 1)
+
+        clist = self.cmd("CLIENT", "LIST")
+        self.assertIn(b"flags=", clist)
+        self.assertRegex(clist, br"flags=[^\r\n]*t")
+
+        self.assertEqual(data.command("CLIENT", "TRACKING", "OFF"), b"OK")
+
+    def test_quit_script_help_and_command_info(self):
+        # QUIT is a registered command (COMMAND INFO / COUNT see it).
+        info = self.cmd("COMMAND", "INFO", "quit", "ping")
+        self.assertEqual(len(info), 2)
+        self.assertEqual(info[0][0], b"quit")
+        self.assertEqual(info[1][0], b"ping")
+
+        help_txt = self.cmd("SCRIPT", "HELP")
+        joined = b" ".join(help_txt).lower()
+        self.assertIn(b"flush", joined)
+        self.assertIn(b"load", joined)
+        self.assertIn(b"exists", joined)
+
+        # QUIT closes after OK; a fresh connection still works.
+        sock = self.connect()
+        self.assertEqual(sock.command("QUIT"), b"OK")
+        sock.close()
+        self.assertEqual(self.cmd("PING"), b"PONG")
 
 
 def parse_args(argv):

@@ -115,6 +115,7 @@ typedef PORT_LONGLONG ustime_t; /* microsecond time type. */
 #define AOF_READ_DIFF_INTERVAL_BYTES (1024*10)
 #define CONFIG_DEFAULT_SLOWLOG_LOG_SLOWER_THAN 10000
 #define CONFIG_DEFAULT_SLOWLOG_MAX_LEN 128
+#define CONFIG_DEFAULT_TRACKING_TABLE_MAX_KEYS 1000000
 #define CONFIG_DEFAULT_MAX_CLIENTS 10000
 #define CONFIG_AUTHPASS_MAX_LEN 512
 #define CONFIG_DEFAULT_SLAVE_PRIORITY 100
@@ -2100,6 +2101,7 @@ void resetCommand(client *c);
 void copyCommand(client *c);
 void pingCommand(client *c);
 void echoCommand(client *c);
+void quitCommand(client *c);
 void commandCommand(client *c);
 void setCommand(client *c);
 void setnxCommand(client *c);

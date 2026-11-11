@@ -1367,7 +1367,7 @@ NULL
     } else if (!strcasecmp(c->argv[1]->ptr,"stats") && c->argc == 2) {
         struct redisMemOverhead *mh = getMemoryOverheadData();
 
-        addReplyMultiBulkLen(c,(25+mh->num_dbs)*2);
+        addReplyMultiBulkLen(c,(28+mh->num_dbs)*2);
 
         addReplyBulkCString(c,"peak.allocated");
         addReplyLongLong(c,mh->peak_allocated);
@@ -1386,6 +1386,15 @@ NULL
 
         addReplyBulkCString(c,"clients.normal");
         addReplyLongLong(c,mh->clients_normal);
+
+        addReplyBulkCString(c,"clients.tracking.table.keys");
+        addReplyLongLong(c,(PORT_LONGLONG)trackingGetTotalKeys());
+
+        addReplyBulkCString(c,"clients.tracking.table.items");
+        addReplyLongLong(c,(PORT_LONGLONG)trackingGetTotalItems());
+
+        addReplyBulkCString(c,"clients.tracking.table.prefixes");
+        addReplyLongLong(c,(PORT_LONGLONG)trackingGetTotalPrefixes());
 
         addReplyBulkCString(c,"aof.buffer");
         addReplyLongLong(c,mh->aof_buffer);
