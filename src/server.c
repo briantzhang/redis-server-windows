@@ -273,6 +273,7 @@ struct redisCommand redisCommandTable[] = {
     {"scan",scanCommand,-2,"rR",0,NULL,0,0,0,0,0},
     {"dbsize",dbsizeCommand,1,"rF",0,NULL,0,0,0,0,0},
     {"auth",authCommand,-2,"sltMF",0,NULL,0,0,0,0,0},
+    {"hello",helloCommand,-1,"sltF",0,NULL,0,0,0,0,0},
     {"acl",aclCommand,-2,"as",0,NULL,0,0,0,0,0},
     {"reset",resetCommand,1,"as",0,NULL,0,0,0,0,0},
     {"ping",pingCommand,-1,"tF",0,NULL,0,0,0,0,0},
@@ -2799,13 +2800,15 @@ int processCommand(client *c) {
 
     /* Check if the user is authenticated. ACL is consulted only once a
      * user is attached; until then requirepass keeps its old meaning. */
-    if (server.requirepass && !c->authenticated && c->cmd->proc != authCommand)
+    if (server.requirepass && !c->authenticated &&
+        c->cmd->proc != authCommand && c->cmd->proc != helloCommand)
     {
         flagTransaction(c);
         addReply(c,shared.noautherr);
         return C_OK;
     }
-    if (c->user && c->cmd->proc != authCommand && ACLCheckCommand(c) == C_ERR) {
+    if (c->user && c->cmd->proc != authCommand && c->cmd->proc != helloCommand &&
+        ACLCheckCommand(c) == C_ERR) {
         flagTransaction(c);
         return C_OK;
     }
@@ -2949,6 +2952,7 @@ int processCommand(client *c) {
     /* Lua script too slow? Only allow a limited number of commands. */
     if (server.lua_timedout &&
           c->cmd->proc != authCommand &&
+          c->cmd->proc != helloCommand &&
           c->cmd->proc != replconfCommand &&
         !(c->cmd->proc == shutdownCommand &&
           c->argc == 2 &&

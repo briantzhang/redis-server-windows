@@ -1200,6 +1200,9 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
                 serverPanic("NACK half-created. Should not be possible.");
             }
 
+            /* Successful delivery: refresh inactive clock (Redis 7.2). */
+            consumer->active_time = mstime();
+
             /* Propagate as XCLAIM. */
             if (spi) {
                 robj *idarg = createObjectFromStreamID(&id);
@@ -1998,6 +2001,8 @@ streamConsumer *streamLookupConsumer(streamCG *cg, sds name, int flags) {
         consumer = zmalloc(sizeof(*consumer));
         consumer->name = sdsdup(name);
         consumer->pel = raxNew();
+        consumer->active_time = -1; /* No successful delivery yet. */
+        consumer->seen_time = mstime();
         raxInsert(cg->consumers,(unsigned char*)name,sdslen(name),
                   consumer,NULL);
     }
@@ -2732,6 +2737,7 @@ void xclaimCommand(client *c) {
                 if (!emitted) addReply(c,shared.nullbulk);
             }
             arraylen++;
+            consumer->active_time = mstime();
 
             /* Propagate this change. */
             streamPropagateXCLAIM(c,c->argv[1],group,c->argv[2],c->argv[j],nack);
@@ -2895,6 +2901,7 @@ void xautoclaimCommand(client *c) {
             if (!emitted) addReply(c,shared.nullbulk);
         }
     }
+    if (claimed_num) consumer->active_time = mstime();
     addReplyMultiBulkLen(c,deleted_num);
     for (j = 0; j < deleted_num; j++) addReplyStreamID(c,&deleted[j]);
 
@@ -3237,11 +3244,13 @@ static void xinfoReplyWithStreamInfo(client *c, stream *s) {
             while (raxNext(&ci)) {
                 streamConsumer *consumer = ci.data;
 
-                addReplyMultiBulkLen(c,4*2);
+                addReplyMultiBulkLen(c,5*2);
                 addReplyBulkCString(c,"name");
                 addReplyBulkCBuffer(c,consumer->name,sdslen(consumer->name));
                 addReplyBulkCString(c,"seen-time");
                 addReplyLongLong(c,consumer->seen_time);
+                addReplyBulkCString(c,"active-time");
+                addReplyLongLong(c,consumer->active_time);
                 addReplyBulkCString(c,"pel-count");
                 addReplyLongLong(c,raxSize(consumer->pel));
 
@@ -3329,13 +3338,23 @@ NULL
             mstime_t idle = now - consumer->seen_time;
             if (idle < 0) idle = 0;
 
-            addReplyMultiBulkLen(c,6);
+            mstime_t inactive;
+            if (consumer->active_time == -1) {
+                inactive = -1;
+            } else {
+                inactive = now - consumer->active_time;
+                if (inactive < 0) inactive = 0;
+            }
+
+            addReplyMultiBulkLen(c,8);
             addReplyBulkCString(c,"name");
             addReplyBulkCBuffer(c,consumer->name,sdslen(consumer->name));
             addReplyBulkCString(c,"pending");
             addReplyLongLong(c,raxSize(consumer->pel));
             addReplyBulkCString(c,"idle");
             addReplyLongLong(c,idle);
+            addReplyBulkCString(c,"inactive");
+            addReplyLongLong(c,inactive);
         }
         raxStop(&ri);
     } else if (!strcasecmp(opt,"GROUPS") && c->argc == 3) {

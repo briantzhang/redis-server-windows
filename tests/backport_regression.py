@@ -2645,6 +2645,114 @@ class BackportRegression(unittest.TestCase):
         self.addCleanup(rotated.close)
         self.assertEqual(rotated.command("PING"), b"PONG")
 
+    def test_scan_type_filter(self):
+        skey = self.key("scan:type:str")
+        hkey = self.key("scan:type:hash")
+        lkey = self.key("scan:type:list")
+        pattern = self.prefix + b"scan:type:*"
+        self.cmd("DEL", skey, hkey, lkey)
+        self.cmd("SET", skey, "v")
+        self.cmd("HSET", hkey, "f", "1")
+        self.cmd("LPUSH", lkey, "x")
+
+        def scan_all(typ=None):
+            cursor = b"0"
+            found = set()
+            for _ in range(1000):
+                args = ["SCAN", cursor, "MATCH", pattern, "COUNT", "100"]
+                if typ is not None:
+                    args.extend(["TYPE", typ])
+                cursor, keys = self.cmd(*args)
+                found.update(keys)
+                if cursor in (b"0", 0):
+                    break
+            return found
+
+        self.assertEqual(scan_all("string"), {skey})
+        self.assertEqual(scan_all("hash"), {hkey})
+        self.assertEqual(scan_all("list"), {lkey})
+        self.assertEqual(scan_all("nosuchtype"), set())
+        with self.assertRaises(RedisError):
+            self.cmd("HSCAN", hkey, "0", "TYPE", "string")
+
+    def test_hello_resp2(self):
+        reply = self.cmd("HELLO")
+        info = self.flat_map(reply)
+        self.assertEqual(info[b"server"], b"redis")
+        self.assertIn(b"bp1", info[b"version"])
+        self.assertEqual(info[b"proto"], 2)
+        self.assertEqual(info[b"mode"], b"standalone")
+        self.assertEqual(info[b"role"], b"master")
+        self.assertEqual(info[b"modules"], [])
+        self.assertIn(b"id", info)
+
+        reply2 = self.cmd("HELLO", "2", "SETNAME", "bp12-client")
+        info2 = self.flat_map(reply2)
+        self.assertEqual(info2[b"proto"], 2)
+        self.assertEqual(self.cmd("CLIENT", "GETNAME"), b"bp12-client")
+
+        with self.assertRaises(RedisError) as ctx:
+            self.cmd("HELLO", "3")
+        self.assertIn("NOPROTO", str(ctx.exception))
+
+        if self.server is None:
+            return
+        directory = Path(self.temp.name) / "hello-auth"
+        directory.mkdir()
+        guarded = ManagedServer(OPTIONS.server, directory, OPTIONS.timeout,
+                                OPTIONS.startup_timeout, requirepass="secret")
+        self.addCleanup(guarded.close)
+        guarded.start()
+        raw = RESP2("127.0.0.1", guarded.port, OPTIONS.timeout)
+        self.addCleanup(raw.close)
+        with self.assertRaises(RedisError):
+            raw.command("HELLO", "2")
+        hello = raw.command("HELLO", "2", "AUTH", "default", "secret",
+                            "SETNAME", "authed")
+        mapped = self.flat_map(hello)
+        self.assertEqual(mapped[b"proto"], 2)
+        self.assertEqual(raw.command("PING"), b"PONG")
+        self.assertEqual(raw.command("CLIENT", "GETNAME"), b"authed")
+        with self.assertRaises(RedisError):
+            raw.command("HELLO", "2", "AUTH", "default", "wrong")
+
+    def test_xinfo_consumers_inactive(self):
+        key = self.key("xinfo:inactive")
+        self.cmd("DEL", key)
+        self.cmd("XADD", key, "1-0", "f", "1")
+        self.cmd("XGROUP", "CREATE", key, "g", "0")
+
+        # Creating a consumer without delivering updates idle; inactive stays -1.
+        self.cmd("XGROUP", "CREATECONSUMER", key, "g", "c1")
+        rows = self.cmd("XINFO", "CONSUMERS", key, "g")
+        self.assertEqual(len(rows), 1)
+        consumer = self.flat_map(rows[0])
+        self.assertEqual(consumer[b"name"], b"c1")
+        self.assertEqual(consumer[b"pending"], 0)
+        self.assertGreaterEqual(consumer[b"idle"], 0)
+        self.assertEqual(consumer[b"inactive"], -1)
+
+        self.cmd("XREADGROUP", "GROUP", "g", "c1", "COUNT", "1",
+                 "STREAMS", key, ">")
+        rows = self.cmd("XINFO", "CONSUMERS", key, "g")
+        consumer = self.flat_map(rows[0])
+        self.assertEqual(consumer[b"pending"], 1)
+        self.assertGreaterEqual(consumer[b"inactive"], 0)
+
+        # An empty read refreshes idle (seen_time) but not inactive.
+        time.sleep(0.05)
+        self.cmd("XREADGROUP", "GROUP", "g", "c1", "COUNT", "1",
+                 "STREAMS", key, ">")
+        rows = self.cmd("XINFO", "CONSUMERS", key, "g")
+        consumer = self.flat_map(rows[0])
+        self.assertGreaterEqual(consumer[b"inactive"], consumer[b"idle"])
+
+        full = self.flat_map(self.cmd("XINFO", "STREAM", key, "FULL", "COUNT", "1"))
+        group = self.flat_map(full[b"groups"][0])
+        cfull = self.flat_map(group[b"consumers"][0])
+        self.assertIn(b"active-time", cfull)
+        self.assertGreater(cfull[b"active-time"], 0)
+
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__,

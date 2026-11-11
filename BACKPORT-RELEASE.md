@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp11
+# Redis for Windows 5.0.14.1-bp12
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -71,6 +71,9 @@
 | `COMMAND DOCS [command ...]` | 7.0 | 返回命令文档字段（summary/since/group/arguments）；数据来自 `help.h`，未知命令名被跳过 |
 | `ZRANK` / `ZREVRANK` 的 `WITHSCORE` | 7.2 | 在排名后附带该成员分数；成员或键缺失时返回空数组 |
 | `ACL HELP` | 6.0 | 列出 ACL 子命令；与 `ACL WHOAMI` 一样对已认证用户放行 |
+| `SCAN ... TYPE type` | 6.0 | 键空间扫描可按类型过滤；未知类型名返回空页，不报错 |
+| `HELLO [protover [AUTH user pass] [SETNAME name]]` | 6.0 | 握手；只接受协议 2，拒绝 3；回复为 RESP2 扁平字段数组 |
+| `XINFO CONSUMERS` 的 `inactive` | 7.2 | 距上次成功投递的毫秒；尚未成功投递为 -1；`idle` 仍按上次尝试交互 |
 
 ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并提供 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN`、`ACL LOG` 与 `ACL SAVE`/`ACL LOAD`。没有 Redis 7 的多选择器，也没有按键的读写权限位。频道规则已经生效：`&pattern` 按通配符匹配字面频道，`PSUBSCRIBE` 要求与 ACL 模式字面一致，`allchannels` 放行全部频道；新建用户默认 `resetchannels`，`default` 用户默认 `allchannels`。`requirepass` 成为 `default` 用户的口令，设置后未认证连接被拒绝，`CONFIG SET requirepass` 会同步更新该用户；不设置时连接以 `default` 用户进入。`ACL WHOAMI` 对任何已认证用户放行。删除用户或从 ACL 文件移除用户时，仍以该用户认证的连接会被断开，避免悬空指针。脚本里调用的命令、键与频道同样受调用者权限约束。
 
@@ -86,6 +89,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 - 不迁入新版 RDB 格式、多段 AOF、RESP3、线程 I/O、TLS、Functions 或集群功能。ACL 只做到 Redis 6 的单权限集，没有 Redis 7 的选择器。`COMMAND DOCS` 用 `help.h` 的扁平字段近似上游文档图，不含完整参数树与 complexity/history。原底座已有功能保留，但本版没有对其做现代化升级。
 - 没有实现 Redis 7 的客户端内存驱逐（`maxmemory-clients`）。`CLIENT NO-EVICT` 只为客户端兼容而接受并记录标志，内存压力下不会据此保留连接。
 - `WAITAOF` 没有 7.2 的异步 fsync 完成队列：开启 AOF 时在命令内调用 `flushAppendOnlyFile` 并 `fsync`，然后立即返回；`numreplicas` 只做参数校验，回复中的副本数恒为 0，不阻塞到超时。
+- `XINFO CONSUMERS` 的 `inactive`/`active_time` 是运行时数据，不写入本版 RDB：快照恢复后 `inactive` 回到 -1，直到再次成功投递。
 - 命令延迟直方图是运行时数据，不写入 RDB/AOF；使用固定的对数桶而不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界。
 - `SCRIPT FLUSH ASYNC` 只接受选项，脚本缓存仍同步清空；本版没有异步释放脚本缓存的线程。
 - 网络/IOCP、Windows 服务与 fork 模拟层沿用底座代码。
@@ -114,7 +118,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-10 在 Windows 11、MSVC 14.44（v143）上跑完 69 项全部通过，包括本轮新增的 `COMMAND DOCS`、`ZRANK`/`ZREVRANK WITHSCORE`、`ACL HELP`/`WHOAMI`，以及此前各轮的延迟直方图与 `INFO latencystats`、ACL 频道权限、脚本内 ACL、`SCRIPT FLUSH ASYNC`/`SYNC`、ACL LOG、ACL 文件、`CLIENT SETINFO`、`XGROUP ENTRIESREAD`、`INFO errorstats`、分片 Pub/Sub、GEOSEARCH、CLIENT KILL、WAITAOF、有序集合运算、COPY、多键弹出、流命令和 AOF 计数保留用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。2026-11-10 在 Windows 11、MSVC 14.44（v143）上跑完 72 项全部通过，包括本轮新增的 `SCAN TYPE`、`HELLO`（仅 RESP2）、`XINFO CONSUMERS inactive`，以及此前各轮的 COMMAND DOCS、ZRANK WITHSCORE、延迟直方图、ACL、流命令和 AOF 计数保留用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 

@@ -2054,6 +2054,8 @@ uint64_t redisBuildId(void);
 /* Commands prototypes */
 int time_independent_strcmp(char *a, char *b);
 void authCommand(client *c);
+int ACLAuthenticateUser(client *c, robj *username, robj *password);
+void helloCommand(client *c);
 void aclCommand(client *c);
 void ACLInit(void);
 void *ACLDefaultUser(void);

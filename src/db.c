@@ -659,6 +659,7 @@ static robj *dupCollectionObject(robj *src) {
                                             SLC_NOREFRESH);
                     streamNACK *nn = streamCreateNACK(nc);
                     nc->seen_time = oc->seen_time;
+                    nc->active_time = oc->active_time;
                     nn->delivery_time = nack->delivery_time;
                     nn->delivery_count = nack->delivery_count;
                     raxInsert(ncg->pel, pi.key, pi.key_len, nn, NULL);
@@ -862,6 +863,18 @@ int parseScanCursorOrReply(client *c, robj *o, PORT_ULONG *cursor) {
  *
  * In the case of a Hash object the function returns both the field and value
  * of every element on the Hash. */
+/* Map a SCAN TYPE name to an object type. Unknown names return -1 so the
+ * scan still runs but yields an empty page (Redis 6/7 behaviour before 8.0). */
+static int scanObjectTypeByName(char *name) {
+    if (!strcasecmp(name,"string")) return OBJ_STRING;
+    if (!strcasecmp(name,"list")) return OBJ_LIST;
+    if (!strcasecmp(name,"set")) return OBJ_SET;
+    if (!strcasecmp(name,"zset")) return OBJ_ZSET;
+    if (!strcasecmp(name,"hash")) return OBJ_HASH;
+    if (!strcasecmp(name,"stream")) return OBJ_STREAM;
+    return -1;
+}
+
 void scanGenericCommand(client *c, robj *o, PORT_ULONG cursor) {
     int i, j;
     list *keys = listCreate();
@@ -869,6 +882,8 @@ void scanGenericCommand(client *c, robj *o, PORT_ULONG cursor) {
     PORT_LONG count = 10;
     sds pat = NULL;
     int patlen = 0, use_pattern = 0;
+    int typefilter = 0;          /* True when TYPE was requested (keys only). */
+    int typematch = -1;          /* Desired OBJ_* value, or -1 if unknown. */
     dict *ht;
 
     /* Object must be NULL (to iterate keys names), or the type of the object
@@ -903,6 +918,11 @@ void scanGenericCommand(client *c, robj *o, PORT_ULONG cursor) {
              * equivalent to disabling it. */
             use_pattern = !(pat[0] == '*' && patlen == 1);
 
+            i += 2;
+        } else if (!strcasecmp(c->argv[i]->ptr, "type") && o == NULL && j >= 2) {
+            /* TYPE is only valid on SCAN (database keys), not HSCAN/SSCAN/ZSCAN. */
+            typefilter = 1;
+            typematch = scanObjectTypeByName(c->argv[i+1]->ptr);
             i += 2;
         } else {
             addReply(c,shared.syntaxerr);
@@ -1000,6 +1020,14 @@ void scanGenericCommand(client *c, robj *o, PORT_ULONG cursor) {
 
         /* Filter element if it is an expired key. */
         if (!filter && o == NULL && expireIfNeeded(c->db, kobj)) filter = 1;
+
+        /* Filter by TYPE when scanning the keyspace. Unknown type names match
+         * nothing; LOOKUP_NOTOUCH keeps LRU/LFU unchanged. */
+        if (!filter && o == NULL && typefilter) {
+            robj *check = lookupKeyReadWithFlags(c->db, kobj, LOOKUP_NOTOUCH);
+            if (check == NULL || typematch < 0 || (int)check->type != typematch)
+                filter = 1;
+        }
 
         /* Remove the element and its associted value if needed. */
         if (filter) {

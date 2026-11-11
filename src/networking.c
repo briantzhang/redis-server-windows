@@ -2285,6 +2285,111 @@ NULL
     }
 }
 
+/* HELLO [protover [AUTH username password] [SETNAME name]]
+ *
+ * Handshake used by modern clients. This build only speaks RESP2, so protocol
+ * 2 is accepted and protocol 3 is rejected with NOPROTO. The reply is a flat
+ * RESP2 field/value array (not a RESP3 map). AUTH reuses the same ACL check as
+ * the AUTH command; SETNAME follows CLIENT SETNAME charset rules. */
+void helloCommand(client *c) {
+    PORT_LONGLONG ver = 0;
+    int next_arg = 1;
+    robj *username = NULL;
+    robj *password = NULL;
+    robj *clientname = NULL;
+    int j;
+
+    if (c->argc >= 2) {
+        if (getLongLongFromObjectOrReply(c, c->argv[next_arg++], &ver,
+            "Protocol version is not an integer or out of range") != C_OK) {
+            return;
+        }
+        if (ver == 3) {
+            addReplyError(c,"-NOPROTO unsupported protocol version");
+            return;
+        }
+        if (ver != 2) {
+            addReplyError(c,"-NOPROTO unsupported protocol version");
+            return;
+        }
+    }
+
+    for (j = next_arg; j < c->argc; j++) {
+        int moreargs = (c->argc-1) - j;
+        const char *opt = c->argv[j]->ptr;
+        if (!strcasecmp(opt,"AUTH") && moreargs >= 2) {
+            username = c->argv[j+1];
+            password = c->argv[j+2];
+            j += 2;
+        } else if (!strcasecmp(opt,"SETNAME") && moreargs >= 1) {
+            clientname = c->argv[j+1];
+            j++;
+        } else {
+            addReplyErrorFormat(c,"Syntax error in HELLO option '%s'",opt);
+            return;
+        }
+    }
+
+    if (username && password) {
+        if (ACLAuthenticateUser(c, username, password) != C_OK) {
+            addReplyError(c,"WRONGPASS invalid username-password pair or user is disabled.");
+            return;
+        }
+    }
+
+    /* Without requirepass the connection already acts as the default user, so
+     * HELLO may proceed even though authenticated stays 0 until AUTH is used.
+     * With requirepass, HELLO must either authenticate here or follow AUTH. */
+    if (server.requirepass && !c->authenticated) {
+        addReplyError(c,"-NOAUTH HELLO must be called with the client already "
+                        "authenticated, otherwise the HELLO <proto> AUTH <user> <pass> "
+                        "option can be used to authenticate the client and "
+                        "select the RESP protocol version at the same time");
+        return;
+    }
+
+    if (clientname) {
+        int len = (int)sdslen(clientname->ptr);                                   WIN_PORT_FIX /* cast (int) */
+        char *p = clientname->ptr;
+        int k;
+        if (len == 0) {
+            if (c->name) decrRefCount(c->name);
+            c->name = NULL;
+        } else {
+            for (k = 0; k < len; k++) {
+                if (p[k] < '!' || p[k] > '~') {
+                    addReplyError(c,
+                        "Client names cannot contain spaces, "
+                        "newlines or special characters.");
+                    return;
+                }
+            }
+            if (c->name) decrRefCount(c->name);
+            c->name = clientname;
+            incrRefCount(c->name);
+        }
+    }
+
+    /* Flat field/value array: server, version, proto, id, mode, role, modules. */
+    addReplyMultiBulkLen(c,14);
+    addReplyBulkCString(c,"server");
+    addReplyBulkCString(c,"redis");
+    addReplyBulkCString(c,"version");
+    addReplyBulkCString(c,REDIS_VERSION);
+    addReplyBulkCString(c,"proto");
+    addReplyLongLong(c,2);
+    addReplyBulkCString(c,"id");
+    addReplyLongLong(c,c->id);
+    addReplyBulkCString(c,"mode");
+    if (server.sentinel_mode) addReplyBulkCString(c,"sentinel");
+    else if (server.cluster_enabled) addReplyBulkCString(c,"cluster");
+    else addReplyBulkCString(c,"standalone");
+    addReplyBulkCString(c,"role");
+    addReplyBulkCString(c,server.masterhost ? "replica" : "master");
+    addReplyBulkCString(c,"modules");
+    addReplyMultiBulkLen(c,0);
+}
+
 /* This callback is bound to POST and "Host:" command names. Those are not
  * really commands, but are used in security attacks in order to talk to
  * Redis instances via HTTP, with a technique called "cross protocol scripting"

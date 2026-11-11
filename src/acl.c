@@ -429,31 +429,48 @@ int ACLCheckChannelPermissionsQuiet(client *c) {
     return ACLCheckChannelPermissionsInternal(c,0);
 }
 
+/* Authenticate the client as username/password. On success attaches the user
+ * and marks the connection authenticated. On failure clears auth state, logs
+ * the denial, and returns C_ERR without sending a reply (caller chooses the
+ * error text so AUTH and HELLO can keep their own messages). */
+int ACLAuthenticateUser(client *c, robj *username, robj *password) {
+    const char *userstr = username->ptr;
+    user *u = ACLGetUser((sds)userstr);
+    size_t pwlen = sdslen(password->ptr);
+
+    if (u == NULL || !(u->flags & USER_ENABLED) ||
+        ACLCheckPassword(u, password->ptr, pwlen) != C_OK) {
+        ACLAddLogEntry(c,ACL_DENIED_AUTH,0,userstr);
+        c->authenticated = 0;
+        c->user = NULL;
+        return C_ERR;
+    }
+    c->authenticated = 1;
+    c->user = u;
+    return C_OK;
+}
+
 void authCommand(client *c) {
-    user *u;
-    const char *username, *password;
+    robj *username, *password;
+    robj *default_user = NULL;
     if (c->argc > 3) {
         addReplyError(c,"wrong number of arguments for 'auth' command");
         return;
     }
     if (c->argc == 2) {
-        username = "default";
-        password = c->argv[1]->ptr;
+        default_user = createStringObject("default",7);
+        username = default_user;
+        password = c->argv[1];
     } else {
-        username = c->argv[1]->ptr;
-        password = c->argv[2]->ptr;
+        username = c->argv[1];
+        password = c->argv[2];
     }
-    u = ACLGetUser((sds)username);
-    if (u == NULL || !(u->flags & USER_ENABLED) ||
-        ACLCheckPassword(u, password, strlen(password)) != C_OK) {
-        ACLAddLogEntry(c,ACL_DENIED_AUTH,0,username);
-        c->authenticated = 0;
-        c->user = NULL;
+    if (ACLAuthenticateUser(c, username, password) != C_OK) {
         addReplyError(c,"invalid username-password pair or user is disabled");
+        if (default_user) decrRefCount(default_user);
         return;
     }
-    c->authenticated = 1;
-    c->user = u;
+    if (default_user) decrRefCount(default_user);
     addReply(c, shared.ok);
 }
 

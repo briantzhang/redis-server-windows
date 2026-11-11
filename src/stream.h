@@ -69,7 +69,12 @@ typedef struct streamCG {
 
 /* A specific consumer in a consumer group.  */
 typedef struct streamConsumer {
-    mstime_t seen_time;         /* Last time this consumer was active. */
+    mstime_t seen_time;         /* Last attempted interaction (XREADGROUP/
+                                   XCLAIM/XAUTOCLAIM). Drives idle. */
+    mstime_t active_time;       /* Last successful delivery of an entry to
+                                   this consumer. Drives inactive; -1 until
+                                   the first success. Not stored in this
+                                   build's RDB format. */
     sds name;                   /* Consumer name. This is how the consumer
                                    will be identified in the consumer group
                                    protocol. Case sensitive. */
