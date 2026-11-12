@@ -155,6 +155,7 @@ static int aeApiAddEvent(aeEventLoop *eventLoop, int fd, int mask) {
         return -1;
     }
 
+    iocpSockLock(sockstate);
     if (mask & AE_READABLE) {
         sockstate->masks |= AE_READABLE;
         if ((sockstate->masks & CONNECT_PENDING) == 0) {
@@ -181,6 +182,7 @@ static int aeApiAddEvent(aeEventLoop *eventLoop, int fd, int mask) {
                                                &areq->ov) == 0) {
                     errno = GetLastError();
                     FreeMemoryNoCOW(areq);
+                    iocpSockUnlock(sockstate);
                     return -1;
                 }
                 sockstate->wreqs++;
@@ -188,6 +190,7 @@ static int aeApiAddEvent(aeEventLoop *eventLoop, int fd, int mask) {
             }
         }
     }
+    iocpSockUnlock(sockstate);
     return 0;
 }
 
@@ -199,8 +202,10 @@ static void aeApiDelEvent(aeEventLoop *eventLoop, int fd, int mask) {
         return;
     }
 
+    iocpSockLock(sockstate);
     if (mask & AE_READABLE) sockstate->masks &= ~AE_READABLE;
     if (mask & AE_WRITABLE) sockstate->masks &= ~AE_WRITABLE;
+    iocpSockUnlock(sockstate);
 }
 
 /* Apply one thread's batch of completions. Each completion belongs to
@@ -223,6 +228,7 @@ static void aeIocpApplyCompletions(aeEventLoop *eventLoop, aeApiState *state,
                 continue;
             }
 
+            iocpSockLock(sockstate);
             if ((sockstate->masks & CLOSE_PENDING) == FALSE) {
                 if ((sockstate->masks & LISTEN_SOCK) && entry->lpOverlapped != NULL) {
                     // Need to set event for listening
@@ -302,9 +308,11 @@ static void aeIocpApplyCompletions(aeEventLoop *eventLoop, aeApiState *state,
                     sockstate->masks &= ~(CLOSE_PENDING);
                     if (WSIOCP_CloseSocketState(sockstate)) {
                         FDAPI_ClearSocketInfo(rfd);
+                        sockstate = NULL;
                     }
                 }
             }
+            iocpSockUnlock(sockstate);
         }
     batch->numevents = numevents;
     (void) eventLoop;

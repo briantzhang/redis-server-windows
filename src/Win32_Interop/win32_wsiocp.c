@@ -57,6 +57,8 @@ iocpSockState* WSIOCP_GetSocketState(int fd) {
             *socketState = (iocpSockState *) CallocMemoryNoCOW(sizeof(iocpSockState));
             if (*socketState != NULL) {
                 (*socketState)->fd = fd;
+                InitializeCriticalSection(&(*socketState)->lock);
+                (*socketState)->lockReady = 1;
             }
         }
         return *socketState;
@@ -65,10 +67,22 @@ iocpSockState* WSIOCP_GetSocketState(int fd) {
 
 /* Closes the socket state or sets the CLOSE_PENDING mask bit.
  * Returns TRUE if closed, FALSE if pending. */
+void iocpSockLock(iocpSockState *state) {
+    if (state != NULL && state->lockReady) EnterCriticalSection(&state->lock);
+}
+
+void iocpSockUnlock(iocpSockState *state) {
+    if (state != NULL && state->lockReady) LeaveCriticalSection(&state->lock);
+}
+
 BOOL WSIOCP_CloseSocketState(iocpSockState* socketState) {
     socketState->masks &= ~(SOCKET_ATTACHED | AE_WRITABLE | AE_READABLE);
     if (socketState->wreqs == 0 &&
         (socketState->masks & (READ_QUEUED | CONNECT_PENDING)) == 0) {
+        if (socketState->lockReady) {
+            socketState->lockReady = 0;
+            DeleteCriticalSection(&socketState->lock);
+        }
         FreeMemoryNoCOW(socketState);
         return TRUE;
     } else {
@@ -89,8 +103,10 @@ int WSIOCP_SocketAttach(int fd, iocpSockState *socketState) {
 
     if (iocph != NULL && socketState != NULL) {
         if (FDAPI_SocketAttachIOCP(fd, iocph)) {
+            iocpSockLock(socketState);
             socketState->masks = SOCKET_ATTACHED;
             socketState->wreqs = 0;
+            iocpSockUnlock(socketState);
             return 0;
         }
     } else {
@@ -126,7 +142,9 @@ int WSIOCP_QueueAccept(int listenfd) {
         return -1;
     }
 
+    iocpSockLock(accsockstate);
     accsockstate->masks = SOCKET_ATTACHED;
+    iocpSockUnlock(accsockstate);
     // Keep accept socket in buf len until accepted
     areq = (aacceptreq *) CallocMemoryNoCOW(sizeof(aacceptreq));
     areq->buf = CallocMemoryNoCOW(ACCEPTEX_ADDRESS_BUFFER_SIZE * 2);
@@ -138,12 +156,17 @@ int WSIOCP_QueueAccept(int listenfd) {
                             ACCEPTEX_ADDRESS_BUFFER_SIZE,
                             ACCEPTEX_ADDRESS_BUFFER_SIZE,
                             &bytes, &areq->ov);
+    iocpSockLock(sockstate);
     if (SUCCEEDED_WITH_IOCP(result)){
         sockstate->masks |= ACCEPT_PENDING;
+        iocpSockUnlock(sockstate);
     } else {
         errno = FDAPI_WSAGetLastError();
         sockstate->masks &= ~ACCEPT_PENDING;
+        iocpSockUnlock(sockstate);
+        iocpSockLock(accsockstate);
         accsockstate->masks = 0;
+        iocpSockUnlock(accsockstate);
         close(acceptfd);
         FreeMemoryNoCOW(areq->buf);
         FreeMemoryNoCOW(areq);
@@ -165,7 +188,9 @@ int WSIOCP_Listen(int rfd, int backlog) {
         return SOCKET_ERROR;
     }
 
+    iocpSockLock(sockstate);
     sockstate->masks |= LISTEN_SOCK;
+    iocpSockUnlock(sockstate);
 
     if (listen(rfd, backlog) != 0) {
         return SOCKET_ERROR;
@@ -194,13 +219,16 @@ int WSIOCP_Accept(int fd, struct sockaddr *sa, socklen_t *len) {
         return SOCKET_ERROR;
     }
 
+    iocpSockLock(sockstate);
     areq = sockstate->reqs;
     if (areq == NULL) {
+        iocpSockUnlock(sockstate);
         errno = EWOULDBLOCK;
         return SOCKET_ERROR;
     }
 
     sockstate->reqs = areq->next;
+    iocpSockUnlock(sockstate);
 
     acceptfd = (int) areq->accept;
 
@@ -258,7 +286,9 @@ int WSIOCP_QueueNextRead(int fd) {
         errno = WSAEINVAL;
         return -1;
     }
+    iocpSockLock(sockstate);
     if ((sockstate->masks & SOCKET_ATTACHED) == 0) {
+        iocpSockUnlock(sockstate);
         return 0;
     }
 
@@ -277,9 +307,11 @@ int WSIOCP_QueueNextRead(int fd) {
                            NULL);
     if (SUCCEEDED_WITH_IOCP(result == 0)){
         sockstate->masks |= READ_QUEUED;
+        iocpSockUnlock(sockstate);
     } else {
         errno = FDAPI_WSAGetLastError();
         sockstate->masks &= ~READ_QUEUED;
+        iocpSockUnlock(sockstate);
         return -1;
     }
     return 0;
@@ -296,16 +328,20 @@ int WSIOCP_SocketSend(int fd, char *buf, int len, void *eventLoop,
     DWORD bytesSent = 0;
 
     sockstate = WSIOCP_GetSocketState(fd);
+    if (sockstate != NULL) iocpSockLock(sockstate);
 
     if (sockstate != NULL &&
         (sockstate->masks & CONNECT_PENDING)) {
+        iocpSockUnlock(sockstate);
         aeWait(fd, AE_WRITABLE, 50);
+        iocpSockLock(sockstate);
     }
 
     // If not an async socket, do normal send
     if (sockstate == NULL ||
         (sockstate->masks & SOCKET_ATTACHED) == 0 ||
         proc == NULL) {
+        if (sockstate != NULL) iocpSockUnlock(sockstate);
         result = (int) write(fd, buf, len);
         if (result == SOCKET_ERROR) {
             errno = FDAPI_WSAGetLastError();
@@ -336,8 +372,10 @@ int WSIOCP_SocketSend(int fd, char *buf, int len, void *eventLoop,
         errno = WSA_IO_PENDING;
         sockstate->wreqs++;
         listAddNodeTail(&sockstate->wreqlist, areq);
+        iocpSockUnlock(sockstate);
     } else {
         errno = FDAPI_WSAGetLastError();
+        iocpSockUnlock(sockstate);
         FreeMemoryNoCOW(areq);
     }
     return SOCKET_ERROR;
@@ -410,7 +448,9 @@ int WSIOCP_SocketConnect(int fd, const SOCKADDR_STORAGE *socketAddrStorage) {
         result = FDAPI_WSAGetLastError();
         if (result == ERROR_IO_PENDING) {
             errno = WSA_IO_PENDING;
+            iocpSockLock(sockstate);
             sockstate->masks |= CONNECT_PENDING;
+            iocpSockUnlock(sockstate);
         } else {
             errno = result;
             return SOCKET_ERROR;
@@ -474,7 +514,9 @@ int WSIOCP_SocketConnectBind(int fd, const SOCKADDR_STORAGE *socketAddrStorage, 
         result = FDAPI_WSAGetLastError();
         if (result == ERROR_IO_PENDING) {
             errno = WSA_IO_PENDING;
+            iocpSockLock(sockstate);
             sockstate->masks |= CONNECT_PENDING;
+            iocpSockUnlock(sockstate);
         } else {
             errno = result;
             return SOCKET_ERROR;

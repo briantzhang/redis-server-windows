@@ -58,7 +58,16 @@ typedef struct iocpSockState {
     OVERLAPPED ov_read;
     list wreqlist;
     int unknownComplete;
+    /* Guards masks, reqs, wreqs, wreqlist and unknownComplete. The main
+     * thread posts reads and writes while IO threads retire completions,
+     * and both touch this state. ov_read is only reused once its completion
+     * has been retired, so it needs no separate protection. */
+    CRITICAL_SECTION lock;
+    int lockReady;
 } iocpSockState;
+
+void iocpSockLock(iocpSockState *state);
+void iocpSockUnlock(iocpSockState *state);
 
 #define READ_QUEUED         0x000100
 #define SOCKET_ATTACHED     0x000400
