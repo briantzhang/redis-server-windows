@@ -255,11 +255,6 @@ int ACLSetUser(user *u, const char *op) {
         u->flags &= ~USER_ALLKEYS;
         return C_OK;
     }
-    /* Pub/Sub channel permissions do not exist in this build, but accept the
-     * Redis 6 syntax so ACL files written by other versions still load. */
-    if (op[0] == '&' || !strcasecmp(op,"allchannels") ||
-        !strcasecmp(op,"resetchannels"))
-        return C_OK;
     return C_ERR;
 }
 

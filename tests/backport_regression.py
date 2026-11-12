@@ -2593,6 +2593,17 @@ class BackportRegression(unittest.TestCase):
         default = self.flat_map(self.cmd("ACL", "GETUSER", "default"))
         self.assertEqual(default[b"channels"], [b"&*"])
 
+        # A channel pattern after allchannels has no effect until the channel
+        # rules are reset, so Redis rejects it. Resetting clears the patterns.
+        self.assertEqual(self.cmd("ACL", "SETUSER", "bp17pub", "on",
+                                  "allchannels"), b"OK")
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "SETUSER", "bp17pub", "&news:*")
+        self.assertEqual(self.cmd("ACL", "SETUSER", "bp17pub",
+                                  "resetchannels", "&news:*"), b"OK")
+        reset = self.flat_map(self.cmd("ACL", "GETUSER", "bp17pub"))
+        self.assertEqual(reset[b"channels"], [b"&news:*"])
+
     def test_script_flush_options(self):
         sha = self.cmd("SCRIPT", "LOAD", "return 1")
         self.assertEqual(self.cmd("SCRIPT", "EXISTS", sha), [1])
