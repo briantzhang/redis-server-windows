@@ -29,6 +29,11 @@
 #define MAX_COMPLETE_PER_POLL   100
 #define MAX_SOCKET_LOOKUP       65535
 
+/* Extra threads blocked on the same completion port. Completions are
+ * delivered to exactly one waiter, so each thread owns the socket state of
+ * the operations it dequeues. Zero keeps the original single-threaded loop. */
+#define IOCP_IO_THREADS         3
+
 /* Use GetQueuedCompletionStatusEx if possible.
  * Try to load the function pointer dynamically.
  * If it is not available, use GetQueuedCompletionStatus */
@@ -41,11 +46,26 @@ typedef BOOL(WINAPI *sGetQueuedCompletionStatusEx)
             BOOL fAlertable);
 sGetQueuedCompletionStatusEx pGetQueuedCompletionStatusEx;
 
+typedef struct aeApiState aeApiState;
+static void aeIocpStartWorkers(aeEventLoop *eventLoop, aeApiState *state);
+
+/* One batch of completions dequeued by a single thread. */
+typedef struct aeIocpBatch {
+    OVERLAPPED_ENTRY entries[MAX_COMPLETE_PER_POLL];
+    aeFiredEvent fired[MAX_COMPLETE_PER_POLL];
+    int numevents;
+    int error;
+} aeIocpBatch;
+
 /* Structure that keeps state of sockets and Completion port handle */
 typedef struct aeApiState {
     HANDLE iocp;
     int setsize;
-    OVERLAPPED_ENTRY entries[MAX_COMPLETE_PER_POLL];
+    aeIocpBatch mainBatch;
+    HANDLE ioThreads[IOCP_IO_THREADS];
+    aeIocpBatch *ioBatches[IOCP_IO_THREADS];
+    LONG ioBatchLock[IOCP_IO_THREADS];
+    volatile LONG ioStop;
 } aeApiState;
 
 /* Find matching value in list and remove. If found return TRUE */
@@ -72,11 +92,13 @@ static int aeApiCreate(aeEventLoop *eventLoop) {
 
     if (!state) return -1;
 
-    // Create a single IOCP to be shared by all sockets
+    // Share one IOCP between the event loop and the IO threads.
+    // A concurrency of 0 lets the system run one active thread per core;
+    // the previous value of 1 throttled every completion onto one thread.
     state->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE,
                                          NULL,
                                          0,
-                                         1);
+                                         0);
     if (state->iocp == NULL) {
         FreeMemoryNoCOW(state);
         return -1;
@@ -93,6 +115,7 @@ static int aeApiCreate(aeEventLoop *eventLoop) {
     state->setsize = eventLoop->setsize;
     eventLoop->apidata = state;
     WSIOCP_Init(state->iocp);
+    aeIocpStartWorkers(eventLoop, state);
     return 0;
 }
 
@@ -104,6 +127,21 @@ static int aeApiResize(aeEventLoop *eventLoop, int setsize) {
 /* Termination */
 static void aeApiFree(aeEventLoop *eventLoop) {
     aeApiState *state = (aeApiState *) eventLoop->apidata;
+    int slot;
+
+    state->ioStop = 1;
+    for (slot = 0; slot < IOCP_IO_THREADS; slot++) {
+        if (state->ioThreads[slot] != NULL)
+            PostQueuedCompletionStatus(state->iocp, 0, 0, NULL);
+    }
+    for (slot = 0; slot < IOCP_IO_THREADS; slot++) {
+        if (state->ioThreads[slot] != NULL) {
+            WaitForSingleObject(state->ioThreads[slot], 2000);
+            CloseHandle(state->ioThreads[slot]);
+        }
+        if (state->ioBatches[slot] != NULL)
+            FreeMemoryNoCOW(state->ioBatches[slot]);
+    }
     CloseHandle(state->iocp);
     FreeMemoryNoCOW(state);
     WSIOCP_Cleanup();
@@ -165,59 +203,19 @@ static void aeApiDelEvent(aeEventLoop *eventLoop, int fd, int mask) {
     if (mask & AE_WRITABLE) sockstate->masks &= ~AE_WRITABLE;
 }
 
-/* Return array of sockets that are ready for read or write
- * depending on the mask for each socket */
-static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
-    aeApiState *state = (aeApiState *) eventLoop->apidata;
-    iocpSockState *sockstate;
+/* Apply one thread's batch of completions. Each completion belongs to
+ * exactly one waiter, and a socket has only one read and a serial chain of
+ * writes outstanding, so the socket state touched here is not shared with
+ * another thread. Ready sockets are recorded in the batch, not in the event
+ * loop, because several threads finish batches at once. */
+static void aeIocpApplyCompletions(aeEventLoop *eventLoop, aeApiState *state,
+                                   aeIocpBatch *batch, ULONG numComplete) {
     ULONG j;
+    iocpSockState *sockstate;
     int numevents = 0;
-    ULONG numComplete = 0;
-    BOOL rc;
-    int mswait = (tvp == NULL) ? 100 : (tvp->tv_sec * 1000) + (tvp->tv_usec / 1000);
+    LPOVERLAPPED_ENTRY entry = batch->entries;
 
-    if (pGetQueuedCompletionStatusEx != NULL) {
-        // First get an array of completion notifications
-        rc = pGetQueuedCompletionStatusEx(state->iocp,
-                                          state->entries,
-                                          MAX_COMPLETE_PER_POLL,
-                                          &numComplete,
-                                          mswait,
-                                          FALSE);
-    } else {
-        // Need to get one at a time. Use first array element
-        rc = GetQueuedCompletionStatus(state->iocp,
-                                       &state->entries[0].dwNumberOfBytesTransferred,
-                                       &state->entries[0].lpCompletionKey,
-                                       &state->entries[0].lpOverlapped,
-                                       mswait);
-        if (!rc && state->entries[0].lpOverlapped == NULL) {
-            // Timeout. Return.
-            return 0;
-        } else {
-            // Check if more completions are ready
-            BOOL lrc = TRUE;
-            rc = TRUE;
-            numComplete = 1;
-
-            while (numComplete < MAX_COMPLETE_PER_POLL) {
-                lrc = GetQueuedCompletionStatus(state->iocp,
-                                                &state->entries[numComplete].dwNumberOfBytesTransferred,
-                                                &state->entries[numComplete].lpCompletionKey,
-                                                &state->entries[numComplete].lpOverlapped,
-                                                0);
-                if (lrc) {
-                    numComplete++;
-                } else {
-                    if (state->entries[numComplete].lpOverlapped == NULL) break;
-                }
-            }
-        }
-    }
-
-    if (rc && numComplete > 0) {
-        LPOVERLAPPED_ENTRY entry = state->entries;
-        for (j = 0; j < numComplete && numevents < state->setsize; j++, entry++) {
+    for (j = 0; j < numComplete && numevents < MAX_COMPLETE_PER_POLL; j++, entry++) {
             // The competion key is the rfd identifying the socket 
             int rfd = (int) entry->lpCompletionKey;
             sockstate = WSIOCP_GetExistingSocketState(rfd);
@@ -233,8 +231,8 @@ static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
                     sockstate->reqs = areq;
                     sockstate->masks &= ~ACCEPT_PENDING;
                     if (sockstate->masks & AE_READABLE) {
-                        eventLoop->fired[numevents].fd = rfd;
-                        eventLoop->fired[numevents].mask = AE_READABLE;
+                        batch->fired[numevents].fd = rfd;
+                        batch->fired[numevents].mask = AE_READABLE;
                         numevents++;
                     }
                 } else if (sockstate->masks & CONNECT_PENDING) {
@@ -251,8 +249,8 @@ static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
                         matched = TRUE;
                         sockstate->masks &= ~READ_QUEUED;
                         if (sockstate->masks & AE_READABLE) {
-                            eventLoop->fired[numevents].fd = rfd;
-                            eventLoop->fired[numevents].mask = AE_READABLE;
+                            batch->fired[numevents].fd = rfd;
+                            batch->fired[numevents].mask = AE_READABLE;
                             numevents++;
                         }
                     } else if (sockstate->wreqs > 0 && entry->lpOverlapped != NULL) {
@@ -271,8 +269,8 @@ static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
                             FreeMemoryNoCOW(areq);
                             // If no active write requests, set ready to write
                             if (sockstate->wreqs == 0 && sockstate->masks & AE_WRITABLE) {
-                                eventLoop->fired[numevents].fd = rfd;
-                                eventLoop->fired[numevents].mask = AE_WRITABLE;
+                                batch->fired[numevents].fd = rfd;
+                                batch->fired[numevents].mask = AE_WRITABLE;
                                 numevents++;
                             }
                         }
@@ -307,6 +305,135 @@ static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
                     }
                 }
             }
+        }
+    batch->numevents = numevents;
+    (void) eventLoop;
+    (void) state;
+}
+
+/* Dequeue one batch. A zero wait returns whatever is already queued. */
+static ULONG aeIocpDequeue(aeApiState *state, aeIocpBatch *batch, int mswait) {
+    ULONG numComplete = 0;
+    BOOL rc;
+
+    if (pGetQueuedCompletionStatusEx != NULL) {
+        rc = pGetQueuedCompletionStatusEx(state->iocp,
+                                          batch->entries,
+                                          MAX_COMPLETE_PER_POLL,
+                                          &numComplete,
+                                          mswait,
+                                          FALSE);
+        return rc ? numComplete : 0;
+    }
+
+    rc = GetQueuedCompletionStatus(state->iocp,
+                                   &batch->entries[0].dwNumberOfBytesTransferred,
+                                   &batch->entries[0].lpCompletionKey,
+                                   &batch->entries[0].lpOverlapped,
+                                   mswait);
+    if (!rc && batch->entries[0].lpOverlapped == NULL) return 0;
+
+    numComplete = 1;
+    while (numComplete < MAX_COMPLETE_PER_POLL) {
+        BOOL lrc = GetQueuedCompletionStatus(state->iocp,
+                        &batch->entries[numComplete].dwNumberOfBytesTransferred,
+                        &batch->entries[numComplete].lpCompletionKey,
+                        &batch->entries[numComplete].lpOverlapped,
+                        0);
+        if (!lrc && batch->entries[numComplete].lpOverlapped == NULL) break;
+        numComplete++;
+    }
+    return numComplete;
+}
+
+/* Hand a worker batch to the event loop. The worker blocks until the loop
+ * has copied it out, so the batch storage is never reused early. */
+static void aeIocpPublishBatch(aeApiState *state, int slot) {
+    aeIocpBatch *batch = state->ioBatches[slot];
+    if (batch->numevents == 0 && batch->error == 0) return;
+    while (InterlockedCompareExchange(&state->ioBatchLock[slot], 1, 0) != 0) {
+        if (state->ioStop) return;
+        Sleep(1);
+    }
+}
+
+static DWORD WINAPI aeIocpWorker(LPVOID arg);
+
+static void aeIocpStartWorkers(aeEventLoop *eventLoop, aeApiState *state) {
+    int slot;
+    for (slot = 0; slot < IOCP_IO_THREADS; slot++) {
+        state->ioBatches[slot] = (aeIocpBatch *) CallocMemoryNoCOW(sizeof(aeIocpBatch));
+        if (state->ioBatches[slot] == NULL) {
+            state->ioStop = 1;
+            return;
+        }
+        state->ioThreads[slot] = CreateThread(NULL, 0, aeIocpWorker,
+                                              eventLoop, 0, NULL);
+        if (state->ioThreads[slot] == NULL) {
+            state->ioStop = 1;
+            return;
+        }
+    }
+}
+
+static DWORD WINAPI aeIocpWorker(LPVOID arg) {
+    aeEventLoop *eventLoop = (aeEventLoop *) arg;
+    aeApiState *state = (aeApiState *) eventLoop->apidata;
+    int slot;
+
+    for (slot = 0; slot < IOCP_IO_THREADS; slot++) {
+        if (state->ioThreads[slot] == GetCurrentThread()) break;
+    }
+    if (slot == IOCP_IO_THREADS) return 0;
+
+    while (!state->ioStop) {
+        aeIocpBatch *batch = state->ioBatches[slot];
+        ULONG numComplete = aeIocpDequeue(state, batch, 100);
+        if (numComplete == 0) continue;
+        batch->numevents = 0;
+        batch->error = 0;
+        aeIocpApplyCompletions(eventLoop, state, batch, numComplete);
+        aeIocpPublishBatch(state, slot);
+    }
+    return 0;
+}
+
+/* Return array of sockets that are ready for read or write
+ * depending on the mask for each socket */
+static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
+    aeApiState *state = (aeApiState *) eventLoop->apidata;
+    int numevents = 0;
+    int mswait = (tvp == NULL) ? 100 : (tvp->tv_sec * 1000) + (tvp->tv_usec / 1000);
+    ULONG numComplete;
+    int slot;
+
+    /* Take the completions the worker threads finished since last poll. */
+    for (slot = 0; slot < IOCP_IO_THREADS && numevents < state->setsize; slot++) {
+        aeIocpBatch *batch = state->ioBatches[slot];
+        int i;
+        if (batch == NULL) continue;
+        if (InterlockedCompareExchange(&state->ioBatchLock[slot], 0, 1) != 1)
+            continue;
+        for (i = 0; i < batch->numevents && numevents < state->setsize; i++) {
+            eventLoop->fired[numevents].fd = batch->fired[i].fd;
+            eventLoop->fired[numevents].mask = batch->fired[i].mask;
+            numevents++;
+        }
+        batch->numevents = 0;
+    }
+
+    /* A full batch from the workers needs no extra wait. */
+    if (numevents > 0) mswait = 0;
+
+    numComplete = aeIocpDequeue(state, &state->mainBatch, mswait);
+    if (numComplete > 0) {
+        int i;
+        state->mainBatch.numevents = 0;
+        aeIocpApplyCompletions(eventLoop, state, &state->mainBatch, numComplete);
+        for (i = 0; i < state->mainBatch.numevents && numevents < state->setsize; i++) {
+            eventLoop->fired[numevents].fd = state->mainBatch.fired[i].fd;
+            eventLoop->fired[numevents].mask = state->mainBatch.fired[i].mask;
+            numevents++;
         }
     }
     return numevents;

@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp17
+# Redis for Windows 5.0.14.1-bp18
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -91,7 +91,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 - 成功的带 TTL 的 SET 在 AOF 中记录为普通 SET + 绝对 PEXPIREAT；KEEPTTL 记录实际保留的截止时间。
 - GETEX 的写入记录为 PEXPIREAT、PERSIST 或 DEL/UNLINK；GETDEL 记录为 DEL。
 - 条件过期仅记录成功结果的绝对截止时间，恢复时不重新判断 NX/XX/GT/LT。
-- 不迁入新版 RDB 格式、多段 AOF、RESP3、线程 I/O、TLS、Functions 或集群功能。ACL 只做到 Redis 6 的单权限集，没有 Redis 7 的选择器。`COMMAND DOCS` 用 `help.h` 的扁平字段近似上游文档图，不含完整参数树与 complexity/history。原底座已有功能保留，但本版没有对其做现代化升级。
+- 不迁入新版 RDB 格式、多段 AOF、RESP3、TLS、Functions 或集群功能。网络收发由多个 IO 线程分担，命令解析与执行仍在主线程。ACL 只做到 Redis 6 的单权限集，没有 Redis 7 的选择器。`COMMAND DOCS` 用 `help.h` 的扁平字段近似上游文档图，不含完整参数树与 complexity/history。原底座已有功能保留，但本版没有对其做现代化升级。
 - 没有实现 Redis 7 的客户端内存驱逐（`maxmemory-clients`）。`CLIENT NO-EVICT` 只为客户端兼容而接受并记录标志，内存压力下不会据此保留连接。
 - `WAITAOF` 没有 7.2 的异步 fsync 完成队列：开启 AOF 时在命令内调用 `flushAppendOnlyFile` 并 `fsync`，然后立即返回；`numreplicas` 只做参数校验，回复中的副本数恒为 0，不阻塞到超时。
 - `XINFO CONSUMERS` 的 `inactive`/`active_time` 是运行时数据，不写入本版 RDB：快照恢复后 `inactive` 回到 -1，直到再次成功投递。
@@ -123,7 +123,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。本轮去掉 ACL 频道规则的重复处理并补回归；并保留 bp16 及更早用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。本轮把网络收发放到多个 IO 线程；并保留 bp17 及更早用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 

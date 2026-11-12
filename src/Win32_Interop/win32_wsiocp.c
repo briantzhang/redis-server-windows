@@ -494,9 +494,12 @@ void WSIOCP_Cleanup() {
 
 static HANDLE privateheap;
 
+/* The heap is touched from the main thread and from the IO completion
+ * threads, so it must be serialized. HEAP_NO_SERIALIZE would corrupt it
+ * as soon as a second thread posts or completes an overlapped request. */
 void* CallocMemoryNoCOW(size_t size) {
     if (!privateheap) {
-        privateheap = HeapCreate(HEAP_GENERATE_EXCEPTIONS | HEAP_NO_SERIALIZE, 0, 0);
+        privateheap = HeapCreate(HEAP_GENERATE_EXCEPTIONS, 0, 0);
     }
     return HeapAlloc(privateheap, HEAP_ZERO_MEMORY, size);
 }
