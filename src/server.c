@@ -1508,6 +1508,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Handle writes with pending output buffers. */
     handleClientsWithPendingWrites();
 
+    /* Drop the largest clients once their buffers pass maxmemory-clients. */
+    evictClients();
+
     /* Client-side caching: broadcast BCAST invalidations and trim table. */
     trackingBroadcastInvalidationMessages();
     trackingLimitUsedSlots();
@@ -1683,6 +1686,8 @@ void initServerConfig(void) {
     server.active_defrag_max_scan_fields = CONFIG_DEFAULT_DEFRAG_MAX_SCAN_FIELDS;
     server.proto_max_bulk_len = CONFIG_DEFAULT_PROTO_MAX_BULK_LEN;
     server.client_max_querybuf_len = PROTO_MAX_QUERYBUF_LEN;
+    server.maxmemory_clients = 0;
+    server.stat_evictedclients = 0;
     server.saveparams = NULL;
     server.loading = 0;
     server.logfile = zstrdup(CONFIG_DEFAULT_LOGFILE);
@@ -3656,11 +3661,15 @@ sds genRedisInfoString(char *section) {
             "client_recent_max_input_buffer:%Iu\r\n"         WIN_PORT_FIX /* %zu -> %Iu */
             "client_recent_max_output_buffer:%Iu\r\n"        WIN_PORT_FIX /* %zu -> %Iu */
             "blocked_clients:%d\r\n"
-            "tracking_clients:%u\r\n",
+            "tracking_clients:%u\r\n"
+            "maxmemory_clients:%Iu\r\n"
+            "evicted_clients:%llu\r\n",
             listLength(server.clients)-listLength(server.slaves),
             maxin, maxout,
             server.blocked_clients,
-            server.tracking_clients);
+            server.tracking_clients,
+            server.maxmemory_clients,
+            (PORT_ULONGLONG) server.stat_evictedclients);
     }
 
     /* Memory */

@@ -2715,6 +2715,60 @@ PORT_ULONG getClientOutputBufferMemoryUsage(client *c) {
     return c->reply_bytes + (list_item_size*listLength(c->reply));
 }
 
+/* Memory held for one client: the pending reply, the query being read and
+ * the parsed argument vector. Replicas, masters and monitors are accounted
+ * elsewhere and are never candidates for client eviction. */
+PORT_ULONG getClientMemoryUsage(client *c) {
+    PORT_ULONG usage = getClientOutputBufferMemoryUsage(c);
+    if (c->querybuf) usage += sdsAllocSize(c->querybuf);
+    usage += (PORT_ULONG)(c->argc * sizeof(robj *));
+    return usage;
+}
+
+/* Drop the largest evictable clients until client buffers fit under
+ * maxmemory-clients. Connections flagged CLIENT_NO_EVICT, and the replica,
+ * master and monitor connections, are kept. Returns the number dropped. */
+int evictClients(void) {
+    PORT_ULONG total = 0;
+    int evicted = 0;
+    listIter li;
+    listNode *ln;
+
+    if (server.maxmemory_clients == 0) return 0;
+
+    listRewind(server.clients,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        client *c = listNodeValue(ln);
+        if (c->flags & (CLIENT_SLAVE|CLIENT_MASTER|CLIENT_MONITOR)) continue;
+        total += getClientMemoryUsage(c);
+    }
+    if (total <= server.maxmemory_clients) return 0;
+
+    while (total > server.maxmemory_clients) {
+        client *worst = NULL;
+        PORT_ULONG worstUsage = 0;
+
+        listRewind(server.clients,&li);
+        while ((ln = listNext(&li)) != NULL) {
+            client *c = listNodeValue(ln);
+            PORT_ULONG usage;
+            if (c->flags & (CLIENT_SLAVE|CLIENT_MASTER|CLIENT_MONITOR|
+                            CLIENT_NO_EVICT|CLIENT_CLOSE_ASAP)) continue;
+            usage = getClientMemoryUsage(c);
+            if (usage > worstUsage) {
+                worst = c;
+                worstUsage = usage;
+            }
+        }
+        if (worst == NULL) break;
+        total -= worstUsage;
+        freeClientAsync(worst);
+        evicted++;
+    }
+    server.stat_evictedclients += evicted;
+    return evicted;
+}
+
 /* Get the class of a client, used in order to enforce limits to different
  * classes of clients.
  *

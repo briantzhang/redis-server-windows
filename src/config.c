@@ -376,6 +376,12 @@ void loadServerConfigFromString(char* config) {
             }
         } else if (!strcasecmp(argv[0],"maxmemory") && argc == 2) {
             server.maxmemory = memtoll(argv[1],NULL);
+        } else if (!strcasecmp(argv[0],"maxmemory-clients") && argc == 2) {
+            PORT_LONGLONG bytes = memtoll(argv[1],NULL);
+            if (bytes < 0) {
+                err = "maxmemory-clients must not be negative"; goto loaderr;
+            }
+            server.maxmemory_clients = (PORT_ULONG) bytes;
         } else if (!strcasecmp(argv[0],"maxmemory-policy") && argc == 2) {
             server.maxmemory_policy =
                 configEnumGetValue(maxmemory_policy_enum,argv[1]);
@@ -1397,6 +1403,8 @@ static int configSetOne(client *c, robj *nameobj, robj *o) {
 
     /* Memory fields.
      * config_set_memory_field(name,var) */
+    } config_set_memory_field("maxmemory-clients",server.maxmemory_clients,0,PORT_LONG_MAX) {
+        evictClients();
     } config_set_memory_field("maxmemory",server.maxmemory,0,PORT_LONG_MAX) {
         if (server.maxmemory) {
             if (server.maxmemory < zmalloc_used_memory()) {
@@ -1551,6 +1559,7 @@ void configGetCommand(client *c) {
 
     /* Numerical values */
     config_get_numerical_field("maxmemory",server.maxmemory);
+    config_get_numerical_field("maxmemory-clients",server.maxmemory_clients);
     config_get_numerical_field("proto-max-bulk-len",server.proto_max_bulk_len);
     config_get_numerical_field("client-query-buffer-limit",server.client_max_querybuf_len);
     config_get_numerical_field("maxmemory-samples",server.maxmemory_samples);
@@ -2391,6 +2400,7 @@ int rewriteConfig(char *path) {
     rewriteConfigNumericalOption(state,"acllog-max-len",server.acllog_max_len,128);
     rewriteConfigNumericalOption(state,"maxclients",server.maxclients,CONFIG_DEFAULT_MAX_CLIENTS);
     rewriteConfigBytesOption(state,"maxmemory",server.maxmemory,CONFIG_DEFAULT_MAXMEMORY);
+    rewriteConfigBytesOption(state,"maxmemory-clients",server.maxmemory_clients,0);
     rewriteConfigBytesOption(state,"proto-max-bulk-len",server.proto_max_bulk_len,CONFIG_DEFAULT_PROTO_MAX_BULK_LEN);
     rewriteConfigBytesOption(state,"client-query-buffer-limit",server.client_max_querybuf_len,PROTO_MAX_QUERYBUF_LEN);
     rewriteConfigEnumOption(state,"maxmemory-policy",server.maxmemory_policy,maxmemory_policy_enum,CONFIG_DEFAULT_MAXMEMORY_POLICY);

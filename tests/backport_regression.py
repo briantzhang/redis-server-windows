@@ -1517,6 +1517,34 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("RESET"), b"OK")
         self.assertNotIn(b"flags=e", self.cmd("CLIENT", "LIST"))
 
+        # maxmemory-clients drops the connection holding the biggest buffer
+        # and keeps one that opted out with CLIENT NO-EVICT. The limit is set
+        # from a connection that has itself opted out, so it survives.
+        self.assertEqual(self.cmd("CLIENT", "NO-EVICT", "on"), b"OK")
+        admin = self.connect()
+        self.addCleanup(admin.close)
+        self.assertEqual(admin.command("CLIENT", "NO-EVICT", "on"), b"OK")
+        self.assertEqual(admin.command("CONFIG", "SET", "maxmemory-clients",
+                                       "1048576"), b"OK")
+        kept = self.connect()
+        self.addCleanup(kept.close)
+        self.assertEqual(kept.command("CLIENT", "NO-EVICT", "on"), b"OK")
+        victim = self.connect()
+        self.addCleanup(victim.close)
+        dropped = False
+        try:
+            # A multi-megabyte argument sits in the query buffer until the
+            # command finishes, which is what the limit measures.
+            victim.command("SET", key, b"x" * 3000000)
+        except (OSError, EOFError, RedisError, ConnectionError):
+            dropped = True
+        self.assertTrue(dropped)
+        self.assertEqual(kept.command("PING"), b"PONG")
+        info = admin.command("INFO", "clients")
+        self.assertIn(b"evicted_clients:", info)
+        self.assertNotIn(b"evicted_clients:0", info)
+        admin.command("CONFIG", "SET", "maxmemory-clients", "0")
+
     def test_stream_xtrim_minid_and_limit(self):
         key = self.key("xtrim:minid")
         for ms in range(1, 7):

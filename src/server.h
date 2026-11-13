@@ -1135,6 +1135,8 @@ struct redisServer {
     int active_defrag_cycle_max;       /* maximal effort for defrag in CPU percentage */
     PORT_ULONG active_defrag_max_scan_fields; /* maximum number of fields of set/hash/zset/list to process from within the main dict scan */
     size_t client_max_querybuf_len; /* Limit for client query buffer length */
+    PORT_ULONG maxmemory_clients;   /* Max memory for client buffers, 0 = off */
+    PORT_ULONGLONG stat_evictedclients; /* Clients dropped by the limit above */
     int dbnum;                      /* Total number of configured DBs */
     int supervised;                 /* 1 if supervised, 0 otherwise. */
     int supervised_mode;            /* See SUPERVISED_* */
@@ -1571,6 +1573,8 @@ void rewriteClientCommandVector(client *c, int argc, ...);
 void rewriteClientCommandArgument(client *c, int i, robj *newval);
 void replaceClientCommandVector(client *c, int argc, robj **argv);
 PORT_ULONG getClientOutputBufferMemoryUsage(client *c);
+PORT_ULONG getClientMemoryUsage(client *c);
+int evictClients(void);
 void freeClientsInAsyncFreeQueue(void);
 void asyncCloseClientOnOutputBufferLimitReached(client *c);
 int getClientType(client *c);

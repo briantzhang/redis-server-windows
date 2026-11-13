@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp19
+# Redis for Windows 5.0.14.1-bp20
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp19`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp20`。
 
 ## 这个版本新增了什么
 
@@ -37,7 +37,7 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `BLMPOP timeout numkeys key [key ...] LEFT\|RIGHT [COUNT count]` | 7.0 | LMPOP 的阻塞版本，支持小数秒超时 |
 | `ZMPOP numkeys key [key ...] MIN\|MAX [COUNT count]` | 7.0 | 从第一个非空有序集合批量弹出，返回 `[键, [[成员, 分数], ...]]` |
 | `BZMPOP timeout numkeys key [key ...] MIN\|MAX [COUNT count]` | 7.0 | ZMPOP 的阻塞版本 |
-| `CLIENT NO-EVICT on\|off` | 7.0 | 记录“不参与客户端驱逐”的标志；本版没有客户端驱逐，见范围说明 |
+| `CLIENT NO-EVICT on\|off` | 7.0 | 标记该连接不参与 `maxmemory-clients` 触发的客户端驱逐 |
 | `CLIENT NO-TOUCH on\|off` | 7.2 | 该连接访问键时不更新 LRU/LFU；`TOUCH` 仍会更新 |
 | `ACL SETUSER/DELUSER/LIST/WHOAMI`、`AUTH username password` | 6.0 | 用户、口令、命令分类与键通配符；见下方范围说明 |
 | `XADD ... [NOMKSTREAM] [MAXLEN\|MINID [~\|=] threshold [LIMIT n]]` | 6.2 | 追加时按长度或最小 ID 裁剪，支持近似裁剪与工作量上限；`NOMKSTREAM` 不自动建键 |
@@ -104,7 +104,7 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 - Redis 7 的 ACL 选择器与按键权限位（本版 ACL 停在 Redis 6 的单权限集）
 - `COMMAND DOCS` 的完整参数树与 complexity/history 字段（本版用 `help.h` 的扁平字段近似）
 - TLS。网络收发已走多个 IO 线程，但命令解析与执行仍在主线程
-- 客户端内存驱逐（`maxmemory-clients`）。`CLIENT NO-EVICT` 只为兼容而接受并记录标志，本版不会因为内存压力驱逐客户端
+- 客户端内存驱逐只按查询缓冲、回复缓冲和参数向量估算，不按 Redis 7 的客户端内存桶分摊
 - 多段 AOF（`appenddirname`）、新版 RDB 格式
 - 集群、Redis 8 的查询引擎
 
@@ -130,7 +130,7 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮给每个套接字的 IOCP 状态加锁，并保留 bp18 及更早用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮实现 `maxmemory-clients` 客户端驱逐，并保留 bp19 及更早用例。
 
 这轮验证不等于已合入上游全部安全补丁，也没有做生产压力测试。
 

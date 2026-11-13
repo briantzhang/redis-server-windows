@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp19
+# Redis for Windows 5.0.14.1-bp20
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -29,7 +29,7 @@
 | 统一 `ZRANGE` / `ZRANGESTORE` | 6.2 | BYSCORE/BYLEX/REV/LIMIT，旧范围命令走同一实现 |
 | `LMPOP` / `BLMPOP` | 7.0 | 从多个列表中选第一个非空键批量弹出，阻塞版本支持小数秒超时 |
 | `ZMPOP` / `BZMPOP` | 7.0 | 从多个有序集合中选第一个非空键批量弹出，返回成员与分数对 |
-| `CLIENT NO-EVICT` | 7.0 | 接受并记录标志；本版没有客户端内存驱逐，因此不会产生实际驱逐效果 |
+| `CLIENT NO-EVICT` | 7.0 | 标记该连接不参与 `maxmemory-clients` 触发的客户端驱逐 |
 | `CLIENT NO-TOUCH` | 7.2 | 该连接访问键时不更新 LRU/LFU，TOUCH 命令仍更新 |
 | `lazyfree-lazy-user-del` / `lazyfree-lazy-user-flush` | 6.0 / 6.2 | 让 DEL 与 FLUSHDB/FLUSHALL 默认走异步释放，避免大键删除阻塞事件循环 |
 | ACL（`SETUSER`/`DELUSER`/`LIST`/`WHOAMI`，`AUTH user pass`） | 6.0 | 用户、口令、命令分类与键通配符；见下方范围说明 |
@@ -92,7 +92,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 - GETEX 的写入记录为 PEXPIREAT、PERSIST 或 DEL/UNLINK；GETDEL 记录为 DEL。
 - 条件过期仅记录成功结果的绝对截止时间，恢复时不重新判断 NX/XX/GT/LT。
 - 不迁入新版 RDB 格式、多段 AOF、RESP3、TLS、Functions 或集群功能。网络收发由多个 IO 线程分担，命令解析与执行仍在主线程。ACL 只做到 Redis 6 的单权限集，没有 Redis 7 的选择器。`COMMAND DOCS` 用 `help.h` 的扁平字段近似上游文档图，不含完整参数树与 complexity/history。原底座已有功能保留，但本版没有对其做现代化升级。
-- 没有实现 Redis 7 的客户端内存驱逐（`maxmemory-clients`）。`CLIENT NO-EVICT` 只为客户端兼容而接受并记录标志，内存压力下不会据此保留连接。
+- `maxmemory-clients` 限制普通客户端的查询缓冲、回复缓冲和参数向量之和，超出时断开占用最大的连接。`CLIENT NO-EVICT` 的连接以及副本、主连接和 MONITOR 不参与。占用按这三项估算，不是 Redis 7 的客户端内存桶。
 - `WAITAOF` 没有 7.2 的异步 fsync 完成队列：开启 AOF 时在命令内调用 `flushAppendOnlyFile` 并 `fsync`，然后立即返回；`numreplicas` 只做参数校验，回复中的副本数恒为 0，不阻塞到超时。
 - `XINFO CONSUMERS` 的 `inactive`/`active_time` 是运行时数据，不写入本版 RDB：快照恢复后 `inactive` 回到 -1，直到再次成功投递。
 - 命令延迟直方图是运行时数据，不写入 RDB/AOF；使用固定的对数桶而不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界。
@@ -123,7 +123,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。本轮给每个套接字的 IOCP 状态加锁；并保留 bp18 及更早用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。本轮实现 `maxmemory-clients` 客户端驱逐；并保留 bp19 及更早用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 
