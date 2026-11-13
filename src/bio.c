@@ -215,6 +215,8 @@ void *bioProcessBackgroundJobs(void *arg) {
                 lazyfreeFreeObjectFromBioThread(job->arg1);
             else if (job->arg2 && job->arg3)
                 lazyfreeFreeDatabaseFromBioThread(job->arg2,job->arg3);
+            else if (job->arg2)
+                dictRelease(job->arg2); /* SCRIPT FLUSH ASYNC script cache */
             else if (job->arg3)
                 lazyfreeFreeSlotsMapFromBioThread(job->arg3);
         } else {

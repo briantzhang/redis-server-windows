@@ -2722,7 +2722,7 @@ class BackportRegression(unittest.TestCase):
         reply = self.cmd("HELLO")
         info = self.flat_map(reply)
         self.assertEqual(info[b"server"], b"redis")
-        self.assertIn(b"bp1", info[b"version"])
+        self.assertTrue(info[b"version"].startswith(b"5.0.14.1-bp"))
         self.assertEqual(info[b"proto"], 2)
         self.assertEqual(info[b"mode"], b"standalone")
         self.assertEqual(info[b"role"], b"master")

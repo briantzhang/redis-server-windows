@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp20
+# Redis for Windows 5.0.14.1-bp21
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp20`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp21`。
 
 ## 这个版本新增了什么
 
@@ -75,7 +75,7 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `latency-tracking yes\|no` | 7.0 | 是否采集命令延迟直方图，默认 `yes` |
 | ACL 频道权限：`&pattern`、`allchannels`、`resetchannels` | 6.0 | 对 `SUBSCRIBE`/`PSUBSCRIBE`/`PUBLISH`/`SSUBSCRIBE`/`SPUBLISH` 生效 |
 | 脚本内的 ACL 检查 | 6.0 | `EVAL`/`EVALSHA` 里的 `redis.call` 按调用者的用户权限校验命令、键与频道 |
-| `SCRIPT FLUSH [ASYNC\|SYNC]` | 6.2 | 两个选项都接受；本版在两种情况下都同步清空脚本缓存 |
+| `SCRIPT FLUSH [ASYNC\|SYNC]` | 6.2 | `ASYNC` 把脚本缓存交给后台线程释放，`SYNC` 立即清空；Lua 解释器都在主线程重建 |
 | `COMMAND DOCS [command ...]` | 7.0 | 返回命令文档（summary/since/group/arguments）；无帮助条目的命令仍给出 `group=unknown` |
 | `ZRANK` / `ZREVRANK` 的 `WITHSCORE` | 7.2 | 排名同时返回分数；成员或键不存在时返回空数组 |
 | `ACL HELP` | 6.0 | 列出 ACL 子命令；`ACL WHOAMI` 继续对已认证用户放行 |
@@ -130,7 +130,7 @@ ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮实现 `maxmemory-clients` 客户端驱逐，并保留 bp19 及更早用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮让 `SCRIPT FLUSH ASYNC` 在后台释放脚本缓存，并保留 bp20 及更早用例。
 
 这轮验证不等于已合入上游全部安全补丁，也没有做生产压力测试。
 

@@ -31,6 +31,7 @@
 #include "Win32_Interop/Win32_Portability.h"
 #endif
 #include "server.h"
+#include "bio.h"
 #include "sha1.h"
 #include "rand.h"
 #include "cluster.h"
@@ -1146,9 +1147,21 @@ void scriptingRelease(void) {
     lua_close(server.lua);
 }
 
-void scriptingReset(void) {
-    scriptingRelease();
-    scriptingInit(0);
+void scriptingReset(int async) {
+    if (async) {
+        /* Hand the cached scripts to the lazy-free thread and keep serving
+         * with an empty cache. The Lua state itself is rebuilt here: it is
+         * not safe to release from another thread. */
+        dict *old_scripts = server.lua_scripts;
+        server.lua_scripts = dictCreate(&shaScriptObjectDictType,NULL);
+        server.lua_scripts_mem = 0;
+        lua_close(server.lua);
+        scriptingInit(0);
+        bioCreateBackgroundJob(BIO_LAZY_FREE,NULL,old_scripts,NULL);
+    } else {
+        scriptingRelease();
+        scriptingInit(0);
+    }
 }
 
 /* Set an array of Redis String Objects as a Lua array (table) stored into a
@@ -1565,9 +1578,7 @@ NULL
                !strcasecmp(c->argv[1]->ptr,"flush") &&
                (c->argc == 2 || !strcasecmp(c->argv[2]->ptr,"async") ||
                 !strcasecmp(c->argv[2]->ptr,"sync"))) {
-        /* ASYNC is accepted for compatibility; this build resets the
-         * script cache synchronously in both cases. */
-        scriptingReset();
+        scriptingReset(c->argc == 3 && !strcasecmp(c->argv[2]->ptr,"async"));
         addReply(c,shared.ok);
         replicationScriptCacheFlush();
         server.dirty++; /* Propagating this command is a good idea. */

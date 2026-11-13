@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp20
+# Redis for Windows 5.0.14.1-bp21
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -67,7 +67,7 @@
 | `latency-tracking yes\|no` | 7.0 | 控制是否采集命令延迟直方图，默认开启 |
 | ACL 频道权限（`&pattern`/`allchannels`/`resetchannels`） | 6.0 | 对订阅、模式订阅、发布与分片频道生效；模式订阅只接受字面匹配 |
 | 脚本内 ACL 检查 | 6.0 | `EVAL`/`EVALSHA` 的 `redis.call` 按调用者用户校验命令、键与频道 |
-| `SCRIPT FLUSH [ASYNC\|SYNC]` | 6.2 | 接受两个选项；本版在两种情况下都同步清空脚本缓存 |
+| `SCRIPT FLUSH [ASYNC\|SYNC]` | 6.2 | `ASYNC` 把脚本缓存交给后台线程释放，`SYNC` 立即清空；Lua 解释器都在主线程重建 |
 | `COMMAND DOCS [command ...]` | 7.0 | 返回命令文档字段（summary/since/group/arguments）；数据来自 `help.h`，未知命令名被跳过 |
 | `ZRANK` / `ZREVRANK` 的 `WITHSCORE` | 7.2 | 在排名后附带该成员分数；成员或键缺失时返回空数组 |
 | `ACL HELP` | 6.0 | 列出 ACL 子命令；与 `ACL WHOAMI` 一样对已认证用户放行 |
@@ -96,7 +96,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 - `WAITAOF` 没有 7.2 的异步 fsync 完成队列：开启 AOF 时在命令内调用 `flushAppendOnlyFile` 并 `fsync`，然后立即返回；`numreplicas` 只做参数校验，回复中的副本数恒为 0，不阻塞到超时。
 - `XINFO CONSUMERS` 的 `inactive`/`active_time` 是运行时数据，不写入本版 RDB：快照恢复后 `inactive` 回到 -1，直到再次成功投递。
 - 命令延迟直方图是运行时数据，不写入 RDB/AOF；使用固定的对数桶而不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界。
-- `SCRIPT FLUSH ASYNC` 只接受选项，脚本缓存仍同步清空；本版没有异步释放脚本缓存的线程。
+- `SCRIPT FLUSH ASYNC` 换上一份空的脚本缓存，把旧的交给后台的延迟释放线程。Lua 解释器本身仍在主线程关闭并重建，因为跨线程释放它不安全。
 - 网络/IOCP、Windows 服务与 fork 模拟层沿用底座代码。
 
 ## 性能预期
@@ -123,7 +123,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。本轮实现 `maxmemory-clients` 客户端驱逐；并保留 bp19 及更早用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。本轮让 `SCRIPT FLUSH ASYNC` 在后台释放脚本缓存；并保留 bp20 及更早用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 
