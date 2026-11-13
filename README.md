@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp21
+# Redis for Windows 5.0.14.1-bp22
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp21`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp22`。
 
 ## 这个版本新增了什么
 
@@ -76,7 +76,7 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | ACL 频道权限：`&pattern`、`allchannels`、`resetchannels` | 6.0 | 对 `SUBSCRIBE`/`PSUBSCRIBE`/`PUBLISH`/`SSUBSCRIBE`/`SPUBLISH` 生效 |
 | 脚本内的 ACL 检查 | 6.0 | `EVAL`/`EVALSHA` 里的 `redis.call` 按调用者的用户权限校验命令、键与频道 |
 | `SCRIPT FLUSH [ASYNC\|SYNC]` | 6.2 | `ASYNC` 把脚本缓存交给后台线程释放，`SYNC` 立即清空；Lua 解释器都在主线程重建 |
-| `COMMAND DOCS [command ...]` | 7.0 | 返回命令文档（summary/since/group/arguments）；无帮助条目的命令仍给出 `group=unknown` |
+| `COMMAND DOCS [command ...]` | 7.0 | 返回命令文档（summary/complexity/since/group/arguments/history）；参数按层级展开，没有文档的命令给出 `group=unknown` |
 | `ZRANK` / `ZREVRANK` 的 `WITHSCORE` | 7.2 | 排名同时返回分数；成员或键不存在时返回空数组 |
 | `ACL HELP` | 6.0 | 列出 ACL 子命令；`ACL WHOAMI` 继续对已认证用户放行 |
 | `SCAN ... TYPE type` | 6.0 | 只返回指定类型的键；未知类型名返回空页 |
@@ -90,19 +90,18 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 
 过期时间在秒数乘 1000、相对时间加当前时间之前做有符号 64 位溢出检查，非法值报错且不改动数据。
 
-ACL 只做到 Redis 6 的范围：一个用户一套权限，支持 `on/off`、`>password`、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并可用 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN` 查看规则和预检权限，用 `ACL LOG` 查看拒绝记录，用 `ACL SAVE`/`ACL LOAD` 配合 `aclfile` 持久化规则。没有 Redis 7 的多选择器（一个用户多套权限）和按键的读写权限位。频道规则已生效：`&pattern` 按通配符匹配字面频道，`PSUBSCRIBE` 要求与 ACL 模式字面一致，`allchannels` 放行全部频道，新建用户默认 `resetchannels`；`default` 用户默认拥有 `allchannels`。配置了 `requirepass` 时，它仍然是 `default` 用户的口令，未认证的连接一律拒绝；`CONFIG SET requirepass` 会同步更新 `default` 用户，不配置时连接直接以 `default` 用户身份进入。删除用户会断开仍以该用户认证的连接，不会留下悬空引用。脚本内调用的命令、键与频道同样按调用者的权限检查，越权时脚本报错而不是绕过 ACL。
+ACL 支持 `on/off`、`>password`、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并可用 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN` 查看规则和预检权限，用 `ACL LOG` 查看拒绝记录，用 `ACL SAVE`/`ACL LOAD` 配合 `aclfile` 持久化规则。一个用户可以有多套权限：根规则之外，用 `(...)` 追加选择器，根规则或任一选择器放行即允许该命令。没有按键的读写权限位，一个选择器对匹配到的键一律放行。频道规则已生效：`&pattern` 按通配符匹配字面频道，`PSUBSCRIBE` 要求与 ACL 模式字面一致，`allchannels` 放行全部频道，新建用户默认 `resetchannels`；`default` 用户默认拥有 `allchannels`。配置了 `requirepass` 时，它仍然是 `default` 用户的口令，未认证的连接一律拒绝；`CONFIG SET requirepass` 会同步更新 `default` 用户，不配置时连接直接以 `default` 用户身份进入。删除用户会断开仍以该用户认证的连接，不会留下悬空引用。脚本内调用的命令、键与频道同样按调用者的权限检查，越权时脚本报错而不是绕过 ACL。
 
 命令语义参照 Redis `7.0.15`（BSD）手工适配，没有引入 Redis 8 的源码。完整说明见 [BACKPORT-RELEASE.md](BACKPORT-RELEASE.md)。
 
-`CLIENT PAUSE WRITE` 只拦写命令与 `EXEC`，`CLIENT PAUSE ALL` 连读命令一起拦；被暂停的连接在恢复后按原顺序执行已解析的命令。`CONFIG SET` 多参数时逐对应用，后面的参数非法时前面的已经生效。`COMMAND LIST FILTERBY ACLCAT` 用命令级读写标志近似 `read`/`write`/`keyspace` 分类；`COMMAND GETKEYSANDFLAGS` 只给出 `RO`/`RW`、`access`、`update` 三种标志，没有 Redis 7 的键规格。`CLIENT KILL LADDR` 匹配的是服务端监听地址，因此同一监听地址上的所有连接都会命中；`MAXAGE` 按连接建立到现在的秒数计算。`LATENCY HISTOGRAM` 使用固定的对数桶，不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界，适合看数量级而不是精确尾延迟。`latency-tracking no` 只停止新采样，已有直方图保留到下一次重置。`WAITAOF` 在本版没有异步 fsync 确认机制：它在命令内同步刷盘后立即返回 `[本机确认, 0]`，不会阻塞到超时，也不跟踪副本的 AOF 落盘。`SHUTDOWN ABORT` 只能取消已置位但尚未执行的关闭请求，此时没有“关闭进行中”的状态。
+`CLIENT PAUSE WRITE` 只拦写命令与 `EXEC`，`CLIENT PAUSE ALL` 连读命令一起拦；被暂停的连接在恢复后按原顺序执行已解析的命令。`CONFIG SET` 多参数时逐对应用，后面的参数非法时前面的已经生效。`COMMAND LIST FILTERBY ACLCAT` 用命令级读写标志近似 `read`/`write`/`keyspace` 分类；`COMMAND GETKEYSANDFLAGS` 按每条命令的键规格给出标志，同一条命令的不同键可以不同，例如 `BITOP` 的目标键是 `OW update`、源键是 `RO access`。键位置不固定的参数（`SORT` 的 `STORE`）仍按命令级标志近似。`CLIENT KILL LADDR` 匹配的是服务端监听地址，因此同一监听地址上的所有连接都会命中；`MAXAGE` 按连接建立到现在的秒数计算。`LATENCY HISTOGRAM` 使用固定的对数桶，不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界，适合看数量级而不是精确尾延迟。`latency-tracking no` 只停止新采样，已有直方图保留到下一次重置。`WAITAOF` 在本版没有异步 fsync 确认机制：它在命令内同步刷盘后立即返回 `[本机确认, 0]`，不会阻塞到超时，也不跟踪副本的 AOF 落盘。`SHUTDOWN ABORT` 只能取消已置位但尚未执行的关闭请求，此时没有“关闭进行中”的状态。
 
 ## 没有合入的部分
 
 以下能力不在本版中，调用会返回 `unknown command` 或沿用底座的旧行为：
 
 - RESP3（`HELLO 3` 返回 NOPROTO；TRACKING 失效也不走 RESP3 push）、Redis Functions
-- Redis 7 的 ACL 选择器与按键权限位（本版 ACL 停在 Redis 6 的单权限集）
-- `COMMAND DOCS` 的完整参数树与 complexity/history 字段（本版用 `help.h` 的扁平字段近似）
+- 按键的读写权限位（选择器对匹配的键一律放行，不区分读与写）
 - TLS。网络收发已走多个 IO 线程，但命令解析与执行仍在主线程
 - 客户端内存驱逐只按查询缓冲、回复缓冲和参数向量估算，不按 Redis 7 的客户端内存桶分摊
 - 多段 AOF（`appenddirname`）、新版 RDB 格式

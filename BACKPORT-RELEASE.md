@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp21
+# Redis for Windows 5.0.14.1-bp22
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -48,7 +48,7 @@
 | `EVAL_RO` / `EVALSHA_RO` | 7.0 | 只读脚本入口；脚本执行期间调用任何写命令都会被拒绝 |
 | `CLIENT PAUSE [WRITE\|ALL]` / `CLIENT UNPAUSE` / `CLIENT INFO` | 6.2 | 移植了 6.2 的 pending-command 机制：命令先解析再阻塞，恢复后按原顺序执行 |
 | `CONFIG GET` 多模式 / `CONFIG SET` 多参数 | 7.0 | GET 对重叠模式去重；SET 逐对顺序应用，后一对失败时前面的已生效，不是原子操作 |
-| `COMMAND LIST` / `COMMAND GETKEYSANDFLAGS` | 7.0 | 支持 FILTERBY PATTERN/ACLCAT/MODULE；ACLCAT 用命令级读写标志近似，MODULE 恒为空。键标志只给出 RO/RW、access、update |
+| `COMMAND LIST` / `COMMAND GETKEYSANDFLAGS` | 7.0 | 支持 FILTERBY PATTERN/ACLCAT/MODULE；ACLCAT 用命令级读写标志近似，MODULE 恒为空。键标志按每条命令的键规格给出，同一命令的不同键可以不同 |
 | `GEOSEARCH` / `GEOSEARCHSTORE` | 6.2 | 圆形或矩形区域搜索；支持 FROMMEMBER/FROMLONLAT、BYRADIUS/BYBOX、ANY、WITHDIST/WITHHASH/WITHCOORD；STORE 形式可存距离，源键缺失时删除目标键 |
 | `ACL CAT` / `ACL USERS` / `ACL GETUSER` / `ACL GENPASS` / `ACL DRYRUN` | 6.0 | 列出分类与用户、输出用户规则、生成随机口令、预检命令与键权限 |
 | `CLIENT KILL` 的 `LADDR` / `USER` / `MAXAGE` | 6.0 / 7.0 | 按本地监听地址、认证用户和连接存活秒数筛选；LADDR 会命中同一监听地址上的全部连接 |
@@ -68,7 +68,7 @@
 | ACL 频道权限（`&pattern`/`allchannels`/`resetchannels`） | 6.0 | 对订阅、模式订阅、发布与分片频道生效；模式订阅只接受字面匹配 |
 | 脚本内 ACL 检查 | 6.0 | `EVAL`/`EVALSHA` 的 `redis.call` 按调用者用户校验命令、键与频道 |
 | `SCRIPT FLUSH [ASYNC\|SYNC]` | 6.2 | `ASYNC` 把脚本缓存交给后台线程释放，`SYNC` 立即清空；Lua 解释器都在主线程重建 |
-| `COMMAND DOCS [command ...]` | 7.0 | 返回命令文档字段（summary/since/group/arguments）；数据来自 `help.h`，未知命令名被跳过 |
+| `COMMAND DOCS [command ...]` | 7.0 | 返回命令文档（summary/complexity/since/group/arguments/history）；参数按层级展开，数据取自 Redis 7.0.15 的命令表 |
 | `ZRANK` / `ZREVRANK` 的 `WITHSCORE` | 7.2 | 在排名后附带该成员分数；成员或键缺失时返回空数组 |
 | `ACL HELP` | 6.0 | 列出 ACL 子命令；与 `ACL WHOAMI` 一样对已认证用户放行 |
 | `SCAN ... TYPE type` | 6.0 | 键空间扫描可按类型过滤；未知类型名返回空页，不报错 |
@@ -80,7 +80,7 @@
 | `XINFO CONSUMERS` 的 `inactive` | 7.2 | 距上次成功投递的毫秒；尚未成功投递为 -1；`idle` 仍按上次尝试交互 |
 | `UNLINK` / `SWAPDB` / `WAIT` / `ROLE` 回归 | 4.0 / 4.0 / 3.0 / 2.8 | 异步删除、库交换、副本确认等待与角色查询；实现早已存在，bp16 补黑盒覆盖 |
 
-ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并提供 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN`、`ACL LOG` 与 `ACL SAVE`/`ACL LOAD`。没有 Redis 7 的多选择器，也没有按键的读写权限位。频道规则已经生效：`&pattern` 按通配符匹配字面频道，`PSUBSCRIBE` 要求与 ACL 模式字面一致，`allchannels` 放行全部频道；新建用户默认 `resetchannels`，`default` 用户默认 `allchannels`。`requirepass` 成为 `default` 用户的口令，设置后未认证连接被拒绝，`CONFIG SET requirepass` 会同步更新该用户；不设置时连接以 `default` 用户进入。`ACL WHOAMI` 对任何已认证用户放行。删除用户或从 ACL 文件移除用户时，仍以该用户认证的连接会被断开，避免悬空指针。脚本里调用的命令、键与频道同样受调用者权限约束。
+ACL 支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并提供 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN`、`ACL LOG` 与 `ACL SAVE`/`ACL LOAD`。一个用户可以有多套权限：根规则之外用 `(...)` 追加选择器，根规则或任一选择器放行即允许该命令。没有按键的读写权限位，选择器对匹配到的键一律放行。频道规则已经生效：`&pattern` 按通配符匹配字面频道，`PSUBSCRIBE` 要求与 ACL 模式字面一致，`allchannels` 放行全部频道；新建用户默认 `resetchannels`，`default` 用户默认 `allchannels`。`requirepass` 成为 `default` 用户的口令，设置后未认证连接被拒绝，`CONFIG SET requirepass` 会同步更新该用户；不设置时连接以 `default` 用户进入。`ACL WHOAMI` 对任何已认证用户放行。删除用户或从 ACL 文件移除用户时，仍以该用户认证的连接会被断开，避免悬空指针。脚本里调用的命令、键与频道同样受调用者权限约束。
 
 代码参照 Redis `7.0.15` 与 `7.2.5`（BSD）中的相关命令语义，按旧版 API 手工适配；没有引入 Redis 8 的源码或模块。
 
@@ -91,7 +91,7 @@ ACL 停在 Redis 6：一个用户一套权限，支持 `on/off`、`>password`（
 - 成功的带 TTL 的 SET 在 AOF 中记录为普通 SET + 绝对 PEXPIREAT；KEEPTTL 记录实际保留的截止时间。
 - GETEX 的写入记录为 PEXPIREAT、PERSIST 或 DEL/UNLINK；GETDEL 记录为 DEL。
 - 条件过期仅记录成功结果的绝对截止时间，恢复时不重新判断 NX/XX/GT/LT。
-- 不迁入新版 RDB 格式、多段 AOF、RESP3、TLS、Functions 或集群功能。网络收发由多个 IO 线程分担，命令解析与执行仍在主线程。ACL 只做到 Redis 6 的单权限集，没有 Redis 7 的选择器。`COMMAND DOCS` 用 `help.h` 的扁平字段近似上游文档图，不含完整参数树与 complexity/history。原底座已有功能保留，但本版没有对其做现代化升级。
+- 不迁入新版 RDB 格式、多段 AOF、RESP3、TLS、Functions 或集群功能。网络收发由多个 IO 线程分担，命令解析与执行仍在主线程。ACL 选择器对匹配的键一律放行，不区分读与写。`COMMAND DOCS` 的文档取自 Redis 7.0.15 的命令表，`ZRANK`/`ZREVRANK` 的 `WITHSCORE` 取自 7.2.5。原底座已有功能保留，但本版没有对其做现代化升级。
 - `maxmemory-clients` 限制普通客户端的查询缓冲、回复缓冲和参数向量之和，超出时断开占用最大的连接。`CLIENT NO-EVICT` 的连接以及副本、主连接和 MONITOR 不参与。占用按这三项估算，不是 Redis 7 的客户端内存桶。
 - `WAITAOF` 没有 7.2 的异步 fsync 完成队列：开启 AOF 时在命令内调用 `flushAppendOnlyFile` 并 `fsync`，然后立即返回；`numreplicas` 只做参数校验，回复中的副本数恒为 0，不阻塞到超时。
 - `XINFO CONSUMERS` 的 `inactive`/`active_time` 是运行时数据，不写入本版 RDB：快照恢复后 `inactive` 回到 -1，直到再次成功投递。

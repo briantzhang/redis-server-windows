@@ -42,6 +42,7 @@
 #include "latency.h"
 #include "atomicvar.h"
 #include "help.h"
+#include "command_docs.inc"
 
 #include <time.h>
 #include <signal.h>
@@ -3281,42 +3282,139 @@ void addReplyCommand(client *c, struct redisCommand *cmd) {
     }
 }
 
-/* Find a commandHelp entry by command name (case-insensitive). */
-static struct commandHelp *commandHelpLookup(const char *name) {
-    size_t i, n = sizeof(commandHelp)/sizeof(commandHelp[0]);
-    for (i = 0; i < n; i++) {
-        if (!strcasecmp(commandHelp[i].name, name))
-            return &commandHelp[i];
+/* One argument as a flat field/value array. A oneof or block carries its
+ * nested arguments under an "arguments" field. */
+static void addReplyCommandDocArgs(client *c, int begin, int count);
+
+static void addReplyCommandDocArg(client *c, int index) {
+    const cmdDocArg *arg = &cmdDocArgs[index];
+    PORT_LONG maplen = 2; /* name, type */
+
+    if (arg->key_spec != -1) maplen++;
+    if (arg->token) maplen++;
+    if (arg->summary) maplen++;
+    if (arg->since) maplen++;
+    if (arg->flags) maplen++;
+    if (arg->child != -1) maplen++;
+
+    addReplyMultiBulkLen(c, maplen*2);
+    addReplyBulkCString(c,"name");
+    addReplyBulkCString(c,arg->name);
+    addReplyBulkCString(c,"type");
+    addReplyBulkCString(c,arg->type);
+    if (arg->key_spec != -1) {
+        addReplyBulkCString(c,"key_spec_index");
+        addReplyLongLong(c,arg->key_spec);
+    }
+    if (arg->token) {
+        addReplyBulkCString(c,"token");
+        addReplyBulkCString(c,arg->token);
+    }
+    if (arg->summary) {
+        addReplyBulkCString(c,"summary");
+        addReplyBulkCString(c,arg->summary);
+    }
+    if (arg->since) {
+        addReplyBulkCString(c,"since");
+        addReplyBulkCString(c,arg->since);
+    }
+    if (arg->flags) {
+        int n = 0, i;
+        const char *names[3];
+        if (arg->flags & CMDDOC_OPTIONAL) names[n++] = "optional";
+        if (arg->flags & CMDDOC_MULTIPLE) names[n++] = "multiple";
+        if (arg->flags & CMDDOC_MULTIPLE_TOKEN) names[n++] = "multiple_token";
+        addReplyBulkCString(c,"flags");
+        addReplyMultiBulkLen(c,n);
+        for (i = 0; i < n; i++) addReplyBulkCString(c,names[i]);
+    }
+    if (arg->child != -1) {
+        addReplyBulkCString(c,"arguments");
+        addReplyCommandDocArgs(c, arg->child, arg->span - 1);
+    }
+}
+
+/* `count` is the number of rows the arguments occupy, nesting included.
+ * Siblings are reached by adding each row's span. */
+static void addReplyCommandDocArgs(client *c, int begin, int count) {
+    int at = begin, end = begin + count, n = 0;
+    for (at = begin; at < end; at += cmdDocArgs[at].span) n++;
+    addReplyMultiBulkLen(c,n);
+    for (at = begin; at < end; at += cmdDocArgs[at].span)
+        addReplyCommandDocArg(c,at);
+}
+
+/* cmdDocTable is sorted by name. Command names are matched folded to
+ * lower case, which is how this tree registers them. */
+static const cmdDocEntry *commandDocLookup(const char *name) {
+    int lo = 0, hi = (int)(sizeof(cmdDocTable)/sizeof(cmdDocTable[0])) - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int cmp = strcasecmp(name, cmdDocTable[mid].name);
+        if (cmp == 0) return &cmdDocTable[mid];
+        if (cmp < 0) hi = mid - 1; else lo = mid + 1;
     }
     return NULL;
 }
 
-/* Emit one command's documentation as a flat field/value array.
- * Fields come from help.h when available; otherwise from the live command. */
-static void addReplyCommandDocs(client *c, struct redisCommand *cmd) {
-    struct commandHelp *help = commandHelpLookup(cmd->name);
-    const char *summary = help ? help->summary : NULL;
-    const char *since = help ? help->since : NULL;
-    const char *group = "unknown";
-    int have_args = 0;
-    PORT_LONG maplen = 1; /* group always present */
+/* The key spec covering argument position `pos`, or NULL when the command
+ * has none. A spec names a fixed range, or a range whose length is the
+ * integer at `first` (keynum). Both match the positions
+ * getKeysFromCommand reports. */
+static const cmdDocKeySpec *commandKeySpecFor(const cmdDocEntry *doc,
+                                              robj **argv, int argc, int pos) {
+    int i;
+    if (!doc || doc->spec_n <= 0) return NULL;
+    for (i = 0; i < doc->spec_n; i++) {
+        const cmdDocKeySpec *spec = &cmdDocKeySpecs[doc->spec_at+i];
+        int first = spec->first, last = spec->last, count = 0, at;
+        if (spec->keynum) {
+            PORT_LONGLONG n;
+            if (first >= argc) continue;
+            if (getLongLongFromObject(argv[first], &n) != C_OK || n < 0) continue;
+            first += spec->step;
+            last = first + (int)n*spec->step - spec->step;
+        } else if (last >= 0) {
+            /* last is relative to the first key. */
+            last = first + last;
+        } else {
+            last = argc + last;
+        }
+        for (at = first; at <= last && at < argc; at += spec->step) {
+            if (spec->limit && count >= spec->limit) break;
+            if (at == pos) return spec;
+            count++;
+        }
+    }
+    return NULL;
+}
 
-    if (help && help->group >= 0 &&
-        help->group < (int)(sizeof(commandGroups)/sizeof(commandGroups[0])))
-    {
-        group = commandGroups[help->group];
-    }
+/* One command's documentation as a flat field/value array: summary,
+ * complexity, since, group, an array of arguments and an array of
+ * [version, change] history pairs. Commands without an entry still get a
+ * group so the reply shape stays stable. */
+static void addReplyCommandDocs(client *c, struct redisCommand *cmd) {
+    const cmdDocEntry *doc = commandDocLookup(cmd->name);
+    const char *summary = doc ? doc->summary : NULL;
+    const char *complexity = doc ? doc->complexity : NULL;
+    const char *since = doc ? doc->since : NULL;
+    const char *group = doc ? doc->group : "unknown";
+    PORT_LONG maplen = 1; /* group */
+
     if (summary) maplen++;
+    if (complexity) maplen++;
     if (since) maplen++;
-    if (help && help->params && help->params[0] != '-' && help->params[0] != '\0') {
-        have_args = 1;
-        maplen++; /* arguments as a simple string for this port */
-    }
+    if (doc && doc->arg_n > 0) maplen++;
+    if (doc && doc->hist_n > 0) maplen++;
 
     addReplyMultiBulkLen(c, maplen*2);
     if (summary) {
         addReplyBulkCString(c,"summary");
         addReplyBulkCString(c,summary);
+    }
+    if (complexity) {
+        addReplyBulkCString(c,"complexity");
+        addReplyBulkCString(c,complexity);
     }
     if (since) {
         addReplyBulkCString(c,"since");
@@ -3324,10 +3422,19 @@ static void addReplyCommandDocs(client *c, struct redisCommand *cmd) {
     }
     addReplyBulkCString(c,"group");
     addReplyBulkCString(c,group);
-    if (have_args) {
-        /* Keep arguments as a single string so RESP2 clients stay flat. */
+    if (doc && doc->arg_n > 0) {
         addReplyBulkCString(c,"arguments");
-        addReplyBulkCString(c,help->params);
+        addReplyCommandDocArgs(c, doc->arg_at, doc->arg_n);
+    }
+    if (doc && doc->hist_n > 0) {
+        int i;
+        addReplyBulkCString(c,"history");
+        addReplyMultiBulkLen(c, doc->hist_n);
+        for (i = 0; i < doc->hist_n; i++) {
+            addReplyMultiBulkLen(c,2);
+            addReplyBulkCString(c, cmdDocHistories[doc->hist_at+i].since);
+            addReplyBulkCString(c, cmdDocHistories[doc->hist_at+i].text);
+        }
     }
 }
 
@@ -3409,17 +3516,27 @@ NULL
         if (!keys) {
             addReplyError(c,"Invalid arguments specified for command");
         } else {
-            /* Redis 5.0 has no key specifications: approximate the flags from
-             * the command level flags (read-only commands access keys, write
-             * commands also update them). */
+            /* Flags come from the command's key specs. A key no spec covers
+             * (the SORT STORE key, whose position is not fixed) falls back to
+             * the command level flags, which are coarser. */
+            const cmdDocEntry *doc = commandDocLookup(cmd->name);
             addReplyMultiBulkLen(c,numkeys);
             for (j = 0; j < numkeys; j++) {
+                const cmdDocKeySpec *spec = commandKeySpecFor(
+                    doc, c->argv+2, c->argc-2, keys[j]);
+                int f, n = 0;
                 addReplyMultiBulkLen(c,2);
                 addReplyBulk(c,c->argv[keys[j]+2]);
-                addReplyMultiBulkLen(c,(cmd->flags & CMD_WRITE) ? 3 : 2);
-                addReplyBulkCString(c,(cmd->flags & CMD_WRITE) ? "RW" : "RO");
-                addReplyBulkCString(c,"access");
-                if (cmd->flags & CMD_WRITE) addReplyBulkCString(c,"update");
+                if (spec) {
+                    for (f = 0; f < 8 && spec->flags[f]; f++) n++;
+                    addReplyMultiBulkLen(c,n);
+                    for (f = 0; f < n; f++) addReplyBulkCString(c,spec->flags[f]);
+                } else {
+                    addReplyMultiBulkLen(c,(cmd->flags & CMD_WRITE) ? 3 : 2);
+                    addReplyBulkCString(c,(cmd->flags & CMD_WRITE) ? "RW" : "RO");
+                    addReplyBulkCString(c,"access");
+                    if (cmd->flags & CMD_WRITE) addReplyBulkCString(c,"update");
+                }
             }
             getKeysFreeResult(keys);
         }

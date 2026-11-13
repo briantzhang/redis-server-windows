@@ -1,6 +1,8 @@
-/* Access control at the Redis 6 level: named users, passwords, command
- * categories and key patterns. Redis 7 selectors (several permission sets per
- * user) and the key-permission flags are intentionally absent.
+/* Access control: named users, passwords, command categories, key patterns
+ * and selectors. A user carries a root permission set plus any number of
+ * selectors added with (...); a command is allowed when the root or any
+ * selector allows it. Key permission flags (read/write per key) are absent:
+ * a selector grants every key matching its patterns.
  *
  * Command permission is stored as one bit per command id. Key permission is
  * either all keys or a list of glob patterns. A user with no password set and
@@ -15,13 +17,22 @@
 #define USER_NOPASS    (1<<3)
 #define USER_ALLCHANNELS (1<<4)
 
+/* One permission set: command bits, key globs and channel globs. A user
+ * has a root selector plus any number added with (...). A command is allowed
+ * when the root or any selector allows it. */
+typedef struct {
+    int flags;
+    list *patterns;
+    list *channels;
+    uint64_t commands[16]; /* 1024 command ids. */
+} aclSelector;
+
 typedef struct {
     sds name;
-    int flags;
+    int flags;         /* enabled, nopass */
     list *passwords;   /* SHA1 hex of each accepted password. */
-    list *patterns;    /* Key globs. Empty unless USER_ALLKEYS is off. */
-    list *channels;    /* Pub/Sub channel globs. Empty when allchannels. */
-    uint64_t commands[16]; /* 1024 command ids. */
+    aclSelector root;
+    list *selectors;   /* aclSelector*, added with (...). */
 } user;
 
 static dict *Users;
@@ -83,8 +94,9 @@ static void aclFreeUser(void *privdata, void *ptr) {
     DICT_NOTUSED(privdata);
     sdsfree(u->name);
     listRelease(u->passwords);
-    listRelease(u->patterns);
-    listRelease(u->channels);
+    listRelease(u->root.patterns);
+    listRelease(u->root.channels);
+    listRelease(u->selectors);
     zfree(u);
 }
 
@@ -93,38 +105,51 @@ static user *ACLGetUser(sds name) {
     return de ? dictGetVal(de) : NULL;
 }
 
+static void aclInitSelector(aclSelector *s) {
+    s->flags = 0;
+    s->patterns = listCreate();
+    s->channels = listCreate();
+    listSetFreeMethod(s->patterns, (void (*)(void*))sdsfree);
+    listSetFreeMethod(s->channels, (void (*)(void*))sdsfree);
+}
+
+static void aclFreeSelector(aclSelector *s) {
+    listRelease(s->patterns);
+    listRelease(s->channels);
+    zfree(s);
+}
+
 static user *ACLCreateUser(const char *name) {
     user *u = zcalloc(sizeof(*u));
     u->name = sdsnew(name);
     u->passwords = listCreate();
-    u->patterns = listCreate();
-    u->channels = listCreate();
     listSetFreeMethod(u->passwords, (void (*)(void*))sdsfree);
-    listSetFreeMethod(u->patterns, (void (*)(void*))sdsfree);
-    listSetFreeMethod(u->channels, (void (*)(void*))sdsfree);
+    aclInitSelector(&u->root);
+    u->selectors = listCreate();
+    listSetFreeMethod(u->selectors, (void (*)(void*))aclFreeSelector);
     dictAdd(Users, sdsnew(name), u);
     return u;
 }
 
-static void aclAllowAll(user *u) {
-    memset(u->commands, 0xff, sizeof(u->commands));
-    u->flags |= USER_ALLCMD;
+static void aclAllowAll(aclSelector *s) {
+    memset(s->commands, 0xff, sizeof(s->commands));
+    s->flags |= USER_ALLCMD;
 }
 
-static void aclDenyAll(user *u) {
-    memset(u->commands, 0, sizeof(u->commands));
-    u->flags &= ~USER_ALLCMD;
+static void aclDenyAll(aclSelector *s) {
+    memset(s->commands, 0, sizeof(s->commands));
+    s->flags &= ~USER_ALLCMD;
 }
 
-static int aclCommandBit(user *u, unsigned id) {
-    return (u->commands[id/64] >> (id%64)) & 1;
+static int aclCommandBit(aclSelector *s, unsigned id) {
+    return (s->commands[id/64] >> (id%64)) & 1;
 }
 
-static void aclSetCommandBit(user *u, unsigned id, int on) {
+static void aclSetCommandBit(aclSelector *s, unsigned id, int on) {
     uint64_t mask = 1ULL << (id%64);
-    if (on) u->commands[id/64] |= mask;
-    else    u->commands[id/64] &= ~mask;
-    u->flags &= ~USER_ALLCMD;
+    if (on) s->commands[id/64] |= mask;
+    else    s->commands[id/64] &= ~mask;
+    s->flags &= ~USER_ALLCMD;
 }
 
 /* Number every command once, in table order, and keep the id on the command
@@ -170,63 +195,45 @@ static sds aclHashPassword(const char *pw, size_t len) {
     return sdsnewlen(hex, 40);
 }
 
-/* Apply one rule. op is a single token such as "on", "+@read", "~cache:*"
- * or ">secret". Returns C_ERR for a rule this build does not understand. */
-int ACLSetUser(user *u, const char *op) {
-    if (!strcasecmp(op,"on")) { u->flags |= USER_ENABLED; return C_OK; }
-    if (!strcasecmp(op,"off")) { u->flags &= ~USER_ENABLED; return C_OK; }
-    if (!strcasecmp(op,"nopass")) { u->flags |= USER_NOPASS; return C_OK; }
-    if (!strcasecmp(op,"resetpass")) {
-        listEmpty(u->passwords);
-        u->flags &= ~USER_NOPASS;
-        return C_OK;
-    }
+/* Apply one permission rule to a selector: command bits, key globs and
+ * channel globs. Returns C_ERR for a rule that is not a permission. */
+static int ACLSetSelector(aclSelector *s, const char *op) {
     if (!strcasecmp(op,"allkeys") || !strcmp(op,"~*")) {
-        listEmpty(u->patterns);
-        u->flags |= USER_ALLKEYS;
+        listEmpty(s->patterns);
+        s->flags |= USER_ALLKEYS;
         return C_OK;
     }
     if (!strcasecmp(op,"resetkeys")) {
-        listEmpty(u->patterns);
-        u->flags &= ~USER_ALLKEYS;
+        listEmpty(s->patterns);
+        s->flags &= ~USER_ALLKEYS;
         return C_OK;
     }
     if (!strcasecmp(op,"allchannels") || !strcmp(op,"&*")) {
-        listEmpty(u->channels);
-        u->flags |= USER_ALLCHANNELS;
+        listEmpty(s->channels);
+        s->flags |= USER_ALLCHANNELS;
         return C_OK;
     }
     if (!strcasecmp(op,"resetchannels")) {
-        listEmpty(u->channels);
-        u->flags &= ~USER_ALLCHANNELS;
+        listEmpty(s->channels);
+        s->flags &= ~USER_ALLCHANNELS;
         return C_OK;
     }
     if (op[0] == '&') {
         /* Redis refuses to add a pattern after allchannels: it would have no
          * effect until resetchannels is used. */
-        if (u->flags & USER_ALLCHANNELS) return C_ERR;
-        listAddNodeTail(u->channels,sdsnew(op+1));
+        if (s->flags & USER_ALLCHANNELS) return C_ERR;
+        listAddNodeTail(s->channels,sdsnew(op+1));
         return C_OK;
     }
     if (!strcasecmp(op,"allcommands") || !strcasecmp(op,"+@all")) {
-        aclAllowAll(u); return C_OK;
+        aclAllowAll(s); return C_OK;
     }
     if (!strcasecmp(op,"nocommands") || !strcasecmp(op,"-@all")) {
-        aclDenyAll(u); return C_OK;
+        aclDenyAll(s); return C_OK;
     }
-    if (!strcasecmp(op,"reset")) {
-        aclDenyAll(u);
-        listEmpty(u->passwords);
-        listEmpty(u->patterns);
-        listEmpty(u->channels);
-        u->flags = 0;
-        return C_OK;
-    }
-    if (op[0] == '>' || op[0] == '#') {
-        sds hash = op[0] == '>' ? aclHashPassword(op+1, strlen(op+1))
-                                : sdsnew(op+1);
-        listAddNodeTail(u->passwords, hash);
-        u->flags &= ~USER_NOPASS;
+    if (op[0] == '~') {
+        listAddNodeTail(s->patterns, sdsnew(op+1));
+        s->flags &= ~USER_ALLKEYS;
         return C_OK;
     }
     if ((op[0] == '+' || op[0] == '-') && op[1] == '@') {
@@ -238,7 +245,7 @@ int ACLSetUser(user *u, const char *op) {
             struct redisCommand *cmd = dictGetVal(de);
             int match = aclCategoryMatch(cmd, op+2);
             if (match < 0) { known = -1; break; }
-            if (match) { aclSetCommandBit(u, cmd->id, on); known = 1; }
+            if (match) { aclSetCommandBit(s, cmd->id, on); known = 1; }
         }
         dictReleaseIterator(di);
         return known < 0 ? C_ERR : C_OK;
@@ -247,12 +254,66 @@ int ACLSetUser(user *u, const char *op) {
         void *found = raxFind(CommandIds, (unsigned char*)(op+1), strlen(op+1));
         int id = (found == raxNotFound) ? 0 : (int)(size_t)found;
         if (id == 0) return C_ERR;
-        aclSetCommandBit(u, (unsigned)(id-1), op[0] == '+');
+        aclSetCommandBit(s, (unsigned)(id-1), op[0] == '+');
         return C_OK;
     }
-    if (op[0] == '~') {
-        listAddNodeTail(u->patterns, sdsnew(op+1));
-        u->flags &= ~USER_ALLKEYS;
+    return C_ERR;
+}
+
+/* Apply one rule. op is a single token such as "on", "+@read", "~cache:*"
+ * or ">secret", or a parenthesised selector. Returns C_ERR for a rule this
+ * build does not understand. */
+int ACLSetUser(user *u, const char *op) {
+    size_t oplen = strlen(op);
+    if (op[0] == '(' && oplen > 1 && op[oplen-1] == ')') {
+        /* A selector is a space separated list of permission rules. */
+        aclSelector *s = zcalloc(sizeof(*s));
+        char *copy = zstrdup(op+1), *tok, *next;
+        int ok = C_OK;
+        copy[oplen-2] = '\0';
+        aclInitSelector(s);
+        for (tok = copy; tok && *tok; tok = next) {
+            while (*tok == ' ') tok++;
+            if (!*tok) break;
+            next = strchr(tok, ' ');
+            if (next) *next++ = '\0';
+            if (ACLSetSelector(s, tok) != C_OK) { ok = C_ERR; break; }
+        }
+        zfree(copy);
+        if (ok != C_OK) { aclFreeSelector(s); return C_ERR; }
+        listAddNodeTail(u->selectors, s);
+        return C_OK;
+    }
+    if (!strcasecmp(op,"on")) { u->flags |= USER_ENABLED; return C_OK; }
+    if (!strcasecmp(op,"off")) { u->flags &= ~USER_ENABLED; return C_OK; }
+    if (!strcasecmp(op,"nopass")) { u->flags |= USER_NOPASS; return C_OK; }
+    if (!strcasecmp(op,"resetpass")) {
+        listEmpty(u->passwords);
+        u->flags &= ~USER_NOPASS;
+        return C_OK;
+    }
+    if (!strcasecmp(op,"clearselectors")) {
+        listEmpty(u->selectors);
+        return C_OK;
+    }
+    if (!strcasecmp(op,"reset")) {
+        aclDenyAll(&u->root);
+        listEmpty(u->passwords);
+        listEmpty(u->root.patterns);
+        listEmpty(u->root.channels);
+        listEmpty(u->selectors);
+        u->flags = 0;
+        u->root.flags = 0;
+        return C_OK;
+    }
+    if (ACLSetSelector(&u->root, op) == C_OK) return C_OK;
+    if (op[0] == '+' || op[0] == '-' || op[0] == '~' || op[0] == '&')
+        return C_ERR;
+    if (op[0] == '>' || op[0] == '#') {
+        sds hash = op[0] == '>' ? aclHashPassword(op+1, strlen(op+1))
+                                : sdsnew(op+1);
+        listAddNodeTail(u->passwords, hash);
+        u->flags &= ~USER_NOPASS;
         return C_OK;
     }
     return C_ERR;
@@ -277,8 +338,9 @@ void ACLUpdateDefaultUserPassword(const char *password) {
  * is allowed, and a configured password is the only way in. */
 void ACLInitDefaultUser(void) {
     user *u = ACLCreateUser("default");
-    aclAllowAll(u);
-    u->flags |= USER_ENABLED | USER_ALLKEYS | USER_NOPASS | USER_ALLCHANNELS;
+    aclAllowAll(&u->root);
+    u->flags |= USER_ENABLED | USER_NOPASS;
+    u->root.flags |= USER_ALLKEYS | USER_ALLCHANNELS;
     if (server.requirepass) {
         sds rule = sdscatprintf(sdsempty(), ">%s", server.requirepass);
         ACLSetUser(u, rule);
@@ -306,12 +368,45 @@ int ACLCheckPassword(user *u, const char *pw, size_t len) {
     return match ? C_OK : C_ERR;
 }
 
-/* Returns C_OK when the command may run. On refusal the denial is logged and
- * C_ERR is returned; with reply set the error is also sent to the client.
- * Scripts use the quiet form because the Lua pseudo-client has no socket. */
+/* A selector allows a command when it grants the command and every key
+ * the command touches. Returns 1 on success, 0 when the command is refused,
+ * -1 when the command is granted but a key is not. */
+static int aclSelectorAllows(aclSelector *s, client *c, int *denied_key) {
+    int *keys, numkeys, i;
+    if (!(s->flags & USER_ALLCMD) && !aclCommandBit(s, c->cmd->id))
+        return 0;
+    if (s->flags & USER_ALLKEYS) return 1;
+    keys = getKeysFromCommand(c->cmd, c->argv, c->argc, &numkeys);
+    for (i = 0; i < numkeys; i++) {
+        sds key = c->argv[keys[i]]->ptr;
+        listIter li;
+        listNode *ln;
+        int allowed = 0;
+        listRewind(s->patterns, &li);
+        while ((ln = listNext(&li))) {
+            sds pat = ln->value;
+            if (stringmatchlen(pat, (int)sdslen(pat), key, (int)sdslen(key), 0))
+                allowed = 1;
+        }
+        if (!allowed) {
+            *denied_key = keys[i];
+            getKeysFreeResult(keys);
+            return -1;
+        }
+    }
+    getKeysFreeResult(keys);
+    return 1;
+}
+
+/* Returns C_OK when the command may run. The root selector and every added
+ * selector are tried; the first that allows the command wins. On refusal the
+ * denial is logged and C_ERR is returned. Scripts use the quiet form because
+ * the Lua pseudo-client has no socket. */
 static int ACLCheckCommandInternal(client *c, int reply) {
     user *u = c->user;
-    int *keys, numkeys, i;
+    listIter li;
+    listNode *ln;
+    int denied_key = 0, saw_key = 0, result;
     if (u == NULL) return C_OK;
     if (!(u->flags & USER_ENABLED)) {
         if (reply) addReplyError(c,"user is disabled");
@@ -322,35 +417,25 @@ static int ACLCheckCommandInternal(client *c, int reply) {
     if (c->cmd->proc == aclCommand && c->argc == 2 &&
         (!strcasecmp(c->argv[1]->ptr,"whoami") ||
          !strcasecmp(c->argv[1]->ptr,"help"))) return C_OK;
-    if (!(u->flags & USER_ALLCMD) && !aclCommandBit(u, c->cmd->id)) {
+    result = aclSelectorAllows(&u->root, c, &denied_key);
+    if (result == 1) return C_OK;
+    if (result < 0) saw_key = 1;
+    listRewind(u->selectors, &li);
+    while ((ln = listNext(&li))) {
+        result = aclSelectorAllows(ln->value, c, &denied_key);
+        if (result == 1) return C_OK;
+        if (result < 0) saw_key = 1;
+    }
+    if (saw_key) {
+        ACLAddLogEntry(c,ACL_DENIED_KEY,denied_key,NULL);
+        if (reply) addReplyError(c,"key access denied");
+    } else {
         ACLAddLogEntry(c,ACL_DENIED_CMD,0,NULL);
         if (reply)
             addReplyErrorFormat(c,"user has no permission to run '%s'",
                                 c->cmd->name);
-        return C_ERR;
     }
-    if (u->flags & USER_ALLKEYS) return C_OK;
-    keys = getKeysFromCommand(c->cmd, c->argv, c->argc, &numkeys);
-    for (i = 0; i < numkeys; i++) {
-        sds key = c->argv[keys[i]]->ptr;
-        listIter li;
-        listNode *ln;
-        int allowed = 0;
-        listRewind(u->patterns, &li);
-        while ((ln = listNext(&li))) {
-            sds pat = ln->value;
-            if (stringmatchlen(pat, (int)sdslen(pat), key, (int)sdslen(key), 0))
-                allowed = 1;
-        }
-        if (!allowed) {
-            ACLAddLogEntry(c,ACL_DENIED_KEY,keys[i],NULL);
-            getKeysFreeResult(keys);
-            if (reply) addReplyError(c,"key access denied");
-            return C_ERR;
-        }
-    }
-    getKeysFreeResult(keys);
-    return C_OK;
+    return C_ERR;
 }
 
 int ACLCheckCommand(client *c) {
@@ -365,24 +450,38 @@ int ACLCheckCommandQuiet(client *c) {
  * Literal channels are glob-matched against the user's channel patterns. A
  * pattern subscription must match an ACL pattern literally: accepting a
  * wider pattern would allow channels outside the ACL. */
+/* A selector allows a channel when it grants all channels or one of its
+ * patterns matches. A pattern subscription must match an ACL pattern
+ * literally: accepting a wider pattern would allow channels outside the ACL. */
+static int aclSelectorAllowsChannel(aclSelector *s, robj *channel,
+                                    int is_pattern) {
+    listIter li;
+    listNode *ln;
+    if (s->flags & USER_ALLCHANNELS) return 1;
+    listRewind(s->channels,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        sds pat = ln->value;
+        if (is_pattern) {
+            if (sdslen(pat) == sdslen(channel->ptr) &&
+                memcmp(pat,channel->ptr,sdslen(pat)) == 0) return 1;
+        } else if (stringmatchlen(pat,(int)sdslen(pat),
+                                  channel->ptr,(int)sdslen(channel->ptr),0)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int ACLCheckPubsubPermission(client *c, robj *channel, int is_pattern) {
     user *u = c->user;
     listIter li;
     listNode *ln;
 
     if (u == NULL) return C_OK;
-    if (u->flags & USER_ALLCHANNELS) return C_OK;
-    listRewind(u->channels,&li);
-    while ((ln = listNext(&li)) != NULL) {
-        sds pat = ln->value;
-        if (is_pattern) {
-            if (sdslen(pat) == sdslen(channel->ptr) &&
-                memcmp(pat,channel->ptr,sdslen(pat)) == 0) return C_OK;
-        } else if (stringmatchlen(pat,(int)sdslen(pat),
-                                  channel->ptr,(int)sdslen(channel->ptr),0)) {
-            return C_OK;
-        }
-    }
+    if (aclSelectorAllowsChannel(&u->root, channel, is_pattern)) return C_OK;
+    listRewind(u->selectors,&li);
+    while ((ln = listNext(&li)) != NULL)
+        if (aclSelectorAllowsChannel(ln->value, channel, is_pattern)) return C_OK;
     return C_ERR;
 }
 
@@ -469,19 +568,19 @@ void authCommand(client *c) {
     addReply(c, shared.ok);
 }
 
-/* Describe the command rules of a user in the same syntax accepted by
- * ACL SETUSER, for ACL GETUSER. */
-static sds ACLDescribeUserCommandRules(user *u) {
+/* Describe the command rules of one selector in the same syntax accepted by
+ * ACL SETUSER, for ACL GETUSER and ACL SAVE. */
+static sds ACLDescribeUserCommandRules(aclSelector *s) {
     sds rules = sdsempty();
     raxIterator ri;
 
-    if (u->flags & USER_ALLCMD) return sdscat(rules,"+@all");
+    if (s->flags & USER_ALLCMD) return sdscat(rules,"+@all");
     rules = sdscat(rules,"-@all");
     raxStart(&ri,CommandIds);
     raxSeek(&ri,"^",NULL,0);
     while(raxNext(&ri)) {
         unsigned id = (unsigned)(size_t)ri.data - 1;
-        if (aclCommandBit(u,id)) {
+        if (aclCommandBit(s,id)) {
             rules = sdscat(rules," +");
             rules = sdscatlen(rules,ri.key,ri.key_len);
         }
@@ -490,49 +589,56 @@ static sds ACLDescribeUserCommandRules(user *u) {
     return rules;
 }
 
+static int aclSelectorAllowsCommand(aclSelector *s, struct redisCommand *cmd,
+                                    robj **argv, int argc);
+
 /* Check whether a user may run the given command with the given arguments,
  * without executing it (ACL DRYRUN). On refusal *err is set to an sds
  * describing the reason and the caller must free it. */
 static int aclCheckUserPerm(user *u, struct redisCommand *cmd,
                             robj **argv, int argc, sds *err)
 {
-    int *keys, numkeys, i;
-
     if (!(u->flags & USER_ENABLED)) {
         *err = sdsnew("User is disabled");
         return C_ERR;
     }
-    if (!(u->flags & USER_ALLCMD) && !aclCommandBit(u,cmd->id)) {
-        *err = sdscatprintf(sdsempty(),
-            "This user has no permissions to run the '%s' command",cmd->name);
-        return C_ERR;
+    if (aclSelectorAllowsCommand(&u->root, cmd, argv, argc)) return C_OK;
+    {
+        listIter li;
+        listNode *ln;
+        listRewind(u->selectors,&li);
+        while ((ln = listNext(&li)))
+            if (aclSelectorAllowsCommand(ln->value, cmd, argv, argc)) return C_OK;
     }
-    if (u->flags & USER_ALLKEYS) return C_OK;
+    *err = sdscatprintf(sdsempty(),
+        "This user has no permissions to run the '%s' command or "
+        "to access one of the keys used as arguments", cmd->name);
+    return C_ERR;
+}
 
-    keys = getKeysFromCommand(cmd,argv,argc,&numkeys);
+/* Whether one selector grants a command and every key it touches. Used by
+ * DRYRUN, which has a command and arguments but no client. */
+static int aclSelectorAllowsCommand(aclSelector *s, struct redisCommand *cmd,
+                                    robj **argv, int argc) {
+    int *keys, numkeys, i;
+    if (!(s->flags & USER_ALLCMD) && !aclCommandBit(s, cmd->id)) return 0;
+    if (s->flags & USER_ALLKEYS) return 1;
+    keys = getKeysFromCommand(cmd, argv, argc, &numkeys);
     for (i = 0; i < numkeys; i++) {
         sds key = argv[keys[i]]->ptr;
         listIter li;
         listNode *ln;
         int allowed = 0;
-
-        listRewind(u->patterns,&li);
+        listRewind(s->patterns,&li);
         while ((ln = listNext(&li))) {
             sds pat = ln->value;
-            if (stringmatchlen(pat,(int)sdslen(pat),key,(int)sdslen(key),0)) {
+            if (stringmatchlen(pat,(int)sdslen(pat),key,(int)sdslen(key),0))
                 allowed = 1;
-                break;
-            }
         }
-        if (!allowed) {
-            *err = sdsnew("This user has no permissions to access one of "
-                          "the keys used as arguments");
-            if (keys) getKeysFreeResult(keys);
-            return C_ERR;
-        }
+        if (!allowed) { if (keys) getKeysFreeResult(keys); return 0; }
     }
     if (keys) getKeysFreeResult(keys);
-    return C_OK;
+    return 1;
 }
 
 /* =============================================================================
@@ -664,11 +770,10 @@ static user *ACLCreateUserIn(dict *users, const char *name) {
     user *u = zcalloc(sizeof(*u));
     u->name = sdsnew(name);
     u->passwords = listCreate();
-    u->patterns = listCreate();
-    u->channels = listCreate();
     listSetFreeMethod(u->passwords, (void (*)(void*))sdsfree);
-    listSetFreeMethod(u->patterns, (void (*)(void*))sdsfree);
-    listSetFreeMethod(u->channels, (void (*)(void*))sdsfree);
+    aclInitSelector(&u->root);
+    u->selectors = listCreate();
+    listSetFreeMethod(u->selectors, (void (*)(void*))aclFreeSelector);
     dictAdd(users, sdsnew(name), u);
     return u;
 }
@@ -684,15 +789,31 @@ static list *aclCopySdsList(list *src) {
 }
 
 /* Copy every rule of src into dst, keeping dst's name and address. */
+static aclSelector *aclCloneSelector(aclSelector *src) {
+    aclSelector *s = zcalloc(sizeof(*s));
+    s->flags = src->flags;
+    s->patterns = aclCopySdsList(src->patterns);
+    s->channels = aclCopySdsList(src->channels);
+    memcpy(s->commands, src->commands, sizeof(s->commands));
+    return s;
+}
+
 static void ACLCopyUser(user *dst, user *src) {
+    listIter li;
+    listNode *ln;
     listRelease(dst->passwords);
-    listRelease(dst->patterns);
-    listRelease(dst->channels);
+    listRelease(dst->root.patterns);
+    listRelease(dst->root.channels);
+    listEmpty(dst->selectors);
     dst->passwords = aclCopySdsList(src->passwords);
-    dst->patterns = aclCopySdsList(src->patterns);
-    dst->channels = aclCopySdsList(src->channels);
+    dst->root.patterns = aclCopySdsList(src->root.patterns);
+    dst->root.channels = aclCopySdsList(src->root.channels);
     dst->flags = src->flags;
-    memcpy(dst->commands,src->commands,sizeof(dst->commands));
+    dst->root.flags = src->root.flags;
+    memcpy(dst->root.commands, src->root.commands, sizeof(dst->root.commands));
+    listRewind(src->selectors,&li);
+    while ((ln = listNext(&li)))
+        listAddNodeTail(dst->selectors, aclCloneSelector(ln->value));
 }
 
 /* Delete a user and disconnect every client authenticated as it. Clients keep
@@ -715,6 +836,8 @@ static void ACLFreeUserAndKillClients(user *u) {
     aclFreeUser(NULL,u);
 }
 
+static sds aclAppendSelector(sds d, aclSelector *s);
+
 /* Describe all rules of a user in the syntax accepted by ACL SETUSER. */
 static sds ACLDescribeUser(user *u) {
     sds d = sdsempty();
@@ -726,19 +849,35 @@ static sds ACLDescribeUser(user *u) {
     listRewind(u->passwords,&li);
     while ((ln = listNext(&li)))
         d = sdscatprintf(d," #%s",(char*)ln->value);
-    if (u->flags & USER_ALLKEYS) d = sdscat(d," ~*");
-    listRewind(u->patterns,&li);
+    d = aclAppendSelector(d, &u->root);
+    listRewind(u->selectors,&li);
+    while ((ln = listNext(&li))) {
+        sds body = aclAppendSelector(sdsempty(), ln->value);
+        d = sdscat(d," (");
+        d = sdscatsds(d, body);
+        d = sdscat(d,")");
+        sdsfree(body);
+    }
+    return d;
+}
+
+/* Append one selector's key, channel and command rules. */
+static sds aclAppendSelector(sds d, aclSelector *s) {
+    listIter li;
+    listNode *ln;
+    if (s->flags & USER_ALLKEYS) d = sdscat(d," ~*");
+    listRewind(s->patterns,&li);
     while ((ln = listNext(&li)))
         d = sdscatprintf(d," ~%s",(char*)ln->value);
-    if (u->flags & USER_ALLCHANNELS) {
+    if (s->flags & USER_ALLCHANNELS) {
         d = sdscat(d," allchannels");
     } else {
         d = sdscat(d," resetchannels");
-        listRewind(u->channels,&li);
+        listRewind(s->channels,&li);
         while ((ln = listNext(&li)))
             d = sdscatprintf(d," &%s",(char*)ln->value);
     }
-    sds rules = ACLDescribeUserCommandRules(u);
+    sds rules = ACLDescribeUserCommandRules(s);
     d = sdscat(d," ");
     d = sdscatsds(d,rules);
     sdsfree(rules);
@@ -818,8 +957,9 @@ sds ACLLoadFromFile(const char *filename) {
 
     dict *newusers = dictCreate(&usersDictType,NULL);
     user *newdefault = ACLCreateUserIn(newusers,"default");
-    aclAllowAll(newdefault);
-    newdefault->flags |= USER_ENABLED | USER_ALLKEYS | USER_NOPASS;
+    aclAllowAll(&newdefault->root);
+    newdefault->flags |= USER_ENABLED | USER_NOPASS;
+    newdefault->root.flags |= USER_ALLKEYS | USER_ALLCHANNELS;
     if (server.requirepass) {
         sds rule = sdscatprintf(sdsempty(), ">%s", server.requirepass);
         ACLSetUser(newdefault, rule);
@@ -1107,17 +1247,17 @@ void aclCommand(client *c) {
             addReply(c,shared.nullmultibulk);
             return;
         }
-        addReplyMultiBulkLen(c,10);
+        addReplyMultiBulkLen(c,12);
 
         int numflags = 1;
-        if (u->flags & USER_ALLKEYS) numflags++;
-        if (u->flags & USER_ALLCMD) numflags++;
+        if (u->root.flags & USER_ALLKEYS) numflags++;
+        if (u->root.flags & USER_ALLCMD) numflags++;
         if (u->flags & USER_NOPASS) numflags++;
         addReplyBulkCString(c,"flags");
         addReplyMultiBulkLen(c,numflags);
         addReplyBulkCString(c,(u->flags & USER_ENABLED) ? "on" : "off");
-        if (u->flags & USER_ALLKEYS) addReplyBulkCString(c,"allkeys");
-        if (u->flags & USER_ALLCMD) addReplyBulkCString(c,"allcommands");
+        if (u->root.flags & USER_ALLKEYS) addReplyBulkCString(c,"allkeys");
+        if (u->root.flags & USER_ALLCMD) addReplyBulkCString(c,"allcommands");
         if (u->flags & USER_NOPASS) addReplyBulkCString(c,"nopass");
 
         addReplyBulkCString(c,"passwords");
@@ -1131,15 +1271,15 @@ void aclCommand(client *c) {
         }
 
         addReplyBulkCString(c,"commands");
-        addReplyBulkSds(c, ACLDescribeUserCommandRules(u));
+        addReplyBulkSds(c, ACLDescribeUserCommandRules(&u->root));
 
         addReplyBulkCString(c,"keys");
-        if (u->flags & USER_ALLKEYS) {
+        if (u->root.flags & USER_ALLKEYS) {
             addReplyMultiBulkLen(c,1);
             addReplyBulkCString(c,"~*");
         } else {
-            addReplyMultiBulkLen(c, listLength(u->patterns));
-            listRewind(u->patterns,&li);
+            addReplyMultiBulkLen(c, listLength(u->root.patterns));
+            listRewind(u->root.patterns,&li);
             while ((ln = listNext(&li))) {
                 sds pat = ln->value;
                 addReplyBulkSds(c, sdscatprintf(sdsempty(),"~%s",pat));
@@ -1147,17 +1287,23 @@ void aclCommand(client *c) {
         }
 
         addReplyBulkCString(c,"channels");
-        if (u->flags & USER_ALLCHANNELS) {
+        if (u->root.flags & USER_ALLCHANNELS) {
             addReplyMultiBulkLen(c,1);
             addReplyBulkCString(c,"&*");
         } else {
-            addReplyMultiBulkLen(c,listLength(u->channels));
-            listRewind(u->channels,&li);
+            addReplyMultiBulkLen(c,listLength(u->root.channels));
+            listRewind(u->root.channels,&li);
             while ((ln = listNext(&li))) {
                 sds pat = ln->value;
                 addReplyBulkSds(c, sdscatprintf(sdsempty(),"&%s",pat));
             }
         }
+
+        addReplyBulkCString(c,"selectors");
+        addReplyMultiBulkLen(c, listLength(u->selectors));
+        listRewind(u->selectors,&li);
+        while ((ln = listNext(&li)))
+            addReplyBulkSds(c, aclAppendSelector(sdsempty(), ln->value));
         return;
     }
     if (!strcasecmp(c->argv[1]->ptr,"genpass") &&

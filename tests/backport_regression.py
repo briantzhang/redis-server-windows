@@ -2073,13 +2073,19 @@ class BackportRegression(unittest.TestCase):
 
         self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "SET",
                                   "key", "value"),
-                         [[b"key", [b"RW", b"access", b"update"]]])
+                         [[b"key", [b"RW", b"access", b"update",
+                                     b"variable_flags"]]])
         self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "GET", "key"),
                          [[b"key", [b"RO", b"access"]]])
+        # BITOP's destination is overwritten, its sources are only read.
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "BITOP",
+                                  "AND", "dest", "src"),
+                         [[b"dest", [b"OW", b"update"]],
+                          [b"src", [b"RO", b"access"]]])
         self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "MSET",
                                   "a", "1", "b", "2"),
-                         [[b"a", [b"RW", b"access", b"update"]],
-                          [b"b", [b"RW", b"access", b"update"]]])
+                         [[b"a", [b"OW", b"update"]],
+                          [b"b", [b"OW", b"update"]]])
         with self.assertRaises(RedisError):
             self.cmd("COMMAND", "GETKEYSANDFLAGS", "NOSUCHCOMMAND", "x")
         with self.assertRaises(RedisError):
@@ -2092,10 +2098,16 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(get_docs[b"group"], b"string")
         self.assertIn(b"value", get_docs[b"summary"].lower())
         self.assertEqual(get_docs[b"since"], b"1.0.0")
-        self.assertEqual(get_docs[b"arguments"], b"key")
+        self.assertEqual(get_docs[b"complexity"], b"O(1)")
+        get_key = self.flat_map(get_docs[b"arguments"][0])
+        self.assertEqual(get_key[b"name"], b"key")
+        self.assertEqual(get_key[b"type"], b"key")
         zrank_docs = self.flat_map(docs[b"zrank"])
         self.assertEqual(zrank_docs[b"group"], b"sorted_set")
-        self.assertIn(b"WITHSCORE", zrank_docs[b"arguments"])
+        zrank_args = [self.flat_map(arg) for arg in zrank_docs[b"arguments"]]
+        self.assertEqual(zrank_args[2][b"token"], b"WITHSCORE")
+        self.assertEqual(zrank_docs[b"history"],
+                         [[b"7.2.0", b"Added the optional `WITHSCORE` argument."]])
         self.assertNotIn(b"nosuchcommand", docs)
 
         help_text = self.cmd("COMMAND", "HELP")
@@ -2631,6 +2643,35 @@ class BackportRegression(unittest.TestCase):
                                   "resetchannels", "&news:*"), b"OK")
         reset = self.flat_map(self.cmd("ACL", "GETUSER", "bp17pub"))
         self.assertEqual(reset[b"channels"], [b"&news:*"])
+
+    def test_acl_selectors(self):
+        # The root grants reads of cache:*, one selector grants writes of
+        # log:*. A command is allowed when either set allows it.
+        self.assertEqual(self.cmd("ACL", "SETUSER", "bp22sel", "on", ">pw",
+                                  "~cache:*", "+@read",
+                                  "(+@write ~log:*)"), b"OK")
+        info = self.flat_map(self.cmd("ACL", "GETUSER", "bp22sel"))
+        self.assertEqual(info[b"keys"], [b"~cache:*"])
+        self.assertTrue(any(b"~log:*" in s for s in info[b"selectors"]))
+
+        cli = self.connect()
+        self.addCleanup(cli.close)
+        self.assertEqual(cli.command("AUTH", "bp22sel", "pw"), b"OK")
+        self.assertEqual(cli.command("ACL", "WHOAMI"), b"bp22sel")
+        with self.assertRaises(RedisError):
+            cli.command("SET", "cache:a", "1")
+        self.assertEqual(cli.command("SET", "log:a", "1"), b"OK")
+        self.assertEqual(cli.command("GET", "cache:a"), None)
+        with self.assertRaises(RedisError):
+            cli.command("GET", "log:a")
+
+        # clearselectors drops the added sets and keeps the root.
+        self.assertEqual(self.cmd("ACL", "SETUSER", "bp22sel",
+                                  "clearselectors"), b"OK")
+        cleared = self.flat_map(self.cmd("ACL", "GETUSER", "bp22sel"))
+        self.assertEqual(cleared[b"selectors"], [])
+        with self.assertRaises(RedisError):
+            cli.command("SET", "log:a", "2")
 
     def test_script_flush_options(self):
         sha = self.cmd("SCRIPT", "LOAD", "return 1")
