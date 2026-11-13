@@ -3274,7 +3274,7 @@ void zscoreCommand(client *c) {
         checkType(c,zobj,OBJ_ZSET)) return;
 
     if (zsetScore(zobj,c->argv[2]->ptr,&score) == C_ERR) {
-        addReply(c,shared.nullbulk);
+        addReplyNull(c);
     } else {
         addReplyDouble(c,score);
     }
@@ -3288,7 +3288,7 @@ void zmscoreCommand(client *c) {
     for (int j = 2; j < c->argc; j++) {
         double score;
         if (!zobj || zsetScore(zobj,c->argv[j]->ptr,&score) == C_ERR)
-            addReply(c,shared.nullbulk);
+            addReplyNull(c);
         else
             addReplyDouble(c,score);
     }

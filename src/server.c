@@ -3297,7 +3297,7 @@ static void addReplyCommandDocArg(client *c, int index) {
     if (arg->flags) maplen++;
     if (arg->child != -1) maplen++;
 
-    addReplyMultiBulkLen(c, maplen*2);
+    addReplyMapLen(c, maplen);
     addReplyBulkCString(c,"name");
     addReplyBulkCString(c,arg->name);
     addReplyBulkCString(c,"type");
@@ -3407,7 +3407,7 @@ static void addReplyCommandDocs(client *c, struct redisCommand *cmd) {
     if (doc && doc->arg_n > 0) maplen++;
     if (doc && doc->hist_n > 0) maplen++;
 
-    addReplyMultiBulkLen(c, maplen*2);
+    addReplyMapLen(c, maplen);
     if (summary) {
         addReplyBulkCString(c,"summary");
         addReplyBulkCString(c,summary);

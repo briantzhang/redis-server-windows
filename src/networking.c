@@ -128,6 +128,7 @@ client *createClient(int fd) {
     c->pending_querybuf = sdsempty();
     c->querybuf_peak = 0;
     c->reqtype = 0;
+    c->resp = 2;
     c->argc = 0;
     c->argv = NULL;
     c->cmd = c->lastcmd = NULL;
@@ -331,6 +332,14 @@ static int isSharedErrorObject(robj *o) {
 void addReply(client *c, robj *obj) {
     if (prepareClientToWrite(c) != C_OK) return;
 
+    /* Callers pass the RESP2 bulk or array null for a missing value. A RESP3
+     * connection gets the null type instead, so the conversion lives here. */
+    if (c->resp == 3 && (obj == shared.nullbulk || obj == shared.nullmultibulk)) {
+        if (_addReplyToBuffer(c,"_\r\n",3) != C_OK)
+            _addReplyStringToList(c,"_\r\n",3);
+        return;
+    }
+
     if (isSharedErrorObject(obj)) {
         char *s = obj->ptr;
         size_t len = sdslen(obj->ptr);
@@ -528,9 +537,22 @@ void addReplyDouble(client *c, double d) {
     if (isinf(d)) {
         /* Libc in odd systems (Hi Solaris!) will format infinite in a
          * different way, so better to handle it in an explicit way. */
-        addReplyBulkCString(c, d > 0 ? "inf" : "-inf");
+        if (c->resp == 3) {
+            addReplyString(c,d > 0 ? ",inf\r\n" : ",-inf\r\n",
+                d > 0 ? 6 : 7);
+        } else {
+            addReplyBulkCString(c, d > 0 ? "inf" : "-inf");
+        }
+        return;
+    }
+    dlen = snprintf(dbuf,sizeof(dbuf),"%.17g",d);
+    if (c->resp == 3) {
+        sbuf[0] = ',';
+        memcpy(sbuf+1,dbuf,dlen);
+        sbuf[dlen+1] = '\r';
+        sbuf[dlen+2] = '\n';
+        addReplyString(c,sbuf,dlen+3);
     } else {
-        dlen = snprintf(dbuf,sizeof(dbuf),"%.17g",d);
         slen = snprintf(sbuf,sizeof(sbuf),"$%d\r\n%s\r\n",dlen,dbuf);
         addReplyString(c,sbuf,slen);
     }
@@ -583,6 +605,60 @@ void addReplyMultiBulkLen(client *c, PORT_LONG length) {
         addReply(c,shared.mbulkhdr[length]);
     else
         addReplyLongLongWithPrefix(c,length,'*');
+}
+
+/* RESP3 aggregate lengths. A map has `length` field/value pairs. On a RESP2
+ * connection a map is a flat array of twice that many elements and a set is an
+ * ordinary array, so callers can use these without checking the protocol. */
+void addReplyArrayLen(client *c, PORT_LONG length) {
+    addReplyLongLongWithPrefix(c,length,'*');
+}
+
+void addReplyMapLen(client *c, PORT_LONG length) {
+    if (c->resp == 3) addReplyLongLongWithPrefix(c,length,'%');
+    else addReplyLongLongWithPrefix(c,length*2,'*');
+}
+
+void addReplySetLen(client *c, PORT_LONG length) {
+    addReplyLongLongWithPrefix(c,length,c->resp == 3 ? '~' : '*');
+}
+
+/* RESP3 null (`_`). RESP2 keeps the bulk and array nulls it already speaks;
+ * addReply converts either shared null when the connection is RESP3. */
+void addReplyNull(client *c) {
+    addReply(c,shared.nullbulk);
+}
+
+void addReplyNullArray(client *c) {
+    addReply(c,shared.nullmultibulk);
+}
+
+void addReplyBool(client *c, int b) {
+    if (c->resp == 3) addReplyString(c,b ? "#t\r\n" : "#f\r\n",4);
+    else addReply(c,b ? shared.cone : shared.czero);
+}
+
+/* Verbatim string (`=`) carries a 3 character format, padded with spaces.
+ * RESP2 has no such type and gets a plain bulk. */
+void addReplyVerbatim(client *c, const char *s, size_t len, const char *ext) {
+    char prefix[16];
+    int plen;
+    char fmt[3] = {' ',' ',' '};
+    size_t elen;
+
+    if (c->resp != 3) {
+        addReplyBulkCBuffer(c,s,len);
+        return;
+    }
+    elen = ext ? strlen(ext) : 0;
+    if (elen > 3) elen = 3;
+    if (elen) memcpy(fmt,ext,elen);
+    plen = snprintf(prefix,sizeof(prefix),"=%zu\r\n",len+4);
+    addReplyString(c,prefix,plen);
+    addReplyString(c,fmt,3);
+    addReplyString(c,":",1);
+    addReplyString(c,s,len);
+    addReplyString(c,"\r\n",2);
 }
 
 /* Create the length prefix of a bulk reply, example: $2234 */
@@ -1952,6 +2028,7 @@ void resetCommand(client *c) {
     c->lib_ver = NULL;
     c->flags &= ~CLIENT_PUBSUB;
     selectDb(c,0);
+    c->resp = 2;
     addReply(c,shared.ok);
 }
 
@@ -2445,8 +2522,8 @@ NULL
             addReplyLongLong(c,-1);
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"trackinginfo") && c->argc == 2) {
-        /* RESP2 flat map: flags / redirect / prefixes */
-        addReplyMultiBulkLen(c,6);
+        /* Map of flags / redirect / prefixes. Flat on a RESP2 connection. */
+        addReplyMapLen(c,3);
 
         addReplyBulkCString(c,"flags");
         void *arraylen_ptr = addDeferredMultiBulkLength(c);
@@ -2510,10 +2587,12 @@ NULL
 
 /* HELLO [protover [AUTH username password] [SETNAME name]]
  *
- * Handshake used by modern clients. This build only speaks RESP2, so protocol
- * 2 is accepted and protocol 3 is rejected with NOPROTO. The reply is a flat
- * RESP2 field/value array (not a RESP3 map). AUTH reuses the same ACL check as
- * the AUTH command; SETNAME follows CLIENT SETNAME charset rules. */
+ * Handshake used by modern clients. Protocol 2 and 3 are accepted; anything else
+ * is rejected with NOPROTO. The reply is a map (a flat field/value array while the
+ * connection is still RESP2). The version given here applies to this reply and
+ * stays in effect until HELLO changes it or RESET brings the connection back to
+ * protocol 2. AUTH reuses the same ACL check as the AUTH command; SETNAME follows
+ * CLIENT SETNAME charset rules. */
 void helloCommand(client *c) {
     PORT_LONGLONG ver = 0;
     int next_arg = 1;
@@ -2527,11 +2606,7 @@ void helloCommand(client *c) {
             "Protocol version is not an integer or out of range") != C_OK) {
             return;
         }
-        if (ver == 3) {
-            addReplyError(c,"-NOPROTO unsupported protocol version");
-            return;
-        }
-        if (ver != 2) {
+        if (ver != 2 && ver != 3) {
             addReplyError(c,"-NOPROTO unsupported protocol version");
             return;
         }
@@ -2593,14 +2668,16 @@ void helloCommand(client *c) {
         }
     }
 
-    /* Flat field/value array: server, version, proto, id, mode, role, modules. */
-    addReplyMultiBulkLen(c,14);
+    /* The negotiated version applies to this reply and everything after it.
+     * A map is a flat field/value array on a RESP2 connection. */
+    if (ver) c->resp = (int)ver;
+    addReplyMapLen(c,7);
     addReplyBulkCString(c,"server");
     addReplyBulkCString(c,"redis");
     addReplyBulkCString(c,"version");
     addReplyBulkCString(c,REDIS_VERSION);
     addReplyBulkCString(c,"proto");
-    addReplyLongLong(c,2);
+    addReplyLongLong(c,c->resp);
     addReplyBulkCString(c,"id");
     addReplyLongLong(c,c->id);
     addReplyBulkCString(c,"mode");

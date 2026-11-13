@@ -1244,10 +1244,10 @@ void aclCommand(client *c) {
     if (c->argc == 3 && !strcasecmp(c->argv[1]->ptr,"getuser")) {
         user *u = ACLGetUser(c->argv[2]->ptr);
         if (u == NULL) {
-            addReply(c,shared.nullmultibulk);
+            addReplyNullArray(c);
             return;
         }
-        addReplyMultiBulkLen(c,12);
+        addReplyMapLen(c,6);
 
         int numflags = 1;
         if (u->root.flags & USER_ALLKEYS) numflags++;

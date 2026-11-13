@@ -50,7 +50,9 @@ class RedisError(Exception):
 
 
 class RESP2:
-    """Small binary-safe RESP2 client; one instance per connection/thread."""
+    """Small binary-safe client. Requests are RESP2; replies of protocol 2 and 3
+    are both read. Maps come back as ordered (field, value) pair lists, sets as
+    lists, and the RESP3 null, bool and double as None, bool and float."""
 
     def __init__(self, host, port, timeout=5.0, password=None):
         self.sock = socket.create_connection((host, port), timeout)
@@ -103,19 +105,35 @@ class RESP2:
             return RedisError(value.decode("utf-8", "replace"))
         if kind == b":":
             return int(value)
-        if kind in (b"$", b"*"):
+        if kind in (b"$", b"*", b"%", b"~", b"="):
             length = int(value)
             if length == -1:
                 return None
             if length < 0:
                 raise ValueError("Invalid RESP length")
-            if kind == b"*":
+            if kind == b"*" or kind == b"~":
                 return [self._read() for _ in range(length)]
+            if kind == b"%":
+                return [(self._read(), self._read()) for _ in range(length)]
             data = self.reader.read(length)
             if len(data) != length or self.reader.read(2) != b"\r\n":
                 raise EOFError("Truncated RESP bulk reply")
             return data
-        raise ValueError("Unknown RESP2 type: %r" % kind)
+        if kind == b"_":
+            return None
+        if kind == b"#":
+            if value not in (b"t", b"f"):
+                raise ValueError("Invalid RESP3 bool: %r" % value)
+            return value == b"t"
+        if kind == b",":
+            return float(value)
+        if kind == b"!":
+            length = int(value)
+            data = self.reader.read(length)
+            if len(data) != length or self.reader.read(2) != b"\r\n":
+                raise EOFError("Truncated RESP blob error")
+            return RedisError(data.decode("utf-8", "replace"))
+        raise ValueError("Unknown RESP type: %r" % kind)
 
     def command(self, *args):
         self.sock.sendall(self.encode(args))
@@ -355,7 +373,10 @@ class BackportRegression(unittest.TestCase):
 
     @staticmethod
     def flat_map(reply):
-        """Convert a flat RESP2 map (field, value, field, value, ...) to a dict."""
+        """Convert a map reply to a dict. RESP2 sends a flat array of alternating
+        fields and values; RESP3 sends a list of (field, value) pairs."""
+        if reply and isinstance(reply[0], tuple):
+            return dict(reply)
         return {reply[i]: reply[i + 1] for i in range(0, len(reply), 2)}
 
     def race(self, commands):
@@ -2776,8 +2797,19 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("CLIENT", "GETNAME"), b"bp12-client")
 
         with self.assertRaises(RedisError) as ctx:
-            self.cmd("HELLO", "3")
+            self.cmd("HELLO", "4")
         self.assertIn("NOPROTO", str(ctx.exception))
+
+        # HELLO 3 switches this connection. The reply itself is already a map,
+        # and the choice survives later commands until RESET.
+        hello3 = self.cmd("HELLO", "3")
+        info3 = self.flat_map(hello3)
+        self.assertEqual(info3[b"proto"], 3)
+        self.assertIsInstance(hello3[0], tuple)
+        self.assertEqual(self.cmd("PING"), b"PONG")
+        self.assertEqual(self.flat_map(self.cmd("HELLO"))[b"proto"], 3)
+        self.assertEqual(self.cmd("RESET"), b"OK")
+        self.assertEqual(self.flat_map(self.cmd("HELLO"))[b"proto"], 2)
 
         if self.server is None:
             return
@@ -2799,6 +2831,29 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(raw.command("CLIENT", "GETNAME"), b"authed")
         with self.assertRaises(RedisError):
             raw.command("HELLO", "2", "AUTH", "default", "wrong")
+
+    def test_resp3_maps_null_and_double(self):
+        self.cmd("HELLO", "3")
+        self.addCleanup(lambda: self.cmd("HELLO", "2"))
+
+        docs = self.flat_map(self.cmd("COMMAND", "DOCS", "get"))
+        get_docs = self.flat_map(docs[b"get"])
+        self.assertEqual(get_docs[b"group"], b"string")
+        self.assertEqual(get_docs[b"complexity"], b"O(1)")
+        arg = self.flat_map(get_docs[b"arguments"][0])
+        self.assertEqual(arg[b"name"], b"key")
+        self.assertEqual(arg[b"type"], b"key")
+
+        user = self.flat_map(self.cmd("ACL", "GETUSER", "default"))
+        self.assertIn(b"on", user[b"flags"])
+        self.assertIsNone(self.cmd("ACL", "GETUSER", "nosuchuser"))
+
+        key = self.key("resp3:z")
+        self.cmd("DEL", key)
+        self.cmd("ZADD", key, "1.5", "a")
+        self.assertEqual(self.cmd("ZSCORE", key, "a"), 1.5)
+        self.assertIsNone(self.cmd("ZSCORE", key, "missing"))
+        self.assertIsNone(self.cmd("GET", self.key("resp3:absent")))
 
     def test_xinfo_consumers_inactive(self):
         key = self.key("xinfo:inactive")

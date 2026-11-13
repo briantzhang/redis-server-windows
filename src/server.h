@@ -784,6 +784,7 @@ typedef struct client {
     robj **argv;            /* Arguments of current command. */
     struct redisCommand *cmd, *lastcmd;  /* Last command executed. */
     int reqtype;            /* Request protocol type: PROTO_REQ_* */
+    int resp;               /* RESP protocol version. Can be 2 or 3. */
     int multibulklen;       /* Number of multi bulk arguments left to read. */
     PORT_LONG bulklen;           /* Length of bulk argument in multi bulk request. */
     list *reply;            /* List of reply objects to send to the client. */
@@ -1557,6 +1558,13 @@ void addReplyDouble(client *c, double d);
 void addReplyHumanLongDouble(client *c, PORT_LONGDOUBLE d);
 void addReplyLongLong(client *c, PORT_LONGLONG ll);
 void addReplyMultiBulkLen(client *c, PORT_LONG length);
+void addReplyArrayLen(client *c, PORT_LONG length);
+void addReplyMapLen(client *c, PORT_LONG length);
+void addReplySetLen(client *c, PORT_LONG length);
+void addReplyNull(client *c);
+void addReplyNullArray(client *c);
+void addReplyBool(client *c, int b);
+void addReplyVerbatim(client *c, const char *s, size_t len, const char *ext);
 void addReplyHelp(client *c, const char **help);
 void addReplySubcommandSyntaxError(client *c);
 void copyClientOutputBuffer(client *dst, client *src);
