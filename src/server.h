@@ -291,6 +291,7 @@ typedef PORT_LONGLONG ustime_t; /* microsecond time type. */
 #define CLIENT_TRACKING_OPTOUT (1ULL<<36)       /* Tracking in opt-out mode. */
 #define CLIENT_TRACKING_CACHING (1ULL<<37)      /* CACHING yes/no given this cmd. */
 #define CLIENT_TRACKING_NOLOOP (1ULL<<38)       /* Don't notify self-modifications. */
+#define CLIENT_TLS (1ULL<<39)                   /* Client socket is protected by TLS. */
 
 /* Client block type (btype field in client structure)
  * if CLIENT_BLOCKED flag is set. */
@@ -771,6 +772,9 @@ typedef struct readyList {
 typedef struct client {
     uint64_t id;            /* Client incremental unique ID. */
     int fd;                 /* Client socket. */
+    void *tls_ssl;          /* OpenSSL SSL object when CLIENT_TLS is set. */
+    int tls_handshaking;    /* TLS handshake is not complete yet. */
+    sds tls_outbuf;         /* Pending TLS ciphertext not yet written to fd. */
     redisDb *db;            /* Pointer to currently SELECTed DB. */
     robj *name;             /* As set by CLIENT SETNAME. */
     sds querybuf;           /* Buffer we use to accumulate client queries. */
@@ -1046,6 +1050,14 @@ struct redisServer {
                                    to be processed. */
     /* Networking */
     int port;                   /* TCP listening port */
+    int tls_port;               /* TLS listening port, 0 = disabled */
+    int tlsfd[CONFIG_BINDADDR_MAX]; /* TLS socket file descriptors */
+    int tlsfd_count;            /* Used slots in tlsfd[] */
+    char *tls_cert_file;        /* Server certificate chain (PEM) */
+    char *tls_key_file;         /* Server private key (PEM) */
+    char *tls_ca_cert_file;     /* CA bundle for client authentication */
+    char *tls_ca_cert_dir;      /* CA hash directory for client authentication */
+    int tls_auth_clients;       /* Require a verified client certificate */
     int tcp_backlog;            /* TCP listen() backlog */
     char *bindaddr[CONFIG_BINDADDR_MAX]; /* Addresses we should bind to */
     int bindaddr_count;         /* Number of addresses in server.bindaddr[] */
@@ -1541,6 +1553,7 @@ void processInputBufferAndReplicate(client *c);
 int processPendingCommandsAndResetClient(client *c);
 void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+void acceptTlsHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask);
 void addReplyString(client *c, const char *s, size_t len);
@@ -1561,6 +1574,7 @@ void addReplyMultiBulkLen(client *c, PORT_LONG length);
 void addReplyArrayLen(client *c, PORT_LONG length);
 void addReplyMapLen(client *c, PORT_LONG length);
 void addReplySetLen(client *c, PORT_LONG length);
+void addReplyPushLen(client *c, PORT_LONG length);
 void addReplyNull(client *c);
 void addReplyNullArray(client *c);
 void addReplyBool(client *c, int b);
@@ -2043,6 +2057,20 @@ int ldbRemoveChild(pid_t pid);
 void ldbKillForkedSessions(void);
 int ldbPendingChildren(void);
 sds luaCreateFunction(client *c, lua_State *lua, robj *body);
+void luaReplyToRedisReply(client *c, lua_State *lua);
+void luaSetGlobalArray(lua_State *lua, char *var, robj **elev, int elec);
+void luaMaskCountHook(lua_State *lua, lua_Debug *ar);
+
+/* Functions */
+ssize_t rdbSaveAuxField(rio *rdb, void *key, size_t keylen, void *val, size_t vallen);
+void functionsInit(int setup);
+void functionCommand(client *c);
+void fcallCommand(client *c);
+void fcallRoCommand(client *c);
+int *functionGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
+int functionsSaveAuxField(rio *rdb);
+int functionsLoadAuxField(robj *auxkey, robj *auxval);
+int functionsRewriteAOF(rio *aof);
 
 /* Blocked clients */
 void processUnblockedClients(void);

@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp23
+# Redis for Windows 5.0.14.1-bp26
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -73,7 +73,10 @@
 | `ACL HELP` | 6.0 | 列出 ACL 子命令；与 `ACL WHOAMI` 一样对已认证用户放行 |
 | `SCAN ... TYPE type` | 6.0 | 键空间扫描可按类型过滤；未知类型名返回空页，不报错 |
 | `HELLO [protover [AUTH user pass] [SETNAME name]]` | 6.0 | 握手；接受协议 2 和 3，其它版本返回 NOPROTO；协议 3 下回复为 RESP3 map |
-| `CLIENT TRACKING` / `CACHING` / `GETREDIR` / `TRACKINGINFO` | 6.0 / 6.2 | 客户端缓存追踪；失效经 Pub/Sub `__redis__:invalidate`（需 REDIRECT） |
+| RESP3 push 帧 | 6.0 | 协议 3 下 Pub/Sub 的订阅确认、消息和 `CLIENT TRACKING` 失效以 `>` 推送，可与命令回复区分 |
+| `FUNCTION LOAD/DELETE/FLUSH/LIST/DUMP/RESTORE`、`FCALL`、`FCALL_RO` | 7.0 | Lua 函数按库管理并随 RDB/AOF 保存；DUMP 为本版私有格式 |
+| TLS 客户端监听（`tls-port`、PEM 证书、`tls-auth-clients`） | 6.0 | OpenSSL 3 memory BIO 接入 IOCP；TLS 1.2/1.3；明文 `port` 可并存 |
+| `CLIENT TRACKING` / `CACHING` / `GETREDIR` / `TRACKINGINFO` | 6.0 / 6.2 | 客户端缓存追踪；RESP3 直接 push 失效，RESP2 经 Pub/Sub `__redis__:invalidate`（需 REDIRECT） |
 | `tracking-table-max-keys` CONFIG | 6.0 | TrackingTable 上限（0=不限，默认 1000000）；支持 GET/SET/REWRITE |
 | `INFO`/`MEMORY STATS` tracking 字段 | 6.0 / 6.2 | `tracking_clients`、`tracking_total_*` 与 `clients.tracking.table.*` |
 | `QUIT` 正式注册 | 1.0 | 进入命令表，可被 `COMMAND INFO`/`COUNT` 看到；Pub/Sub 与未认证场景仍可退出 |
@@ -91,12 +94,14 @@ ACL 支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@categor
 - 成功的带 TTL 的 SET 在 AOF 中记录为普通 SET + 绝对 PEXPIREAT；KEEPTTL 记录实际保留的截止时间。
 - GETEX 的写入记录为 PEXPIREAT、PERSIST 或 DEL/UNLINK；GETDEL 记录为 DEL。
 - 条件过期仅记录成功结果的绝对截止时间，恢复时不重新判断 NX/XX/GT/LT。
-- RESP3 只接入了类型和握手：`HELLO 3` 把该连接切到协议 3，map、set、null、bool、double 和 verbatim 按协议编码，`RESET` 退回协议 2。没有 RESP3 push，TRACKING 的失效通知仍走 Pub/Sub。不迁入新版 RDB 格式、多段 AOF、TLS、Functions 或集群功能。网络收发由多个 IO 线程分担，命令解析与执行仍在主线程。ACL 选择器对匹配的键一律放行，不区分读与写。`COMMAND DOCS` 的文档取自 Redis 7.0.15 的命令表，`ZRANK`/`ZREVRANK` 的 `WITHSCORE` 取自 7.2.5。原底座已有功能保留，但本版没有对其做现代化升级。
+- RESP3 接入了类型、握手和 push：`HELLO 3` 把该连接切到协议 3，map、set、null、bool、double 和 verbatim 按协议编码，`RESET` 退回协议 2。Pub/Sub 的订阅确认、消息、分片消息以及 TRACKING 失效在协议 3 下都是 `>` push 帧；协议 2 保持普通数组，TRACKING 失效仍走 Pub/Sub。不迁入新版 RDB 格式或多段 AOF。TLS 只覆盖客户端监听，主从复制和集群总线仍为明文，也不支持证书热加载。网络收发由多个 IO 线程分担，命令解析与执行仍在主线程。ACL 选择器对匹配的键一律放行，不区分读与写。`COMMAND DOCS` 的文档取自 Redis 7.0.15 的命令表，`ZRANK`/`ZREVRANK` 的 `WITHSCORE` 取自 7.2.5。原底座已有功能保留，但本版没有对其做现代化升级。
 - `maxmemory-clients` 限制普通客户端的查询缓冲、回复缓冲和参数向量之和，超出时断开占用最大的连接。`CLIENT NO-EVICT` 的连接以及副本、主连接和 MONITOR 不参与。占用按这三项估算，不是 Redis 7 的客户端内存桶。
 - `WAITAOF` 没有 7.2 的异步 fsync 完成队列：开启 AOF 时在命令内调用 `flushAppendOnlyFile` 并 `fsync`，然后立即返回；`numreplicas` 只做参数校验，回复中的副本数恒为 0，不阻塞到超时。
 - `XINFO CONSUMERS` 的 `inactive`/`active_time` 是运行时数据，不写入本版 RDB：快照恢复后 `inactive` 回到 -1，直到再次成功投递。
 - 命令延迟直方图是运行时数据，不写入 RDB/AOF；使用固定的对数桶而不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界。
 - `SCRIPT FLUSH ASYNC` 换上一份空的脚本缓存，把旧的交给后台的延迟释放线程。Lua 解释器本身仍在主线程关闭并重建，因为跨线程释放它不安全。
+- 集群沿用底座的 Redis 5.0 实现，槽位、握手、`MOVED`/`ASK` 重定向和故障转移代码未改写。bp25 增加三节点黑盒覆盖，并记录集群总线端口为客户端端口 +10000。
+- TLS 使用 OpenSSL 3.5.9 的 memory BIO：密文仍由 `read()` 和 `write()` 走原有 IOCP 就绪通知，不在 socket 上直接挂 `SSL_set_fd`。支持 `tls-port`、`tls-cert-file`、`tls-key-file`、`tls-ca-cert-file`、`tls-ca-cert-dir` 和 `tls-auth-clients`；没有 `tls-protocols`、`tls-ciphers`、`tls-replication`、`tls-cluster` 等配置。运行时需要随包的 `libssl-3-x64.dll` 与 `libcrypto-3-x64.dll`。
 - 网络/IOCP、Windows 服务与 fork 模拟层沿用底座代码。
 
 ## 性能预期
@@ -113,7 +118,7 @@ ACL 支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@categor
 .\build-tools\build-windows.ps1 -BuildTools 'D:\BuildTools\VS2022' -Toolset 'v143'
 ```
 
-产物位于 `msvs/x64/Release`。编译脚本会生成 `src/release.h`，写入底座 Git SHA 和工作区 dirty 状态；不自动提交或创建 Git 标签。
+产物位于 `msvs/x64/Release`。TLS 依赖 `deps/openssl` 下的 OpenSSL 3.5.9 头和 import lib；运行时从 `deps/openssl/bin` 取 `libssl-3-x64.dll`、`libcrypto-3-x64.dll`，打包脚本会把两个 DLL 和 `deps/openssl/LICENSE.txt` 放入发布包。编译脚本会生成 `src/release.h`，写入底座 Git SHA 和工作区 dirty 状态；不自动提交或创建 Git 标签。
 
 ## 验证
 
@@ -123,7 +128,7 @@ ACL 支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@categor
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。本轮覆盖 `HELLO 3` 的协议切换、RESP3 的 map、null 与 double；并保留 bp22 及更早用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。本轮覆盖 `FUNCTION` / `FCALL` 及 DUMP/RESTORE 往返、三节点集群组网与重定向，以及 TLS 明文/密文双监听、256 KiB 往返、流水线和 `tls-auth-clients yes` 客户端证书校验，还有 RESP3 下 Pub/Sub 与 TRACKING 的 push 帧；共 89 项。保留 bp23 的 RESP3 及 bp22 及更早用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 
@@ -131,4 +136,5 @@ python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.ex
 
 - Windows 底座：https://github.com/tporadowski/redis/releases/tag/v5.0.14.1
 - 命令参考：https://github.com/redis/redis/tree/7.0.15
+- TLS：OpenSSL 3.5.9（Apache License 2.0），Windows x64 二进制来自 Win64OpenSSL 3.5.9 安装包，许可证随包放在 `licenses/openssl-LICENSE.txt`。
 - 随包保留 `COPYING` 及原有源码版权声明。

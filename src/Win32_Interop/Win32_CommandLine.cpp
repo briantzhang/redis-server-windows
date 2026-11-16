@@ -379,6 +379,12 @@ static RedisParameterMapper g_redisArgMap =
     { "tcp-keepalive",                  &fp1 },    // tcp-keepalive [value]
     { "protected-mode",                 &fp1 },    // protected-mode [yes/no]
     { "port",                           &fp1 },    // port [port number]
+    { "tls-port",                       &fp1 },    // tls-port [port number]
+    { "tls-cert-file",                  &fp1 },    // tls-cert-file [path]
+    { "tls-key-file",                   &fp1 },    // tls-key-file [path]
+    { "tls-ca-cert-file",               &fp1 },    // tls-ca-cert-file [path]
+    { "tls-ca-cert-dir",                &fp1 },    // tls-ca-cert-dir [path]
+    { "tls-auth-clients",               &fp1 },    // tls-auth-clients [yes/no]
     { "tcp-backlog",                    &fp1 },    // tcp-backlog [number]
     { "bind",                           &bp },     // bind [address] [address] ...
     { "unixsocket",                     &fp1 },    // unixsocket [path]

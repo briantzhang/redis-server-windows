@@ -241,6 +241,27 @@ void loadServerConfigFromString(char* config) {
             if (server.port < 0 || server.port > 65535) {
                 err = "Invalid port"; goto loaderr;
             }
+        } else if (!strcasecmp(argv[0],"tls-port") && argc == 2) {
+            server.tls_port = atoi(argv[1]);
+            if (server.tls_port < 0 || server.tls_port > 65535) {
+                err = "Invalid TLS port"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"tls-cert-file") && argc == 2) {
+            zfree(server.tls_cert_file);
+            server.tls_cert_file = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"tls-key-file") && argc == 2) {
+            zfree(server.tls_key_file);
+            server.tls_key_file = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"tls-ca-cert-file") && argc == 2) {
+            zfree(server.tls_ca_cert_file);
+            server.tls_ca_cert_file = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"tls-ca-cert-dir") && argc == 2) {
+            zfree(server.tls_ca_cert_dir);
+            server.tls_ca_cert_dir = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"tls-auth-clients") && argc == 2) {
+            if ((server.tls_auth_clients = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
         } else if (!strcasecmp(argv[0],"tcp-backlog") && argc == 2) {
             server.tcp_backlog = atoi(argv[1]);
             if (server.tcp_backlog < 0) {
@@ -1551,6 +1572,12 @@ void configGetCommand(client *c) {
     config_get_numerical_field("acllog-max-len",server.acllog_max_len);
     config_get_string_field("masterauth",server.masterauth);
     config_get_string_field("cluster-announce-ip",server.cluster_announce_ip);
+    config_get_numerical_field("tls-port",server.tls_port);
+    config_get_string_field("tls-cert-file",server.tls_cert_file);
+    config_get_string_field("tls-key-file",server.tls_key_file);
+    config_get_string_field("tls-ca-cert-file",server.tls_ca_cert_file);
+    config_get_string_field("tls-ca-cert-dir",server.tls_ca_cert_dir);
+    config_get_bool_field("tls-auth-clients",server.tls_auth_clients);
     config_get_string_field("unixsocket",server.unixsocket);
     config_get_string_field("logfile",server.logfile);
     config_get_string_field("pidfile",server.pidfile);

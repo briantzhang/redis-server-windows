@@ -1,8 +1,8 @@
 # 运维手册
 
-适用版本：Redis for Windows `5.0.14.1-bp23`，仅 Windows x64，单机、非集群。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
+适用版本：Redis for Windows `5.0.14.1-bp26`，仅 Windows x64，支持单机和集群模式。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
 
-本文只覆盖这一个可执行文件的日常操作。它不包含 TLS、多段 AOF 和集群，那些配置项写进 `redis.conf` 也不会生效，启动时会报未知配置。ACL 已按 Redis 6 的范围实现，见第 3 节。
+本文只覆盖这一个可执行文件的日常操作。它不包含多段 AOF，相关配置项写进 `redis.conf` 也不会生效。TLS 只覆盖客户端监听，见第 4c 节；主从复制和集群总线仍是明文。集群模式沿用底座实现，见第 4b 节。ACL 已按 Redis 6 的范围实现，见第 3 节。
 
 ## 1. 目录与文件
 
@@ -13,6 +13,7 @@
 | `redis-server.exe` | 服务进程 |
 | `redis-cli.exe` | 命令行客户端 |
 | `redis-benchmark.exe` | 压测工具，不要对生产实例跑 |
+| `libssl-3-x64.dll` / `libcrypto-3-x64.dll` | OpenSSL 3 运行库；开 TLS 时必须与 `redis-server.exe` 同目录 |
 
 运行时数据默认写在启动时的工作目录：
 
@@ -38,7 +39,7 @@
 .\redis-server.exe --version
 ```
 
-应看到 `v=5.0.14.1-bp23`。如果不是这个版本号，说明运行的不是这份回移。
+应看到 `v=5.0.14.1-bp26`。如果不是这个版本号，说明运行的不是这份回移。
 
 另开一个窗口检查存活：
 
@@ -366,6 +367,59 @@ CONFIG SET latency-tracking no -- 停止采集，已有数据保留
 
 直方图按 1024ns 起、2 的幂分桶，`histogram_usec` 是“桶上界 → 累计次数”的扁平数组。它适合判断延迟量级，不是精确的尾延迟分布。直方图只存在内存里，重启或 `CONFIG RESETSTAT` 后从零开始。
 
+## 4a. Functions
+
+本版支持基础 Redis Functions：`#!lua name=<库名>` 声明库，`redis.register_function()` 注册回调，调用入口是 `FCALL` / `FCALL_RO`。函数以源码形式保存：RDB 使用 AUX 字段，AOF rewrite 在开头写出 `FUNCTION LOAD`。
+
+限制：`FUNCTION DUMP` 是本版私有格式，不与 Redis 7 互换；`FUNCTION STATS` 是简化输出；`FUNCTION KILL` 没有真正的脚本抢占；没有 `FUNCTION LOAD_RO`；flags 只实现 `no-writes` 写命令拦截。
+
+## 4b. 集群模式
+
+在配置中设置 `cluster-enabled yes`，并为每个节点指定独立的 `cluster-config-file`。集群总线监听客户端端口 +10000，配置防火墙和端口规划时要同时放行这两个端口。可用 `CLUSTER MEET` 加入节点，用 `CLUSTER ADDSLOTS` 分配槽位；`CLUSTER INFO` 的 `cluster_state` 变成 `ok` 后才会服务对应槽。客户端收到 `MOVED` 后应连接目标节点重试。
+
+本版沿用底座 Redis 5.0 的集群实现，没有改写槽迁移和故障转移代码。三节点本机组网、槽位分配、`MOVED` 重定向与 `CLUSTERDOWN` 已有黑盒覆盖；跨机器、网络分区和真实故障切换仍应在目标环境单独验证。
+
+## 4c. TLS 客户端监听
+
+TLS 和明文可以同时开。只想暴露 TLS 时把明文 `port` 设为 0：
+
+```text
+port 0
+tls-port 6380
+tls-cert-file D:/redis/certs/server.crt
+tls-key-file D:/redis/certs/server.key
+tls-ca-cert-file D:/redis/certs/ca.crt
+tls-auth-clients yes
+```
+
+- 证书和私钥都是 PEM。`tls-cert-file` 要按“服务器证书、中间证书”的顺序放完整链，`tls-key-file` 是不带口令的私钥。
+- `tls-auth-clients no` 只加密、不校验客户端证书，仍应配合 ACL 或 `requirepass` 使用；`yes` 要求客户端出示由 `tls-ca-cert-file`（或 `tls-ca-cert-dir`）签发的证书，没有证书的连接会在握手中被拒绝。
+- `tls-ca-cert-dir` 走 OpenSSL 的哈希目录格式，Windows 上不常用，优先用 `tls-ca-cert-file`。
+- `tls-port`、证书路径和 `tls-auth-clients` 在启动时读取；改证书或开关 TLS 需要重启进程。
+- 程序目录必须有 `libssl-3-x64.dll` 和 `libcrypto-3-x64.dll`，缺一个进程就起不来。发布包已带上这两个文件和 OpenSSL 许可证。
+- `INFO server` 的 `tls_port` 显示监听端口，`CONFIG GET tls-*` 可核对当前配置。
+
+证书可以从本机 CA 签发，服务器证书要带 SAN：
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 3650 \
+  -subj "/CN=Redis Internal CA" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=redis.example"
+printf 'subjectAltName=DNS:redis.example,IP:10.0.0.10\nextendedKeyUsage=serverAuth\n' > server.ext
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -out server.crt -days 825 -extfile server.ext
+```
+
+连通性可以用 `openssl s_client` 检查，看到证书链后输入 `PING`：
+
+```bash
+openssl s_client -connect 127.0.0.1:6380 -servername redis.example -CAfile ca.crt
+```
+
+需要客户端证书时再带 `-cert client.crt -key client.key`。TLS 只覆盖客户端连接；主从复制、集群总线、Sentinel 仍是明文，也没有证书热加载、`tls-protocols`、`tls-ciphers` 等配置项。
+
 ## 5. 持久化与恢复
 
 RDB 是某个时间点的快照，AOF 是写命令日志。两者同时开启时，重启优先用 AOF 恢复，因为它更接近停机前的状态。
@@ -420,7 +474,7 @@ BGREWRITEAOF
 
 等 `INFO persistence` 里两次后台任务的状态都变成 `ok`，再复制 `dir` 下的 `dump.rdb` 和 `appendonly.aof`。复制过程中不要 `SHUTDOWN`，也不要再手动触发保存。
 
-备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp23-20261109.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
+备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp26-20261109.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
 
 流的 `entries-added` 和 `max-deleted-entry-id` 不写入 RDB 快照：从 `dump.rdb` 恢复后前者按当前长度重算、后者归零；从 AOF 恢复（含 AOF 重写）会保留。若业务依赖这两个计数，恢复时优先使用 AOF，或在恢复后用 `XSETID <key> <id> ENTRIESADDED <n> MAXDELETEDID <id>` 校正。
 
@@ -461,6 +515,6 @@ AOF 启动失败：
 ## 9. 不在本版范围内的事
 
 - 不支持把一份数据目录挂给两个进程同时写。
-- 没有主从复制之外的高可用。底座保留了原有的复制命令，但本版没有额外验证哨兵和集群，生产不要靠它做故障切换。
-- 没有访问控制列表。需要账号级别的权限隔离时，本版做不到。
-- 客户端可以用 `HELLO 3` 切到 RESP3：map、set、null、bool、double 和 verbatim 都有。失效通知仍走 Pub/Sub 频道 `__redis__:invalidate`（需 `REDIRECT` 到已订阅该频道的连接），没有 RESP3 push。Redisson 单机模式下的 `SET ... KEEPTTL`、`GETEX`、`GETDEL` 属于本版已实现的范围。
+- 集群功能沿用底座实现，已有本机三节点覆盖，但没有验证哨兵、跨机器网络分区和真实故障切换；生产不要仅凭本版测试结论做故障切换。
+- ACL 已实现用户、口令、命令分类和键/频道通配符，但选择器没有按键的读写权限位，匹配到的键一律放行。见第 3 节。
+- 客户端可以用 `HELLO 3` 切到 RESP3：map、set、null、bool、double 和 verbatim 都有。协议 3 下 Pub/Sub 的订阅确认、消息以及 `CLIENT TRACKING` 失效都用 push 帧（`>`）发送，失效不需要 `REDIRECT`；协议 2 仍是普通数组，失效继续走 `__redis__:invalidate` 频道，必须 `REDIRECT` 到已订阅该频道的连接。Redisson 单机模式下的 `SET ... KEEPTTL`、`GETEX`、`GETDEL` 属于本版已实现的范围。

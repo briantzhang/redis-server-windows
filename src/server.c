@@ -36,6 +36,7 @@
 #endif
 
 #include "server.h"
+#include "tls.h"
 #include "cluster.h"
 #include "slowlog.h"
 #include "bio.h"
@@ -335,6 +336,9 @@ struct redisCommand redisCommandTable[] = {
     {"evalsha_ro",evalShaRoCommand,-3,"s",0,evalGetKeys,0,0,0,0,0},
     {"slowlog",slowlogCommand,-2,"aR",0,NULL,0,0,0,0,0},
     {"script",scriptCommand,-2,"s",0,NULL,0,0,0,0,0},
+    {"function",functionCommand,-2,"ws",0,NULL,0,0,0,0,0},
+    {"fcall",fcallCommand,-3,"s",0,functionGetKeys,0,0,0,0,0},
+    {"fcall_ro",fcallRoCommand,-3,"rs",0,functionGetKeys,0,0,0,0,0},
     {"time",timeCommand,1,"RF",0,NULL,0,0,0,0,0},
     {"bitop",bitopCommand,-4,"wm",0,NULL,2,-1,1,0,0},
     {"bitcount",bitcountCommand,-2,"r",0,NULL,1,1,1,0,0},
@@ -1665,6 +1669,13 @@ void initServerConfig(void) {
     server.dynamic_hz = CONFIG_DEFAULT_DYNAMIC_HZ;
     server.arch_bits = (sizeof(PORT_LONG) == 8) ? 64 : 32;
     server.port = CONFIG_DEFAULT_SERVER_PORT;
+    server.tls_port = 0;
+    server.tlsfd_count = 0;
+    server.tls_cert_file = NULL;
+    server.tls_key_file = NULL;
+    server.tls_ca_cert_file = NULL;
+    server.tls_ca_cert_dir = NULL;
+    server.tls_auth_clients = 0;
     server.tcp_backlog = CONFIG_DEFAULT_TCP_BACKLOG;
     server.bindaddr_count = 0;
     server.unixsocket = NULL;
@@ -2260,6 +2271,14 @@ void initServer(void) {
         listenToPort(server.port,server.ipfd,&server.ipfd_count) == C_ERR)
         exit(1);
 
+    /* Open the TLS listening socket. */
+    if (server.tls_port != 0) {
+        if (tlsInit() != C_OK) exit(1);
+        if (listenToPort(server.tls_port,server.tlsfd,
+                         &server.tlsfd_count) == C_ERR)
+            exit(1);
+    }
+
     /* Open the listening Unix domain socket. */
     if (server.unixsocket != NULL) {
         unlink(server.unixsocket); /* don't care if this fails */
@@ -2273,7 +2292,7 @@ void initServer(void) {
     }
 
     /* Abort if there are no listening sockets at all. */
-    if (server.ipfd_count == 0 && server.sofd < 0) {
+    if (server.ipfd_count == 0 && server.sofd < 0 && server.tlsfd_count == 0) {
         serverLog(LL_WARNING, "Configured to not listen anywhere, exiting.");
         exit(1);
     }
@@ -2344,6 +2363,14 @@ void initServer(void) {
                     "Unrecoverable error creating server.ipfd file event.");
             }
     }
+    for (j = 0; j < server.tlsfd_count; j++) {
+        if (aeCreateFileEvent(server.el, server.tlsfd[j], AE_READABLE,
+            acceptTlsHandler,NULL) == AE_ERR)
+        {
+            serverPanic(
+                "Unrecoverable error creating server.tlsfd file event.");
+        }
+    }
     if (server.sofd > 0 && aeCreateFileEvent(server.el,server.sofd,AE_READABLE,
         acceptUnixHandler,NULL) == AE_ERR) serverPanic("Unrecoverable error creating server.sofd file event.");
 
@@ -2386,6 +2413,7 @@ void initServer(void) {
     if (server.cluster_enabled) clusterInit();
     replicationScriptCacheInit();
     scriptingInit(1);
+    functionsInit(1);
     slowlogInit();
     latencyMonitorInit();
 }
@@ -3023,6 +3051,7 @@ void closeListeningSockets(int unlink_unix_socket) {
     int j;
 
     for (j = 0; j < server.ipfd_count; j++) close(server.ipfd[j]);
+    for (j = 0; j < server.tlsfd_count; j++) close(server.tlsfd[j]);
     if (server.sofd != -1) close(server.sofd);
     if (server.cluster_enabled)
         for (j = 0; j < server.cfd_count; j++) close(server.cfd[j]);
@@ -3728,6 +3757,7 @@ sds genRedisInfoString(char *section) {
             "process_id:%Id\r\n"                                                WIN_PORT_FIX /* %ld -> %Id */
             "run_id:%s\r\n"
             "tcp_port:%d\r\n"
+            "tls_port:%d\r\n"
             "uptime_in_seconds:%lld\r\n"                                        WIN_PORT_FIX /* %jd -> %lld */
             "uptime_in_days:%lld\r\n"                                           WIN_PORT_FIX /* %jd -> %lld */
             "hz:%d\r\n"
@@ -3758,6 +3788,7 @@ sds genRedisInfoString(char *section) {
             (PORT_LONG) getpid(),
             server.runid,
             server.port,
+            server.tls_port,
             (intmax_t)uptime,
             (intmax_t)(uptime/(3600*24)),
             server.hz,

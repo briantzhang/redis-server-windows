@@ -32,6 +32,7 @@
 #endif
 
 #include "server.h"
+#include "tls.h"
 #include "atomicvar.h"
 
 #ifdef _WIN32
@@ -136,6 +137,9 @@ client *createClient(int fd) {
     c->bulklen = -1;
     c->sentlen = 0;
     c->flags = 0;
+    c->tls_ssl = NULL;
+    c->tls_handshaking = 0;
+    c->tls_outbuf = NULL;
     c->ctime = c->lastinteraction = server.unixtime;
     c->authenticated = 0;
     /* With no requirepass the connection is open from the start, so it acts as
@@ -623,6 +627,14 @@ void addReplySetLen(client *c, PORT_LONG length) {
     addReplyLongLongWithPrefix(c,length,c->resp == 3 ? '~' : '*');
 }
 
+/* RESP3 push (`>`). Out-of-band messages such as Pub/Sub deliveries and client
+ * tracking invalidations are not replies to the command being executed, so a
+ * RESP3 client must be able to tell them apart from the command reply. RESP2
+ * has no push type; callers that need to reach a RESP2 client use Pub/Sub. */
+void addReplyPushLen(client *c, PORT_LONG length) {
+    addReplyLongLongWithPrefix(c,length,c->resp == 3 ? '>' : '*');
+}
+
 /* RESP3 null (`_`). RESP2 keeps the bulk and array nulls it already speaks;
  * addReply converts either shared null when the connection is RESP3. */
 void addReplyNull(client *c) {
@@ -790,7 +802,7 @@ int clientHasPendingReplies(client *c) {
 }
 
 #define MAX_ACCEPTS_PER_CALL 1000
-static void acceptCommonHandler(int fd, int flags, char *ip) {
+static void acceptCommonHandler(int fd, uint64_t flags, char *ip) {
     client *c;
     if ((c = createClient(fd)) == NULL) {
         serverLog(LL_WARNING,
@@ -862,8 +874,14 @@ static void acceptCommonHandler(int fd, int flags, char *ip) {
         }
     }
 
-    server.stat_numconnections++;
     c->flags |= flags;
+    if (c->flags & CLIENT_TLS) {
+        if (tlsAttachClient(c) != C_OK) {
+            freeClient(c);
+            return;
+        }
+    }
+    server.stat_numconnections++;
 }
 
 void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -890,6 +908,33 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
         serverLog(LL_VERBOSE,"Accepted %s:%d", cip, cport);
         acceptCommonHandler(cfd,0,cip);
+    }
+}
+
+void acceptTlsHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    int cport, cfd, max = MAX_ACCEPTS_PER_CALL;
+    char cip[NET_IP_STR_LEN];
+    UNUSED(el);
+    UNUSED(mask);
+    UNUSED(privdata);
+
+    while(max--) {
+        cfd = anetTcpAccept(server.neterr, fd, cip, sizeof(cip), &cport);
+        if (cfd == ANET_ERR) {
+            if (errno != EWOULDBLOCK) {
+                serverLog(LL_WARNING,
+                    "Accepting TLS client connection: %s", server.neterr);
+#ifdef _WIN32
+                if (WSIOCP_QueueAccept(fd) == -1) {
+                    serverLog(LL_WARNING,
+                        "acceptTlsHandler: failed to queue another accept.");
+                }
+#endif
+            }
+            return;
+        }
+        serverLog(LL_VERBOSE,"Accepted TLS connection from %s:%d", cip, cport);
+        acceptCommonHandler(cfd,CLIENT_TLS,cip);
     }
 }
 
@@ -1053,6 +1098,9 @@ void freeClient(client *c) {
     listRelease(c->reply);
     freeClientArgv(c);
 
+    /* Release TLS state while the socket is still open. */
+    tlsFreeClient(c);
+
     /* Unlink the client: this will close the socket, remove the I/O
      * handlers, and remove references of the client from different
      * places where active clients may be referenced. */
@@ -1141,24 +1189,40 @@ int writeToClient(int fd, client *c, int handler_installed) {
     size_t objlen;
     clientReplyBlock *o;
 
+    if (c->flags & CLIENT_TLS) {
+        if (tlsFlushPending(c) == C_ERR) {
+            freeClient(c);
+            return C_ERR;
+        }
+        /* Still blocked on the socket: the writable event stays armed and
+         * writeToClient will be called again when the ciphertext drains. */
+        if (c->tls_outbuf) return C_OK;
+    }
+
     while(clientHasPendingReplies(c)) {
         if (c->bufpos > 0) {
 #ifdef _WIN32
-            nwritten = c->bufpos - c->sentlen;
-            //[tporadowski/#7] don't use "sendReplyBufferDone" callback, clean up and connection closing is done here and at the end now
-            int result = WSIOCP_SocketSend(fd, c->buf + c->sentlen, nwritten,
-                server.el, c, c->buf, NULL);
-            if (result == SOCKET_ERROR && errno != WSA_IO_PENDING) {
-                nwritten = -1;
+            if (c->flags & CLIENT_TLS) {
+                nwritten = tlsWrite(c, c->buf + c->sentlen,
+                                    (int)(c->bufpos - c->sentlen));
+                if (nwritten <= 0) break;
+            } else {
+                nwritten = c->bufpos - c->sentlen;
+                //[tporadowski/#7] don't use "sendReplyBufferDone" callback, clean up and connection closing is done here and at the end now
+                int result = WSIOCP_SocketSend(fd, c->buf + c->sentlen, nwritten,
+                    server.el, c, c->buf, NULL);
+                if (result == SOCKET_ERROR && errno != WSA_IO_PENDING) {
+                    nwritten = -1;
 
-                //[tporadowski/#11] we might be bursting data too fast, so turn it into another try that will put back the client
-                //  in the sending queue
-                if (errno == WSAEWOULDBLOCK) {
-                    serverLog(LL_DEBUG, "writeToClient: will try again (EAGAIN) due to WSAEWOULDBLOCK");
-                    errno = EAGAIN;
+                    //[tporadowski/#11] we might be bursting data too fast, so turn it into another try that will put back the client
+                    //  in the sending queue
+                    if (errno == WSAEWOULDBLOCK) {
+                        serverLog(LL_DEBUG, "writeToClient: will try again (EAGAIN) due to WSAEWOULDBLOCK");
+                        errno = EAGAIN;
+                    }
+
+                    break;
                 }
-
-                break;
             }
 #else
             nwritten = write(fd,c->buf+c->sentlen,c->bufpos-c->sentlen);
@@ -1184,24 +1248,32 @@ int writeToClient(int fd, client *c, int handler_installed) {
             }
 
 #ifdef _WIN32
-            //[tporadowski/#7] don't use "sendReplyListDone" callback, clean up and connection closing is at the end now
-			nwritten = objlen - c->sentlen;
-            int result = WSIOCP_SocketSend(fd, o->buf+c->sentlen, nwritten,
-                server.el, c, o->buf, NULL);
-            if (result == SOCKET_ERROR && errno != WSA_IO_PENDING) {
-                nwritten = -1;
+            if (c->flags & CLIENT_TLS) {
+                nwritten = tlsWrite(c, o->buf + c->sentlen,
+                                    (int)(objlen - c->sentlen));
+                if (nwritten <= 0) break;
+                c->sentlen += nwritten;
+                totwritten += nwritten;
+            } else {
+                //[tporadowski/#7] don't use "sendReplyListDone" callback, clean up and connection closing is at the end now
+                nwritten = objlen - c->sentlen;
+                int result = WSIOCP_SocketSend(fd, o->buf+c->sentlen, nwritten,
+                    server.el, c, o->buf, NULL);
+                if (result == SOCKET_ERROR && errno != WSA_IO_PENDING) {
+                    nwritten = -1;
 
-                //[tporadowski/#11] we might be bursting data too fast, so turn it into another try that will put back the client
-                //  in the sending queue
-                if (errno == WSAEWOULDBLOCK) {
-                    serverLog(LL_DEBUG, "writeToClient: will try again (EAGAIN) due to WSAEWOULDBLOCK");
-                    errno = EAGAIN;
+                    //[tporadowski/#11] we might be bursting data too fast, so turn it into another try that will put back the client
+                    //  in the sending queue
+                    if (errno == WSAEWOULDBLOCK) {
+                        serverLog(LL_DEBUG, "writeToClient: will try again (EAGAIN) due to WSAEWOULDBLOCK");
+                        errno = EAGAIN;
+                    }
+                    break;
                 }
-                break;
+                if (nwritten <= 0) break;
+                c->sentlen += nwritten;
+                totwritten += nwritten;
             }
-			if (nwritten <= 0) break;
-            c->sentlen += nwritten;
-            totwritten += nwritten;
 
 #else
             nwritten = write(fd, o->buf + c->sentlen, objlen - c->sentlen);
@@ -1256,7 +1328,9 @@ int writeToClient(int fd, client *c, int handler_installed) {
          * We just rely on data / pings received for timeout detection. */
         if (!(c->flags & CLIENT_MASTER)) c->lastinteraction = server.unixtime;
     }
-    if (!clientHasPendingReplies(c)) {
+    if (!clientHasPendingReplies(c) &&
+        (!(c->flags & CLIENT_TLS) || c->tls_outbuf == NULL))
+    {
         c->sentlen = 0;
         if (handler_installed) aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
 
@@ -1804,13 +1878,29 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
          * for example once we resume a blocked client after CLIENT PAUSE. */
         if (remaining > 0 && remaining < readlen) readlen = remaining;
     }
+    if (c->flags & CLIENT_TLS) {
+        /* Room for everything already buffered in the SSL object plus a full
+         * raw socket read. Since decrypted output never exceeds its input,
+         * this guarantees tlsRead() can drain the BIO completely and never
+         * strands plaintext with no IOCP readable completion to wake us. */
+        readlen = PROTO_IOBUF_LEN * 2 + (int)tlsPendingBytes(c);
+    }
 
     qblen = sdslen(c->querybuf);
     if (c->querybuf_peak < qblen) c->querybuf_peak = qblen;
     c->querybuf = sdsMakeRoomFor(c->querybuf, readlen);
-    nread = (int)read(fd, c->querybuf+qblen, readlen);                          WIN_PORT_FIX /* cast (int) */
+    if (c->flags & CLIENT_TLS) {
+        nread = tlsRead(c, c->querybuf+qblen, readlen);
+    } else {
+        nread = (int)read(fd, c->querybuf+qblen, readlen);                      WIN_PORT_FIX /* cast (int) */
+    }
     if (nread == -1) {
         if (errno == EAGAIN) {
+#ifdef _WIN32
+            /* The zero-byte IOCP read was already consumed; TLS may need
+             * another readable completion to finish the handshake. */
+            if (c->flags & CLIENT_TLS) WSIOCP_QueueNextRead(fd);
+#endif
             return;
         } else {
             serverLog(LL_VERBOSE, "Reading from client: %s", IF_WIN32(wsa_strerror(errno), strerror(errno)));

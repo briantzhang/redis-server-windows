@@ -8,13 +8,14 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '5.0.14.1-bp23'
+VERSION = '5.0.14.1-bp26'
 NAME = 'Redis-x64-' + VERSION
 DIST = ROOT / 'dist'
 PKG = DIST / NAME
 BUILD = ROOT / 'msvs' / 'x64' / 'Release'
 BINARIES = ['redis-server.exe', 'redis-cli.exe', 'redis-benchmark.exe',
             'redis-check-rdb.exe', 'redis-check-aof.exe']
+OPENSSL_DLLS = ['libssl-3-x64.dll', 'libcrypto-3-x64.dll']
 
 
 def digest(path):
@@ -33,6 +34,9 @@ def main():
     for name in BINARIES:
         if not (BUILD/name).is_file():
             raise SystemExit('Missing build output: ' + str(BUILD/name))
+    for name in OPENSSL_DLLS:
+        if not (ROOT/'deps'/'openssl'/'bin'/name).is_file():
+            raise SystemExit('Missing OpenSSL runtime: ' + name)
     version = subprocess.check_output([str(BUILD/'redis-server.exe'), '--version'], text=True)
     if VERSION not in version:
         raise SystemExit('Unexpected redis-server version: ' + version)
@@ -42,13 +46,16 @@ def main():
     PKG.mkdir()
     for name in BINARIES:
         shutil.copy2(BUILD/name, PKG/name)
+    for name in OPENSSL_DLLS:
+        shutil.copy2(ROOT/'deps'/'openssl'/'bin'/name, PKG/name)
     for name in ['COPYING', 'BACKPORT-RELEASE.md']:
         shutil.copy2(ROOT/name, PKG/name)
     licenses = PKG/'licenses'
     licenses.mkdir()
     for src, dest in [('deps/hiredis/COPYING','hiredis-COPYING'),
                       ('deps/jemalloc-5.2.1/COPYING','jemalloc-COPYING'),
-                      ('deps/lua/COPYRIGHT','lua-COPYRIGHT')]:
+                      ('deps/lua/COPYRIGHT','lua-COPYRIGHT'),
+                      ('deps/openssl/LICENSE.txt','openssl-LICENSE.txt')]:
         shutil.copy2(ROOT/src, licenses/dest)
     shutil.copy2(test_log, PKG/'regression-windows.log')
     for name in ['benchmark-windows.json', 'verification-windows.md']:
@@ -58,6 +65,13 @@ def main():
 bind 127.0.0.1
 protected-mode yes
 port 6379
+# Optional TLS listener. Keep libssl-3-x64.dll and libcrypto-3-x64.dll
+# next to redis-server.exe, then uncomment and edit:
+# tls-port 6380
+# tls-cert-file certs/server.crt
+# tls-key-file certs/server.key
+# tls-ca-cert-file certs/ca.crt
+# tls-auth-clients no
 tcp-backlog 511
 timeout 0
 tcp-keepalive 300
@@ -91,7 +105,7 @@ if not exist data mkdir data
 "%~dp0redis-server.exe" "%~dp0redis.windows.conf" --dir "%~dp0data"
 popd
 ''', encoding='ascii', newline='\r\n')
-    (PKG/'README.md').write_text('''# Redis Windows 5.0.14.1-bp23
+    (PKG/'README.md').write_text('''# Redis Windows 5.0.14.1-bp26
 
 Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；关闭窗口或 Ctrl+C 停止。
 默认监听 127.0.0.1:6379，AOF 每秒同步，数据保存在同目录 data/。
@@ -100,6 +114,9 @@ Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；
 
 检查版本：redis-server.exe --version
 测试连接：redis-cli.exe -h 127.0.0.1 -p 6379 PING
+TLS：按 redis.windows.conf 的注释配置 tls-port 和证书后重启；必须保留
+      libssl-3-x64.dll 与 libcrypto-3-x64.dll。随包 redis-cli 不支持 TLS，
+      请用支持 TLS 的客户端连接，许可证见 licenses/openssl-LICENSE.txt。
 新命令示例：
   redis-cli.exe SET demo value KEEPTTL
   redis-cli.exe ZUNION 2 z1 z2 WITHSCORES
@@ -138,6 +155,7 @@ Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；
   redis-cli.exe ACL WHOAMI
   redis-cli.exe SCAN 0 TYPE string
   redis-cli.exe HELLO 2
+  redis-cli.exe HELLO 3
   redis-cli.exe CLIENT TRACKING ON REDIRECT 1
   redis-cli.exe CLIENT TRACKING ON BCAST PREFIX cache:
   redis-cli.exe CONFIG GET tracking-table-max-keys

@@ -214,7 +214,9 @@ void trackingRememberKeys(client *tracking) {
     getKeysFreeResult(keyindex);
 }
 
-/* Deliver a Pub/Sub invalidation message to 'c' (must be CLIENT_PUBSUB).
+/* Deliver an invalidation to 'c'. A RESP3 connection receives a push frame on
+ * itself; a RESP2 connection can only receive it through a redirected Pub/Sub
+ * subscription, because RESP2 has no push type.
  * 'proto' means keyname/keylen already contain a RESP array (or null bulk). */
 static void sendTrackingMessage(client *c, char *keyname, size_t keylen, int proto) {
     int using_redirection = 0;
@@ -228,13 +230,19 @@ static void sendTrackingMessage(client *c, char *keyname, size_t keylen, int pro
         using_redirection = 1;
     }
 
-    /* This RESP2-only build can only push invalidations via Pub/Sub. */
-    if (!(using_redirection && (c->flags & CLIENT_PUBSUB))) return;
+    if (c->resp == 3) {
+        /* Push frame: [ "invalidate", <key|array|nil> ] */
+        addReplyPushLen(c,2);
+        addReplyBulkCBuffer(c,"invalidate",10);
+    } else if (using_redirection && (c->flags & CLIENT_PUBSUB)) {
+        /* Pub/Sub envelope: ["message", "__redis__:invalidate", <payload>] */
+        addReplyPushLen(c,3);
+        addReply(c,shared.messagebulk);
+        addReplyBulk(c,TrackingChannelName);
+    } else {
+        return;
+    }
 
-    /* Pub/Sub envelope: ["message", "__redis__:invalidate", <payload>] */
-    addReply(c,shared.mbulkhdr[3]);
-    addReply(c,shared.messagebulk);
-    addReplyBulk(c,TrackingChannelName);
     if (proto) {
         addReplyString(c,keyname,keylen);
     } else {

@@ -33,6 +33,14 @@
  * Pubsub low level API
  *----------------------------------------------------------------------------*/
 
+/* Subscription confirmations and delivered messages are not replies to the
+ * command currently being executed. RESP3 marks them as push frames so a
+ * multiplexing client can route them separately; RESP2 keeps plain arrays. */
+static void addReplyPubsubFrame(client *c, robj *kind, PORT_LONG elements) {
+    addReplyPushLen(c,elements);
+    addReply(c,kind);
+}
+
 void freePubsubPattern(void *p) {
     pubsubPattern *pat = p;
 
@@ -85,8 +93,7 @@ int pubsubSubscribeChannel(client *c, robj *channel) {
         listAddNodeTail(clients,c);
     }
     /* Notify the client */
-    addReply(c,shared.mbulkhdr[3]);
-    addReply(c,shared.subscribebulk);
+    addReplyPubsubFrame(c,shared.subscribebulk,3);
     addReplyBulk(c,channel);
     addReplyLongLong(c,clientSubscriptionsCount(c));
     return retval;
@@ -121,8 +128,7 @@ int pubsubUnsubscribeChannel(client *c, robj *channel, int notify) {
     }
     /* Notify the client */
     if (notify) {
-        addReply(c,shared.mbulkhdr[3]);
-        addReply(c,shared.unsubscribebulk);
+        addReplyPubsubFrame(c,shared.unsubscribebulk,3);
         addReplyBulk(c,channel);
         addReplyLongLong(c,dictSize(c->pubsub_channels)+
                        listLength(c->pubsub_patterns));
@@ -147,8 +153,7 @@ int pubsubSubscribePattern(client *c, robj *pattern) {
         listAddNodeTail(server.pubsub_patterns,pat);
     }
     /* Notify the client */
-    addReply(c,shared.mbulkhdr[3]);
-    addReply(c,shared.psubscribebulk);
+    addReplyPubsubFrame(c,shared.psubscribebulk,3);
     addReplyBulk(c,pattern);
     addReplyLongLong(c,clientSubscriptionsCount(c));
     return retval;
@@ -172,8 +177,7 @@ int pubsubUnsubscribePattern(client *c, robj *pattern, int notify) {
     }
     /* Notify the client */
     if (notify) {
-        addReply(c,shared.mbulkhdr[3]);
-        addReply(c,shared.punsubscribebulk);
+        addReplyPubsubFrame(c,shared.punsubscribebulk,3);
         addReplyBulk(c,pattern);
         addReplyLongLong(c,dictSize(c->pubsub_channels)+
                        listLength(c->pubsub_patterns));
@@ -196,8 +200,7 @@ int pubsubUnsubscribeAllChannels(client *c, int notify) {
     }
     /* We were subscribed to nothing? Still reply to the client. */
     if (notify && count == 0) {
-        addReply(c,shared.mbulkhdr[3]);
-        addReply(c,shared.unsubscribebulk);
+        addReplyPubsubFrame(c,shared.unsubscribebulk,3);
         addReply(c,shared.nullbulk);
         addReplyLongLong(c,dictSize(c->pubsub_channels)+
                        listLength(c->pubsub_patterns));
@@ -221,8 +224,7 @@ int pubsubUnsubscribeAllPatterns(client *c, int notify) {
     }
     if (notify && count == 0) {
         /* We were subscribed to nothing? Still reply to the client. */
-        addReply(c,shared.mbulkhdr[3]);
-        addReply(c,shared.punsubscribebulk);
+        addReplyPubsubFrame(c,shared.punsubscribebulk,3);
         addReply(c,shared.nullbulk);
         addReplyLongLong(c,dictSize(c->pubsub_channels)+
                        listLength(c->pubsub_patterns));
@@ -250,8 +252,7 @@ int pubsubSubscribeShardChannel(client *c, robj *channel) {
         }
         listAddNodeTail(clients,c);
     }
-    addReply(c,shared.mbulkhdr[3]);
-    addReply(c,shared.ssubscribebulk);
+    addReplyPubsubFrame(c,shared.ssubscribebulk,3);
     addReplyBulk(c,channel);
     addReplyLongLong(c,clientShardSubscriptionsCount(c));
     return retval;
@@ -278,8 +279,7 @@ int pubsubUnsubscribeShardChannel(client *c, robj *channel, int notify) {
             dictDelete(server.pubsubshard_channels,channel);
     }
     if (notify) {
-        addReply(c,shared.mbulkhdr[3]);
-        addReply(c,shared.sunsubscribebulk);
+        addReplyPubsubFrame(c,shared.sunsubscribebulk,3);
         addReplyBulk(c,channel);
         addReplyLongLong(c,clientShardSubscriptionsCount(c));
     }
@@ -297,8 +297,7 @@ int pubsubUnsubscribeAllShardChannels(client *c, int notify) {
         count += pubsubUnsubscribeShardChannel(c,channel,notify);
     }
     if (notify && count == 0) {
-        addReply(c,shared.mbulkhdr[3]);
-        addReply(c,shared.sunsubscribebulk);
+        addReplyPubsubFrame(c,shared.sunsubscribebulk,3);
         addReply(c,shared.nullbulk);
         addReplyLongLong(c,clientShardSubscriptionsCount(c));
     }
@@ -319,8 +318,7 @@ int pubsubPublishShardMessage(robj *channel, robj *message) {
         listRewind(list,&li);
         while ((ln = listNext(&li)) != NULL) {
             client *c = ln->value;
-            addReply(c,shared.mbulkhdr[3]);
-            addReply(c,shared.smessagebulk);
+            addReplyPubsubFrame(c,shared.smessagebulk,3);
             addReplyBulk(c,channel);
             addReplyBulk(c,message);
             receivers++;
@@ -347,8 +345,7 @@ int pubsubPublishMessage(robj *channel, robj *message) {
         while ((ln = listNext(&li)) != NULL) {
             client *c = ln->value;
 
-            addReply(c,shared.mbulkhdr[3]);
-            addReply(c,shared.messagebulk);
+            addReplyPubsubFrame(c,shared.messagebulk,3);
             addReplyBulk(c,channel);
             addReplyBulk(c,message);
             receivers++;
@@ -365,8 +362,7 @@ int pubsubPublishMessage(robj *channel, robj *message) {
                                 (int)sdslen(pat->pattern->ptr),                 WIN_PORT_FIX /* cast (int) */
                                 (char*)channel->ptr,
                                 (int)sdslen(channel->ptr),0)) {                 WIN_PORT_FIX /* cast (int) */
-                addReply(pat->client,shared.mbulkhdr[4]);
-                addReply(pat->client,shared.pmessagebulk);
+                addReplyPubsubFrame(pat->client,shared.pmessagebulk,4);
                 addReplyBulk(pat->client,pat->pattern);
                 addReplyBulk(pat->client,channel);
                 addReplyBulk(pat->client,message);

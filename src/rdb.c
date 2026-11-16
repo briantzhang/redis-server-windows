@@ -1247,6 +1247,9 @@ int rdbSaveRio(rio *rdb, int *error, int flags, rdbSaveInfo *rsi) {
         di = NULL; /* So that we don't release it again on error. */
     }
 
+    /* Function libraries are stored as AUX fields. Older readers skip them. */
+    if (functionsSaveAuxField(rdb) == C_ERR) goto werr;
+
     if (rdbSaveModulesAux(rdb, REDISMODULE_AUX_AFTER_RDB) == -1) goto werr;
 
     /* EOF opcode */
@@ -2073,7 +2076,10 @@ int rdbLoadRio(rio *rdb, rdbSaveInfo *rsi, int loading_aof) {
                         "Can't load Lua script from RDB file! "
                         "BODY: %s", auxval->ptr);
                 }
-            } else {
+            } else if (functionsLoadAuxField(auxkey,auxval) < 0) {
+                rdbExitReportCorruptRDB(
+                    "Can't load function library from RDB file!");
+            } else if (strcasecmp(auxkey->ptr,"function-library") != 0) {
                 /* We ignore fields we don't understand, as by AUX field
                  * contract. */
                 serverLog(LL_DEBUG,"Unrecognized RDB AUX field: '%s'",

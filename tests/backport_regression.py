@@ -28,8 +28,10 @@ from concurrent.futures import ThreadPoolExecutor
 import fnmatch
 from pathlib import Path
 import select
+import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -54,8 +56,8 @@ class RESP2:
     are both read. Maps come back as ordered (field, value) pair lists, sets as
     lists, and the RESP3 null, bool and double as None, bool and float."""
 
-    def __init__(self, host, port, timeout=5.0, password=None):
-        self.sock = socket.create_connection((host, port), timeout)
+    def __init__(self, host, port, timeout=5.0, password=None, sock=None):
+        self.sock = sock or socket.create_connection((host, port), timeout)
         self.sock.settimeout(timeout)
         self.reader = self.sock.makefile("rb")
         try:
@@ -105,13 +107,13 @@ class RESP2:
             return RedisError(value.decode("utf-8", "replace"))
         if kind == b":":
             return int(value)
-        if kind in (b"$", b"*", b"%", b"~", b"="):
+        if kind in (b"$", b"*", b">", b"%", b"~", b"="):
             length = int(value)
             if length == -1:
                 return None
             if length < 0:
                 raise ValueError("Invalid RESP length")
-            if kind == b"*" or kind == b"~":
+            if kind in (b"*", b">", b"~"):
                 return [self._read() for _ in range(length)]
             if kind == b"%":
                 return [(self._read(), self._read()) for _ in range(length)]
@@ -155,9 +157,84 @@ def reserve_port():
         return sock.getsockname()[1]
 
 
+def port_is_free(port):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+
+
+def reserve_cluster_port():
+    """Reserve a client port whose Redis cluster bus port (port+10000) is usable."""
+    for _ in range(200):
+        port = reserve_port()
+        if port <= 55535 and port_is_free(port + 10000):
+            return port
+    for port in range(20000, 30000):
+        if port_is_free(port) and port_is_free(port + 10000):
+            return port
+    raise RuntimeError("can not find a free Redis cluster port pair")
+
+
+def make_tls_certificates(directory):
+    """Create a throwaway CA, server certificate and client certificate.
+
+    Returns a dict of paths, or None when the openssl command line tool is not
+    installed. These certificates are test fixtures only and never leave the
+    temporary directory.
+    """
+    openssl = shutil.which("openssl")
+    if not openssl:
+        return None
+    root = Path(directory)
+    paths = {
+        "ca": root / "tls-ca.crt",
+        "ca_key": root / "tls-ca.key",
+        "server_cert": root / "tls-server.crt",
+        "server_key": root / "tls-server.key",
+        "client_cert": root / "tls-client.crt",
+        "client_key": root / "tls-client.key",
+    }
+
+    def run(args):
+        subprocess.run(
+            [openssl] + [str(arg) for arg in args],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+
+    run(["req", "-x509", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", paths["ca_key"], "-out", paths["ca"],
+         "-days", "2", "-subj", "/CN=Redis Backport Test CA",
+         "-addext", "basicConstraints=critical,CA:TRUE",
+         "-addext", "keyUsage=critical,keyCertSign,cRLSign"])
+    run(["req", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", paths["server_key"], "-out", root / "tls-server.csr",
+         "-subj", "/CN=localhost"])
+    server_ext = root / "tls-server.ext"
+    server_ext.write_text(
+        "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n",
+        encoding="ascii")
+    run(["x509", "-req", "-in", root / "tls-server.csr",
+         "-CA", paths["ca"], "-CAkey", paths["ca_key"], "-CAcreateserial",
+         "-out", paths["server_cert"], "-days", "2", "-extfile", server_ext])
+    run(["req", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", paths["client_key"], "-out", root / "tls-client.csr",
+         "-subj", "/CN=redis-backport-test-client"])
+    client_ext = root / "tls-client.ext"
+    client_ext.write_text("extendedKeyUsage=clientAuth\n", encoding="ascii")
+    run(["x509", "-req", "-in", root / "tls-client.csr",
+         "-CA", paths["ca"], "-CAkey", paths["ca_key"], "-CAcreateserial",
+         "-out", paths["client_cert"], "-days", "2", "-extfile", client_ext])
+    return paths
+
+
 class ManagedServer:
     def __init__(self, executable, directory, timeout, startup_timeout, aof=False,
-                 requirepass=None, aclfile=False):
+                 requirepass=None, aclfile=False, cluster=False, tls=None,
+                 tls_auth_clients="no"):
         self.executable = executable
         self.directory = Path(directory)
         self.timeout = timeout
@@ -165,7 +242,14 @@ class ManagedServer:
         self.aof = aof
         self.requirepass = requirepass
         self.aclfile = aclfile
-        self.port = reserve_port()
+        self.cluster = cluster
+        self.tls = tls
+        self.tls_auth_clients = tls_auth_clients
+        self.port = reserve_cluster_port() if cluster else reserve_port()
+        self.tls_port = None
+        if tls:
+            while self.tls_port in (None, self.port):
+                self.tls_port = reserve_port()
         self.process = None
         self.output = None
         self.ready = False
@@ -196,16 +280,28 @@ class ManagedServer:
                 encoding="ascii",
             )
             aclfile_line = "aclfile %s\n" % acl.as_posix()
+        tls_line = ""
+        if self.tls:
+            tls_line = (
+                "tls-port %d\ntls-cert-file %s\ntls-key-file %s\n"
+                "tls-ca-cert-file %s\ntls-auth-clients %s\n" % (
+                    self.tls_port, self.tls["server_cert"].as_posix(),
+                    self.tls["server_key"].as_posix(), self.tls["ca"].as_posix(),
+                    self.tls_auth_clients))
         config.write_text(
             "bind 127.0.0.1\nprotected-mode yes\nport %d\n"
             "daemonize no\nsave \"\"\ndir .\ndbfilename dump.rdb\n"
             "logfile server.log\nloglevel notice\n"
             "appendonly %s\nappendfilename appendonly.aof\n"
             "appendfsync always\naof-use-rdb-preamble no\n"
-            "auto-aof-rewrite-percentage 0\n%s%s" % (
+            "auto-aof-rewrite-percentage 0\n%s%s%s%s" % (
                 self.port, "yes" if self.aof else "no",
                 "requirepass %s\n" % self.requirepass if self.requirepass else "",
-                aclfile_line),
+                aclfile_line,
+                "cluster-enabled yes\ncluster-config-file nodes.conf\n"
+                "cluster-node-timeout 5000\ncluster-require-full-coverage yes\n"
+                if self.cluster else "",
+                tls_line),
             encoding="ascii",
         )
         self.output = (self.directory / "stdout.log").open("ab", buffering=0)
@@ -286,11 +382,18 @@ class BackportRegression(unittest.TestCase):
         self.keys = set()
         self.prefix = ("backport:%s:" % uuid.uuid4().hex).encode("ascii")
         self.server = None
+        tls_test = "tls" in self._testMethodName
         if OPTIONS.server:
+            tls_certs = None
+            if tls_test:
+                tls_certs = make_tls_certificates(self.temp.name)
+                if tls_certs is None:
+                    self.skipTest("openssl command line tool not available")
             self.server = ManagedServer(
                 OPTIONS.server, self.temp.name, OPTIONS.timeout,
                 OPTIONS.startup_timeout, aof="aof" in self._testMethodName,
-                aclfile="aclfile" in self._testMethodName,
+                aclfile="aclfile" in self._testMethodName, tls=tls_certs,
+                tls_auth_clients="yes" if "mutual" in self._testMethodName else "no",
             )
             self.addCleanup(self.server.close)
             self.server.start()
@@ -304,6 +407,20 @@ class BackportRegression(unittest.TestCase):
 
     def connect(self):
         return RESP2(self.host, self.port, OPTIONS.timeout, self.password)
+
+    def tls_connect(self, client_cert=False):
+        if self.server is None or self.server.tls_port is None:
+            self.skipTest("TLS tests require a managed --server instance")
+        context = ssl.create_default_context(cafile=str(self.server.tls["ca"]))
+        if client_cert:
+            context.load_cert_chain(
+                str(self.server.tls["client_cert"]),
+                str(self.server.tls["client_key"]),
+            )
+        raw = socket.create_connection(
+            ("127.0.0.1", self.server.tls_port), OPTIONS.timeout)
+        wrapped = context.wrap_socket(raw, server_hostname="localhost")
+        return RESP2("127.0.0.1", self.server.tls_port, OPTIONS.timeout, sock=wrapped)
 
     def clean_keys(self):
         if self.keys:
@@ -2005,6 +2122,168 @@ class BackportRegression(unittest.TestCase):
                                   "1", key), b"OK")
         self.assertEqual(self.cmd("GET", key), b"new")
 
+    def test_functions_load_and_call(self):
+        key = self.key("functions:key")
+        code = (
+            "#!lua name=bp24lib\n"
+            "redis.register_function('get_value', function(keys, args)\n"
+            "  return redis.call('get', keys[1])\n"
+            "end)\n"
+            "redis.register_function('set_value', function(keys, args)\n"
+            "  return redis.call('set', keys[1], args[1])\n"
+            "end)\n"
+            "redis.register_function('readonly_set', function(keys, args)\n"
+            "  return redis.call('set', keys[1], args[1])\n"
+            "end, {'no-writes'})\n"
+        )
+        self.cmd("FUNCTION", "FLUSH")
+        self.assertEqual(self.cmd("FUNCTION", "LOAD", code), b"bp24lib")
+        with self.assertRaises(RedisError):
+            self.cmd("FUNCTION", "LOAD", code)
+        self.assertEqual(self.cmd("FUNCTION", "LOAD", "REPLACE", code), b"bp24lib")
+
+        self.assertEqual(self.cmd("FCALL", "set_value", "1", key, "one"), b"OK")
+        self.assertEqual(self.cmd("FCALL", "get_value", "1", key), b"one")
+        with self.assertRaises(RedisError) as ctx:
+            self.cmd("FCALL", "readonly_set", "1", key, "changed")
+        self.assertIn("read-only", str(ctx.exception).lower())
+        with self.assertRaises(RedisError) as ctx:
+            self.cmd("FCALL_RO", "set_value", "1", key, "changed")
+        self.assertIn("read-only", str(ctx.exception).lower())
+        self.assertEqual(self.cmd("GET", key), b"one")
+        with self.assertRaises(RedisError):
+            self.cmd("FCALL", "missing", "0")
+
+        listed = self.cmd("FUNCTION", "LIST")
+        self.assertEqual(len(listed), 1)
+        info = self.flat_map(listed[0])
+        self.assertEqual(info[b"library_name"], b"bp24lib")
+        self.assertEqual(len(info[b"functions"]), 3)
+        withcode = self.flat_map(self.cmd("FUNCTION", "LIST", "WITHCODE")[0])
+        self.assertIn(b"bp24lib", withcode[b"library_code"])
+        stats = self.flat_map(self.cmd("FUNCTION", "STATS"))
+        self.assertIn(b"LUA", self.flat_map(stats[b"engines"]))
+        self.assertEqual(self.cmd("FUNCTION", "DELETE", "bp24lib"), b"OK")
+        with self.assertRaises(RedisError):
+            self.cmd("FCALL", "get_value", "1", key)
+        self.assertEqual(self.cmd("FUNCTION", "FLUSH"), b"OK")
+        self.assertEqual(self.cmd("FUNCTION", "LIST"), [])
+
+    def test_functions_dump_restore(self):
+        code = (
+            "#!lua name=bp24dump\n"
+            "redis.register_function('echo', function(keys, args)\n"
+            "  return args[1]\n"
+            "end)\n"
+        )
+        self.cmd("FUNCTION", "FLUSH")
+        self.cmd("FUNCTION", "LOAD", code)
+        payload = self.cmd("FUNCTION", "DUMP")
+        self.assertTrue(payload.startswith(b"RFNC"))
+        with self.assertRaises(RedisError) as ctx:
+            self.cmd("FUNCTION", "RESTORE", b"RFNC" + payload[4:-1] + b"\x00")
+        self.assertIn("checksum", str(ctx.exception).lower())
+        with self.assertRaises(RedisError) as ctx:
+            self.cmd("FUNCTION", "RESTORE", payload)
+        self.assertIn("already exists", str(ctx.exception).lower())
+        self.assertEqual(self.cmd("FUNCTION", "RESTORE", payload, "FLUSH"), b"OK")
+        self.assertEqual(self.cmd("FCALL", "echo", "0", "roundtrip"), b"roundtrip")
+        self.assertEqual(self.cmd("FUNCTION", "RESTORE", payload, "REPLACE"), b"OK")
+        self.assertEqual(self.cmd("FCALL", "echo", "0", "again"), b"again")
+        self.assertEqual(self.cmd("FUNCTION", "FLUSH"), b"OK")
+
+    def test_cluster_three_nodes(self):
+        if self.server is None:
+            self.skipTest("cluster tests require --server")
+        nodes = []
+        clients = []
+        try:
+            for index in range(3):
+                directory = Path(self.temp.name) / ("cluster%d" % index)
+                directory.mkdir()
+                node = ManagedServer(
+                    OPTIONS.server, str(directory), OPTIONS.timeout,
+                    OPTIONS.startup_timeout, cluster=True,
+                )
+                node.start()
+                nodes.append(node)
+                clients.append(RESP2("127.0.0.1", node.port, OPTIONS.timeout))
+
+            for node in nodes[1:]:
+                self.assertEqual(
+                    clients[0].command("CLUSTER", "MEET", "127.0.0.1", node.port),
+                    b"OK",
+                )
+
+            ranges = ((0, 5460), (5461, 10921), (10922, 16383))
+            for client, (low, high) in zip(clients, ranges):
+                self.assertEqual(
+                    client.command(
+                        "CLUSTER", "ADDSLOTS", *[str(slot) for slot in range(low, high + 1)]
+                    ),
+                    b"OK",
+                )
+
+            deadline = time.monotonic() + 15
+            infos = []
+            while time.monotonic() < deadline:
+                infos = [client.command("CLUSTER", "INFO") for client in clients]
+                if all(
+                    b"cluster_state:ok" in info
+                    and b"cluster_known_nodes:3" in info
+                    and b"cluster_size:3" in info
+                    for info in infos
+                ):
+                    break
+                time.sleep(0.2)
+            self.assertTrue(
+                all(b"cluster_state:ok" in info for info in infos),
+                "cluster did not converge: %r" % (infos,),
+            )
+            self.assertTrue(
+                all(b"cluster_known_nodes:3" in info for info in infos),
+                "meet did not converge: %r" % (infos,),
+            )
+
+            key = self.prefix + b"cluster-key"
+            slot = clients[0].command("CLUSTER", "KEYSLOT", key)
+            owner = None
+            for start, end, endpoint in clients[0].command("CLUSTER", "SLOTS"):
+                if start <= slot <= end:
+                    owner = int(endpoint[1])
+                    break
+            self.assertIsNotNone(owner, "slot %d has no owner" % slot)
+            owner_index = next(
+                index for index, node in enumerate(nodes) if node.port == owner
+            )
+
+            for index, client in enumerate(clients):
+                if index == owner_index:
+                    self.assertEqual(client.command("SET", key, b"value"), b"OK")
+                else:
+                    with self.assertRaises(RedisError) as ctx:
+                        client.command("SET", key, b"value")
+                    self.assertIn("MOVED %d " % slot, str(ctx.exception))
+            self.assertEqual(clients[owner_index].command("GET", key), b"value")
+            self.assertEqual(
+                clients[owner_index].command("CLUSTER", "COUNTKEYSINSLOT", slot), 1
+            )
+            self.assertEqual(
+                clients[owner_index].command("CLUSTER", "GETKEYSINSLOT", slot, 10),
+                [key],
+            )
+            self.assertEqual(
+                clients[owner_index].command("CLUSTER", "DELSLOTS", slot), b"OK"
+            )
+            with self.assertRaises(RedisError) as ctx:
+                clients[owner_index].command("GET", key)
+            self.assertIn("CLUSTERDOWN", str(ctx.exception))
+        finally:
+            for client in clients:
+                client.close()
+            for node in nodes:
+                node.close()
+
     def test_client_info_unpause_pause(self):
         if self.server is None:
             self.skipTest("CLIENT PAUSE tests require --server")
@@ -3029,6 +3308,78 @@ class BackportRegression(unittest.TestCase):
 
         self.assertEqual(data.command("CLIENT", "TRACKING", "OFF"), b"OK")
 
+    def test_resp3_pubsub_push_frames(self):
+        # Subscription confirmations and deliveries are push frames in RESP3.
+        # Read the type byte directly: the parser accepts arrays either way.
+        sub = self.connect()
+        self.addCleanup(sub.close)
+        sub.sock.sendall(sub.encode(("HELLO", "3")))
+        sub._read()
+        sub.sock.sendall(sub.encode(("SUBSCRIBE", "push:chan")))
+        self.assertEqual(sub.reader.readline(), b">3\r\n")
+        self.assertEqual([sub._read() for _ in range(3)],
+                         [b"subscribe", b"push:chan", 1])
+        self.assertEqual(self.cmd("PUBLISH", "push:chan", "payload"), 1)
+        time.sleep(0.05)
+        self.assertEqual(sub.reader.readline(), b">3\r\n")
+        self.assertEqual([sub._read() for _ in range(3)],
+                         [b"message", b"push:chan", b"payload"])
+        sub.sock.sendall(sub.encode(("UNSUBSCRIBE", "push:chan")))
+        self.assertEqual(sub.reader.readline(), b">3\r\n")
+        self.assertEqual([sub._read() for _ in range(3)],
+                         [b"unsubscribe", b"push:chan", 0])
+
+        # A RESP2 connection keeps plain arrays, as before.
+        sub2 = self.connect()
+        self.addCleanup(sub2.close)
+        self.assertEqual(sub2.command("SUBSCRIBE", "push:chan2"),
+                         [b"subscribe", b"push:chan2", 1])
+        self.assertEqual(self.cmd("PUBLISH", "push:chan2", "plain"), 1)
+        time.sleep(0.05)
+        self.assertEqual(sub2._read(), [b"message", b"push:chan2", b"plain"])
+
+    def test_resp3_tracking_push_invalidate(self):
+        if self.server is None:
+            self.skipTest("CLIENT TRACKING test requires --server")
+
+        key = self.key("push:track")
+        self.cmd("DEL", key)
+
+        # RESP3 needs no redirection: invalidations arrive as push frames on
+        # the tracking connection itself.
+        tracker = self.connect()
+        self.addCleanup(tracker.close)
+        tracker.command("HELLO", "3")
+        self.assertEqual(tracker.command("CLIENT", "TRACKING", "ON"), b"OK")
+        self.assertIsNone(tracker.command("GET", key))
+        self.assertEqual(self.cmd("SET", key, "v1"), b"OK")
+        time.sleep(0.05)
+        # The wire type must be push (`>`), not an ordinary array.
+        self.assertEqual(tracker.reader.readline(), b">2\r\n")
+        self.assertEqual(tracker._read(), b"invalidate")
+        self.assertEqual(tracker._read(), [key])
+        self.assertEqual(tracker.command("PING"), b"PONG")
+
+        # BCAST + PREFIX: a write to a matching key pushes without a GET.
+        bcast = self.connect()
+        self.addCleanup(bcast.close)
+        bcast.command("HELLO", "3")
+        self.assertEqual(
+            bcast.command("CLIENT", "TRACKING", "ON", "BCAST",
+                          "PREFIX", "push:bcast:"),
+            b"OK")
+        self.assertEqual(self.cmd("SET", "push:bcast:1", "x"), b"OK")
+        time.sleep(0.05)
+        msg = bcast._read()
+        self.assertEqual(msg[0], b"invalidate")
+        self.assertEqual(msg[1], [b"push:bcast:1"])
+
+        # FLUSHALL invalidates everything: push with a nil payload.
+        self.assertEqual(self.cmd("FLUSHALL"), b"OK")
+        time.sleep(0.05)
+        msg = bcast._read()
+        self.assertEqual(msg, [b"invalidate", None])
+
     def test_quit_script_help_and_command_info(self):
         # QUIT is a registered command (COMMAND INFO / COUNT see it).
         info = self.cmd("COMMAND", "INFO", "quit", "ping")
@@ -3285,6 +3636,38 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("WAIT", "0", "0"), 0)
         with self.assertRaises(RedisError):
             self.cmd("WAIT", "1", "not-a-timeout")
+
+    def test_tls_transport_roundtrip(self):
+        """TLS listener and the plaintext listener stay independently usable."""
+        if self.server is None or self.server.tls_port is None:
+            self.skipTest("TLS tests require a managed --server instance")
+        self.assertEqual(self.cmd("PING"), b"PONG")
+        info = self.cmd("INFO", "server").decode("utf-8", "replace")
+        self.assertIn("tls_port:%d" % self.server.tls_port, info)
+
+        with self.tls_connect() as tls:
+            self.assertEqual(tls.command("PING"), b"PONG")
+            key = self.key("tls-binary")
+            payload = bytes(range(256)) * 1024  # 256 KiB: many TLS records
+            self.assertEqual(tls.command("SET", key, payload), b"OK")
+            self.assertEqual(tls.command("STRLEN", key), len(payload))
+            self.assertEqual(tls.command("GET", key), payload)
+            self.assertEqual(
+                tls.pipeline([("PING",)] * 64), [b"PONG"] * 64)
+
+    def test_tls_mutual_auth_requires_client_certificate(self):
+        """tls-auth-clients yes rejects anonymous clients and accepts our CA."""
+        if self.server is None or self.server.tls_port is None:
+            self.skipTest("TLS tests require a managed --server instance")
+        with self.assertRaises((ssl.SSLError, OSError, EOFError, RedisError)):
+            with self.tls_connect() as tls:
+                tls.command("PING")
+
+        with self.tls_connect(client_cert=True) as tls:
+            self.assertEqual(tls.command("PING"), b"PONG")
+            key = self.key("tls-mtls")
+            self.assertEqual(tls.command("SET", key, b"mutual"), b"OK")
+            self.assertEqual(tls.command("GET", key), b"mutual")
 
 
 def parse_args(argv):

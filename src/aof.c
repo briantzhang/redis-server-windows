@@ -1348,6 +1348,10 @@ int rewriteAppendOnlyFileRio(rio *aof) {
     size_t processed = 0;
     int j;
 
+    /* Function libraries are replayed before any key-space command so that
+     * functions called by the rewritten dataset already exist. */
+    if (functionsRewriteAOF(aof) == C_ERR) goto werr;
+
     for (j = 0; j < server.dbnum; j++) {
         char selectcmd[] = "*2\r\n$6\r\nSELECT\r\n";
         redisDb *db = server.db+j;
