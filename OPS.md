@@ -1,6 +1,6 @@
 # 运维手册
 
-适用版本：Redis for Windows `5.0.14.1-bp26`，仅 Windows x64，支持单机和集群模式。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
+适用版本：Redis for Windows `5.0.14.1-bp28`，仅 Windows x64，支持单机和集群模式。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
 
 本文只覆盖这一个可执行文件的日常操作。它不包含多段 AOF，相关配置项写进 `redis.conf` 也不会生效。TLS 只覆盖客户端监听，见第 4c 节；主从复制和集群总线仍是明文。集群模式沿用底座实现，见第 4b 节。ACL 已按 Redis 6 的范围实现，见第 3 节。
 
@@ -39,7 +39,7 @@
 .\redis-server.exe --version
 ```
 
-应看到 `v=5.0.14.1-bp26`。如果不是这个版本号，说明运行的不是这份回移。
+应看到 `v=5.0.14.1-bp28`。如果不是这个版本号，说明运行的不是这份回移。
 
 另开一个窗口检查存活：
 
@@ -127,7 +127,7 @@ ACL DRYRUN reader get cache:1   -- 预检权限，不执行命令
 
 - `on`/`off` 启用或停用用户。`>口令` 追加一个口令，口令以 SHA1 摘要保存，不明文落盘。
 - `-@all +get +ping` 先清空命令权限再放行单个命令。分类有 `keyspace`、`read`、`write`、`admin`、`pubsub`、`fast`、`slow`，顺序有意义，`+get` 必须写在 `-@all` 后面。
-- `~cache:*` 只允许匹配该通配符的键，`~*` 是全部键。键权限只有允许或不允许，没有 Redis 7 那种按键区分读和写的选择器，写了 `%R~` 这类规则会报未知规则。
+- `~cache:*` 允许匹配该通配符的键读写，`~*` 是全部键。`%R~cache:*` 只允许读，`%W~cache:*` 只允许写，`%RW~` 与 `~` 相同。只读命令要求读权限；写入、插入、删除要求写权限；`GETDEL`、`COPY` 的目标键同时要求两者。`SET`/`SETEX` 视选项而定，按命令级写标志判断，因此 `%W~` 用户可以执行普通 `SET`。`&pattern` 频道规则与键规则独立。
 - 一个用户不能删掉自己看不到的用户：`ACL` 命令本身受权限控制，但 `ACL WHOAMI` 对任何已认证用户都放行。
 - 配置了 `requirepass` 时，未认证连接收到 `NOAUTH`；没有配置时，连接以 `default` 用户进入，`default` 默认拥有全部权限。
 - `ACL DELUSER default` 会被拒绝。删掉一个用户后，仍以该用户身份在线的连接会立即被断开。
@@ -418,7 +418,32 @@ openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
 openssl s_client -connect 127.0.0.1:6380 -servername redis.example -CAfile ca.crt
 ```
 
-需要客户端证书时再带 `-cert client.crt -key client.key`。TLS 只覆盖客户端连接；主从复制、集群总线、Sentinel 仍是明文，也没有证书热加载、`tls-protocols`、`tls-ciphers` 等配置项。
+需要客户端证书时再带 `-cert client.crt -key client.key`。TLS 覆盖客户端连接和主从复制；集群总线、Sentinel 仍是明文，也没有证书热加载、`tls-protocols`、`tls-ciphers` 等配置项。
+
+## 4d. TLS 主从复制
+
+主库照常开 `tls-port`，从库设置 `tls-replication yes`，并让 `replicaof` 指向主库的 TLS 端口：
+
+```text
+# 主库
+tls-port 6380
+tls-cert-file D:/redis/certs/server.crt
+tls-key-file D:/redis/certs/server.key
+tls-ca-cert-file D:/redis/certs/ca.crt
+tls-auth-clients yes
+
+# 从库
+tls-replication yes
+replicaof 10.0.0.10 6380
+tls-cert-file D:/redis/certs/replica.crt
+tls-key-file D:/redis/certs/replica.key
+tls-ca-cert-file D:/redis/certs/ca.crt
+```
+
+- 握手、`PING`/`REPLCONF`/`PSYNC`、RDB 传输和后续增量命令都在同一条 TLS 会话里；`INFO replication` 的 `master_link_status` 与明文复制一样显示 `up`。
+- 主库设置 `tls-auth-clients yes` 时，从库也必须配置由同一 CA 签发的证书和私钥，否则握手中被拒绝。
+- 主库启用 `repl-diskless-sync yes` 时，遇到 TLS 从库会自动退回磁盘方式生成并发送 RDB。
+- 已加密链路上不要再叠加 `masterauth` 以外的明文隧道；更换证书或修改 `tls-replication` 都需要重启进程。
 
 ## 5. 持久化与恢复
 
@@ -474,7 +499,7 @@ BGREWRITEAOF
 
 等 `INFO persistence` 里两次后台任务的状态都变成 `ok`，再复制 `dir` 下的 `dump.rdb` 和 `appendonly.aof`。复制过程中不要 `SHUTDOWN`，也不要再手动触发保存。
 
-备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp26-20261109.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
+备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp28-20261109.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
 
 流的 `entries-added` 和 `max-deleted-entry-id` 不写入 RDB 快照：从 `dump.rdb` 恢复后前者按当前长度重算、后者归零；从 AOF 恢复（含 AOF 重写）会保留。若业务依赖这两个计数，恢复时优先使用 AOF，或在恢复后用 `XSETID <key> <id> ENTRIESADDED <n> MAXDELETEDID <id>` 校正。
 
@@ -516,5 +541,5 @@ AOF 启动失败：
 
 - 不支持把一份数据目录挂给两个进程同时写。
 - 集群功能沿用底座实现，已有本机三节点覆盖，但没有验证哨兵、跨机器网络分区和真实故障切换；生产不要仅凭本版测试结论做故障切换。
-- ACL 已实现用户、口令、命令分类和键/频道通配符，但选择器没有按键的读写权限位，匹配到的键一律放行。见第 3 节。
+- ACL 已实现用户、口令、命令分类、键/频道通配符和 `%R~`/`%W~` 键读写权限；`SET`、`SETEX` 这类选项相关命令按命令级标志近似。见第 3 节。
 - 客户端可以用 `HELLO 3` 切到 RESP3：map、set、null、bool、double 和 verbatim 都有。协议 3 下 Pub/Sub 的订阅确认、消息以及 `CLIENT TRACKING` 失效都用 push 帧（`>`）发送，失效不需要 `REDIRECT`；协议 2 仍是普通数组，失效继续走 `__redis__:invalidate` 频道，必须 `REDIRECT` 到已订阅该频道的连接。Redisson 单机模式下的 `SET ... KEEPTTL`、`GETEX`、`GETDEL` 属于本版已实现的范围。

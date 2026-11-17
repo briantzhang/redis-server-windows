@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp26
+# Redis for Windows 5.0.14.1-bp28
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -74,8 +74,10 @@
 | `SCAN ... TYPE type` | 6.0 | 键空间扫描可按类型过滤；未知类型名返回空页，不报错 |
 | `HELLO [protover [AUTH user pass] [SETNAME name]]` | 6.0 | 握手；接受协议 2 和 3，其它版本返回 NOPROTO；协议 3 下回复为 RESP3 map |
 | RESP3 push 帧 | 6.0 | 协议 3 下 Pub/Sub 的订阅确认、消息和 `CLIENT TRACKING` 失效以 `>` 推送，可与命令回复区分 |
+| ACL 键读写权限（`%R~` / `%W~` / `%RW~`） | 7.0 | 每个键模式只授读、只授写或两者；按命令键规格区分读写，`SET`/`SETEX` 按命令级写标志近似 |
 | `FUNCTION LOAD/DELETE/FLUSH/LIST/DUMP/RESTORE`、`FCALL`、`FCALL_RO` | 7.0 | Lua 函数按库管理并随 RDB/AOF 保存；DUMP 为本版私有格式 |
 | TLS 客户端监听（`tls-port`、PEM 证书、`tls-auth-clients`） | 6.0 | OpenSSL 3 memory BIO 接入 IOCP；TLS 1.2/1.3；明文 `port` 可并存 |
+| TLS 主从复制（`tls-replication`） | 6.0 | 从库连主库的 `tls-port`；握手、`PSYNC`、RDB 传输、增量命令与心跳全部加密 |
 | `CLIENT TRACKING` / `CACHING` / `GETREDIR` / `TRACKINGINFO` | 6.0 / 6.2 | 客户端缓存追踪；RESP3 直接 push 失效，RESP2 经 Pub/Sub `__redis__:invalidate`（需 REDIRECT） |
 | `tracking-table-max-keys` CONFIG | 6.0 | TrackingTable 上限（0=不限，默认 1000000）；支持 GET/SET/REWRITE |
 | `INFO`/`MEMORY STATS` tracking 字段 | 6.0 / 6.2 | `tracking_clients`、`tracking_total_*` 与 `clients.tracking.table.*` |
@@ -83,7 +85,7 @@
 | `XINFO CONSUMERS` 的 `inactive` | 7.2 | 距上次成功投递的毫秒；尚未成功投递为 -1；`idle` 仍按上次尝试交互 |
 | `UNLINK` / `SWAPDB` / `WAIT` / `ROLE` 回归 | 4.0 / 4.0 / 3.0 / 2.8 | 异步删除、库交换、副本确认等待与角色查询；实现早已存在，bp16 补黑盒覆盖 |
 
-ACL 支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并提供 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN`、`ACL LOG` 与 `ACL SAVE`/`ACL LOAD`。一个用户可以有多套权限：根规则之外用 `(...)` 追加选择器，根规则或任一选择器放行即允许该命令。没有按键的读写权限位，选择器对匹配到的键一律放行。频道规则已经生效：`&pattern` 按通配符匹配字面频道，`PSUBSCRIBE` 要求与 ACL 模式字面一致，`allchannels` 放行全部频道；新建用户默认 `resetchannels`，`default` 用户默认 `allchannels`。`requirepass` 成为 `default` 用户的口令，设置后未认证连接被拒绝，`CONFIG SET requirepass` 会同步更新该用户；不设置时连接以 `default` 用户进入。`ACL WHOAMI` 对任何已认证用户放行。删除用户或从 ACL 文件移除用户时，仍以该用户认证的连接会被断开，避免悬空指针。脚本里调用的命令、键与频道同样受调用者权限约束。
+ACL 支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并提供 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN`、`ACL LOG` 与 `ACL SAVE`/`ACL LOAD`。一个用户可以有多套权限：根规则之外用 `(...)` 追加选择器，根规则或任一选择器放行即允许该命令。键模式可以只授读（`%R~pattern`）、只授写（`%W~pattern`）或两者（`~pattern`、`%RW~pattern`）；命令对该键的访问方式取自键规格，`SET`/`SETEX` 这类随选项变化的按命令级写标志判断。频道规则已经生效：`&pattern` 按通配符匹配字面频道，`PSUBSCRIBE` 要求与 ACL 模式字面一致，`allchannels` 放行全部频道；新建用户默认 `resetchannels`，`default` 用户默认 `allchannels`。`requirepass` 成为 `default` 用户的口令，设置后未认证连接被拒绝，`CONFIG SET requirepass` 会同步更新该用户；不设置时连接以 `default` 用户进入。`ACL WHOAMI` 对任何已认证用户放行。删除用户或从 ACL 文件移除用户时，仍以该用户认证的连接会被断开，避免悬空指针。脚本里调用的命令、键与频道同样受调用者权限约束。
 
 代码参照 Redis `7.0.15` 与 `7.2.5`（BSD）中的相关命令语义，按旧版 API 手工适配；没有引入 Redis 8 的源码或模块。
 
@@ -94,14 +96,14 @@ ACL 支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@categor
 - 成功的带 TTL 的 SET 在 AOF 中记录为普通 SET + 绝对 PEXPIREAT；KEEPTTL 记录实际保留的截止时间。
 - GETEX 的写入记录为 PEXPIREAT、PERSIST 或 DEL/UNLINK；GETDEL 记录为 DEL。
 - 条件过期仅记录成功结果的绝对截止时间，恢复时不重新判断 NX/XX/GT/LT。
-- RESP3 接入了类型、握手和 push：`HELLO 3` 把该连接切到协议 3，map、set、null、bool、double 和 verbatim 按协议编码，`RESET` 退回协议 2。Pub/Sub 的订阅确认、消息、分片消息以及 TRACKING 失效在协议 3 下都是 `>` push 帧；协议 2 保持普通数组，TRACKING 失效仍走 Pub/Sub。不迁入新版 RDB 格式或多段 AOF。TLS 只覆盖客户端监听，主从复制和集群总线仍为明文，也不支持证书热加载。网络收发由多个 IO 线程分担，命令解析与执行仍在主线程。ACL 选择器对匹配的键一律放行，不区分读与写。`COMMAND DOCS` 的文档取自 Redis 7.0.15 的命令表，`ZRANK`/`ZREVRANK` 的 `WITHSCORE` 取自 7.2.5。原底座已有功能保留，但本版没有对其做现代化升级。
+- RESP3 接入了类型、握手和 push：`HELLO 3` 把该连接切到协议 3，map、set、null、bool、double 和 verbatim 按协议编码，`RESET` 退回协议 2。Pub/Sub 的订阅确认、消息、分片消息以及 TRACKING 失效在协议 3 下都是 `>` push 帧；协议 2 保持普通数组，TRACKING 失效仍走 Pub/Sub。不迁入新版 RDB 格式或多段 AOF。TLS 覆盖客户端监听和主从复制链路（`tls-replication yes`），集群总线仍为明文，也不支持证书热加载。网络收发由多个 IO 线程分担，命令解析与执行仍在主线程。ACL 键权限按命令键规格区分读与写。`COMMAND DOCS` 的文档取自 Redis 7.0.15 的命令表，`ZRANK`/`ZREVRANK` 的 `WITHSCORE` 取自 7.2.5。原底座已有功能保留，但本版没有对其做现代化升级。
 - `maxmemory-clients` 限制普通客户端的查询缓冲、回复缓冲和参数向量之和，超出时断开占用最大的连接。`CLIENT NO-EVICT` 的连接以及副本、主连接和 MONITOR 不参与。占用按这三项估算，不是 Redis 7 的客户端内存桶。
 - `WAITAOF` 没有 7.2 的异步 fsync 完成队列：开启 AOF 时在命令内调用 `flushAppendOnlyFile` 并 `fsync`，然后立即返回；`numreplicas` 只做参数校验，回复中的副本数恒为 0，不阻塞到超时。
 - `XINFO CONSUMERS` 的 `inactive`/`active_time` 是运行时数据，不写入本版 RDB：快照恢复后 `inactive` 回到 -1，直到再次成功投递。
 - 命令延迟直方图是运行时数据，不写入 RDB/AOF；使用固定的对数桶而不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界。
 - `SCRIPT FLUSH ASYNC` 换上一份空的脚本缓存，把旧的交给后台的延迟释放线程。Lua 解释器本身仍在主线程关闭并重建，因为跨线程释放它不安全。
 - 集群沿用底座的 Redis 5.0 实现，槽位、握手、`MOVED`/`ASK` 重定向和故障转移代码未改写。bp25 增加三节点黑盒覆盖，并记录集群总线端口为客户端端口 +10000。
-- TLS 使用 OpenSSL 3.5.9 的 memory BIO：密文仍由 `read()` 和 `write()` 走原有 IOCP 就绪通知，不在 socket 上直接挂 `SSL_set_fd`。支持 `tls-port`、`tls-cert-file`、`tls-key-file`、`tls-ca-cert-file`、`tls-ca-cert-dir` 和 `tls-auth-clients`；没有 `tls-protocols`、`tls-ciphers`、`tls-replication`、`tls-cluster` 等配置。运行时需要随包的 `libssl-3-x64.dll` 与 `libcrypto-3-x64.dll`。
+- TLS 使用 OpenSSL 3.5.9 的 memory BIO：密文仍由 `read()` 和 `write()` 走原有 IOCP 就绪通知，不在 socket 上直接挂 `SSL_set_fd`。支持 `tls-port`、`tls-cert-file`、`tls-key-file`、`tls-ca-cert-file`、`tls-ca-cert-dir`、`tls-auth-clients` 和 `tls-replication`；没有 `tls-protocols`、`tls-ciphers`、`tls-cluster` 等配置。主库向 TLS 从库发送 `+FULLRESYNC`、`+CONTINUE`、RDB 内容与心跳换行时都通过加密会话，磁盘方式传 RDB 由 TLS 写路径带背压发送；启用 `repl-diskless-sync` 时遇到 TLS 从库会自动退回磁盘方式。运行时需要随包的 `libssl-3-x64.dll` 与 `libcrypto-3-x64.dll`。
 - 网络/IOCP、Windows 服务与 fork 模拟层沿用底座代码。
 
 ## 性能预期
@@ -128,7 +130,7 @@ ACL 支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@categor
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。本轮覆盖 `FUNCTION` / `FCALL` 及 DUMP/RESTORE 往返、三节点集群组网与重定向，以及 TLS 明文/密文双监听、256 KiB 往返、流水线和 `tls-auth-clients yes` 客户端证书校验，还有 RESP3 下 Pub/Sub 与 TRACKING 的 push 帧；共 89 项。保留 bp23 的 RESP3 及 bp22 及更早用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。本轮覆盖 `FUNCTION` / `FCALL` 及 DUMP/RESTORE 往返、三节点集群组网与重定向，以及 TLS 明文/密文双监听、256 KiB 往返、流水线和 `tls-auth-clients yes` 客户端证书校验，RESP3 下 Pub/Sub 与 TRACKING 的 push 帧，ACL 的 `%R~`/`%W~` 键权限，以及 TLS 主从复制的全量同步、部分重同步与增量传播；共 91 项。保留 bp23 的 RESP3 及 bp22 及更早用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 

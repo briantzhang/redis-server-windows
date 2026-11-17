@@ -8,7 +8,7 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '5.0.14.1-bp26'
+VERSION = '5.0.14.1-bp28'
 NAME = 'Redis-x64-' + VERSION
 DIST = ROOT / 'dist'
 PKG = DIST / NAME
@@ -105,7 +105,7 @@ if not exist data mkdir data
 "%~dp0redis-server.exe" "%~dp0redis.windows.conf" --dir "%~dp0data"
 popd
 ''', encoding='ascii', newline='\r\n')
-    (PKG/'README.md').write_text('''# Redis Windows 5.0.14.1-bp26
+    (PKG/'README.md').write_text('''# Redis Windows 5.0.14.1-bp28
 
 Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；关闭窗口或 Ctrl+C 停止。
 默认监听 127.0.0.1:6379，AOF 每秒同步，数据保存在同目录 data/。
@@ -117,11 +117,14 @@ Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；
 TLS：按 redis.windows.conf 的注释配置 tls-port 和证书后重启；必须保留
       libssl-3-x64.dll 与 libcrypto-3-x64.dll。随包 redis-cli 不支持 TLS，
       请用支持 TLS 的客户端连接，许可证见 licenses/openssl-LICENSE.txt。
+      主从复制加密：从库设置 tls-replication yes，并用 replicaof 指向主库
+      tls-port；主库要求客户端证书时从库也要配置证书和私钥。
 新命令示例：
   redis-cli.exe SET demo value KEEPTTL
   redis-cli.exe ZUNION 2 z1 z2 WITHSCORES
   redis-cli.exe COPY src dst REPLACE
   redis-cli.exe ACL SETUSER reader on ">secret" "~cache:*" -@all +get +ping
+  redis-cli.exe ACL SETUSER writer on ">secret2" "%R~cache:*" "%W~queue:*" -@all +get +set +lpush
   redis-cli.exe HRANDFIELD h 2 WITHVALUES
   redis-cli.exe ZRANDMEMBER z 2 WITHSCORES
   redis-cli.exe LPOP queue 10

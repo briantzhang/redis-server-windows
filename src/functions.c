@@ -104,8 +104,17 @@ void functionsInit(int setup) {
     }
     function_libs = newLibDict();
     functions = newFunctionDict();
+    server.function_libs = function_libs;
+    server.function_index = functions;
     lua_newtable(server.lua);
     lua_setglobal(server.lua,"__redis_function_callbacks");
+}
+
+/* The Windows fork child copies the server structure but starts with fresh
+ * statics. The dictionaries themselves are in the mapped parent heap. */
+void functionsReloadGlobals(void) {
+    function_libs = (dict*)server.function_libs;
+    functions = (dict*)server.function_index;
 }
 
 static int validName(const char *s, size_t len) {

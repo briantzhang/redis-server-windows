@@ -1,12 +1,13 @@
 /* Access control: named users, passwords, command categories, key patterns
  * and selectors. A user carries a root permission set plus any number of
  * selectors added with (...); a command is allowed when the root or any
- * selector allows it. Key permission flags (read/write per key) are absent:
- * a selector grants every key matching its patterns.
+ * selector allows it.
  *
  * Command permission is stored as one bit per command id. Key permission is
- * either all keys or a list of glob patterns. A user with no password set and
- * without "nopass" cannot authenticate. */
+ * either all keys or a list of patterns, each granting reads, writes or both.
+ * A key is allowed when a matching pattern grants everything the command needs
+ * for that key. A user with no password set and without "nopass" cannot
+ * authenticate. */
 
 #include "server.h"
 #include "sha1.h"
@@ -17,12 +18,19 @@
 #define USER_NOPASS    (1<<3)
 #define USER_ALLCHANNELS (1<<4)
 
-/* One permission set: command bits, key globs and channel globs. A user
+/* A key glob and the access it grants. `~pat` grants both, `%R~pat` only
+ * reads and `%W~pat` only writes. */
+typedef struct {
+    int flags;      /* ACL_KEY_READ and/or ACL_KEY_WRITE. */
+    sds pattern;
+} aclKeyPattern;
+
+/* One permission set: command bits, key patterns and channel globs. A user
  * has a root selector plus any number added with (...). A command is allowed
  * when the root or any selector allows it. */
 typedef struct {
     int flags;
-    list *patterns;
+    list *patterns;   /* aclKeyPattern*. */
     list *channels;
     uint64_t commands[16]; /* 1024 command ids. */
 } aclSelector;
@@ -105,11 +113,24 @@ static user *ACLGetUser(sds name) {
     return de ? dictGetVal(de) : NULL;
 }
 
+static void aclFreeKeyPattern(void *p) {
+    aclKeyPattern *kp = p;
+    sdsfree(kp->pattern);
+    zfree(kp);
+}
+
+static aclKeyPattern *aclCreateKeyPattern(int flags, sds pattern) {
+    aclKeyPattern *kp = zmalloc(sizeof(*kp));
+    kp->flags = flags;
+    kp->pattern = pattern;
+    return kp;
+}
+
 static void aclInitSelector(aclSelector *s) {
     s->flags = 0;
     s->patterns = listCreate();
     s->channels = listCreate();
-    listSetFreeMethod(s->patterns, (void (*)(void*))sdsfree);
+    listSetFreeMethod(s->patterns, aclFreeKeyPattern);
     listSetFreeMethod(s->channels, (void (*)(void*))sdsfree);
 }
 
@@ -231,8 +252,23 @@ static int ACLSetSelector(aclSelector *s, const char *op) {
     if (!strcasecmp(op,"nocommands") || !strcasecmp(op,"-@all")) {
         aclDenyAll(s); return C_OK;
     }
-    if (op[0] == '~') {
-        listAddNodeTail(s->patterns, sdsnew(op+1));
+    if (op[0] == '~' || op[0] == '%') {
+        int flags = ACL_KEY_READ|ACL_KEY_WRITE;
+        const char *pat = op;
+
+        if (op[0] == '%') {
+            /* %R~, %W~ and %RW~ (either letter order). */
+            flags = 0;
+            pat++;
+            while (*pat && *pat != '~') {
+                if (*pat == 'R' || *pat == 'r') flags |= ACL_KEY_READ;
+                else if (*pat == 'W' || *pat == 'w') flags |= ACL_KEY_WRITE;
+                else return C_ERR;
+                pat++;
+            }
+            if (*pat != '~' || flags == 0) return C_ERR;
+        }
+        listAddNodeTail(s->patterns, aclCreateKeyPattern(flags, sdsnew(pat+1)));
         s->flags &= ~USER_ALLKEYS;
         return C_OK;
     }
@@ -368,34 +404,50 @@ int ACLCheckPassword(user *u, const char *pw, size_t len) {
     return match ? C_OK : C_ERR;
 }
 
+/* Whether any pattern grants the access this key argument needs. */
+static int aclKeyAllowed(aclSelector *s, const char *key, size_t keylen,
+                         int need) {
+    listIter li;
+    listNode *ln;
+    listRewind(s->patterns,&li);
+    while ((ln = listNext(&li))) {
+        aclKeyPattern *kp = ln->value;
+        if ((kp->flags & need) != need) continue;
+        if (stringmatchlen(kp->pattern,(int)sdslen(kp->pattern),key,
+                           (int)keylen,0))
+            return 1;
+    }
+    return 0;
+}
+
+/* Whether a selector grants every key of the command. Sets *denied_key to the
+ * argument position of the first key it refuses. */
+static int aclSelectorAllowsKeys(aclSelector *s, struct redisCommand *cmd,
+                                 robj **argv, int argc, int *denied_key) {
+    int *keys, numkeys, i;
+    if (s->flags & USER_ALLKEYS) return 1;
+    keys = getKeysFromCommand(cmd, argv, argc, &numkeys);
+    for (i = 0; i < numkeys; i++) {
+        sds key = argv[keys[i]]->ptr;
+        int need = getKeyPermissionFlags(cmd, argv, argc, keys[i]);
+        if (!aclKeyAllowed(s, key, sdslen(key), need)) {
+            if (denied_key) *denied_key = keys[i];
+            if (keys) getKeysFreeResult(keys);
+            return 0;
+        }
+    }
+    if (keys) getKeysFreeResult(keys);
+    return 1;
+}
+
 /* A selector allows a command when it grants the command and every key
  * the command touches. Returns 1 on success, 0 when the command is refused,
  * -1 when the command is granted but a key is not. */
 static int aclSelectorAllows(aclSelector *s, client *c, int *denied_key) {
-    int *keys, numkeys, i;
     if (!(s->flags & USER_ALLCMD) && !aclCommandBit(s, c->cmd->id))
         return 0;
-    if (s->flags & USER_ALLKEYS) return 1;
-    keys = getKeysFromCommand(c->cmd, c->argv, c->argc, &numkeys);
-    for (i = 0; i < numkeys; i++) {
-        sds key = c->argv[keys[i]]->ptr;
-        listIter li;
-        listNode *ln;
-        int allowed = 0;
-        listRewind(s->patterns, &li);
-        while ((ln = listNext(&li))) {
-            sds pat = ln->value;
-            if (stringmatchlen(pat, (int)sdslen(pat), key, (int)sdslen(key), 0))
-                allowed = 1;
-        }
-        if (!allowed) {
-            *denied_key = keys[i];
-            getKeysFreeResult(keys);
-            return -1;
-        }
-    }
-    getKeysFreeResult(keys);
-    return 1;
+    return aclSelectorAllowsKeys(s, c->cmd, c->argv, c->argc, denied_key) ?
+           1 : -1;
 }
 
 /* Returns C_OK when the command may run. The root selector and every added
@@ -620,25 +672,8 @@ static int aclCheckUserPerm(user *u, struct redisCommand *cmd,
  * DRYRUN, which has a command and arguments but no client. */
 static int aclSelectorAllowsCommand(aclSelector *s, struct redisCommand *cmd,
                                     robj **argv, int argc) {
-    int *keys, numkeys, i;
     if (!(s->flags & USER_ALLCMD) && !aclCommandBit(s, cmd->id)) return 0;
-    if (s->flags & USER_ALLKEYS) return 1;
-    keys = getKeysFromCommand(cmd, argv, argc, &numkeys);
-    for (i = 0; i < numkeys; i++) {
-        sds key = argv[keys[i]]->ptr;
-        listIter li;
-        listNode *ln;
-        int allowed = 0;
-        listRewind(s->patterns,&li);
-        while ((ln = listNext(&li))) {
-            sds pat = ln->value;
-            if (stringmatchlen(pat,(int)sdslen(pat),key,(int)sdslen(key),0))
-                allowed = 1;
-        }
-        if (!allowed) { if (keys) getKeysFreeResult(keys); return 0; }
-    }
-    if (keys) getKeysFreeResult(keys);
-    return 1;
+    return aclSelectorAllowsKeys(s, cmd, argv, argc, NULL);
 }
 
 /* =============================================================================
@@ -788,11 +823,24 @@ static list *aclCopySdsList(list *src) {
     return dst;
 }
 
+static list *aclCopyKeyPatterns(list *src) {
+    list *dst = listCreate();
+    listIter li;
+    listNode *ln;
+    listSetFreeMethod(dst, aclFreeKeyPattern);
+    listRewind(src,&li);
+    while ((ln = listNext(&li))) {
+        aclKeyPattern *kp = ln->value;
+        listAddNodeTail(dst, aclCreateKeyPattern(kp->flags, sdsdup(kp->pattern)));
+    }
+    return dst;
+}
+
 /* Copy every rule of src into dst, keeping dst's name and address. */
 static aclSelector *aclCloneSelector(aclSelector *src) {
     aclSelector *s = zcalloc(sizeof(*s));
     s->flags = src->flags;
-    s->patterns = aclCopySdsList(src->patterns);
+    s->patterns = aclCopyKeyPatterns(src->patterns);
     s->channels = aclCopySdsList(src->channels);
     memcpy(s->commands, src->commands, sizeof(s->commands));
     return s;
@@ -806,7 +854,7 @@ static void ACLCopyUser(user *dst, user *src) {
     listRelease(dst->root.channels);
     listEmpty(dst->selectors);
     dst->passwords = aclCopySdsList(src->passwords);
-    dst->root.patterns = aclCopySdsList(src->root.patterns);
+    dst->root.patterns = aclCopyKeyPatterns(src->root.patterns);
     dst->root.channels = aclCopySdsList(src->root.channels);
     dst->flags = src->flags;
     dst->root.flags = src->root.flags;
@@ -861,14 +909,30 @@ static sds ACLDescribeUser(user *u) {
     return d;
 }
 
+/* The ACL SETUSER spelling of one key pattern. */
+static sds aclKeyPatternDescription(aclKeyPattern *kp) {
+    const char *prefix;
+    if ((kp->flags & (ACL_KEY_READ|ACL_KEY_WRITE)) ==
+        (ACL_KEY_READ|ACL_KEY_WRITE))
+        prefix = "~";
+    else if (kp->flags & ACL_KEY_READ)
+        prefix = "%R~";
+    else
+        prefix = "%W~";
+    return sdscatprintf(sdsempty(),"%s%s",prefix,kp->pattern);
+}
+
 /* Append one selector's key, channel and command rules. */
 static sds aclAppendSelector(sds d, aclSelector *s) {
     listIter li;
     listNode *ln;
     if (s->flags & USER_ALLKEYS) d = sdscat(d," ~*");
     listRewind(s->patterns,&li);
-    while ((ln = listNext(&li)))
-        d = sdscatprintf(d," ~%s",(char*)ln->value);
+    while ((ln = listNext(&li))) {
+        sds desc = aclKeyPatternDescription(ln->value);
+        d = sdscatprintf(d," %s",desc);
+        sdsfree(desc);
+    }
     if (s->flags & USER_ALLCHANNELS) {
         d = sdscat(d," allchannels");
     } else {
@@ -1281,8 +1345,7 @@ void aclCommand(client *c) {
             addReplyMultiBulkLen(c, listLength(u->root.patterns));
             listRewind(u->root.patterns,&li);
             while ((ln = listNext(&li))) {
-                sds pat = ln->value;
-                addReplyBulkSds(c, sdscatprintf(sdsempty(),"~%s",pat));
+                addReplyBulkSds(c, aclKeyPatternDescription(ln->value));
             }
         }
 

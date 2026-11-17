@@ -39,6 +39,7 @@
 #endif
 
 #include "server.h"
+#include "tls.h"
 #include "cluster.h"
 
 POSIX_ONLY(#include <sys/time.h>)
@@ -425,6 +426,32 @@ PORT_LONGLONG getPsyncInitialOffset(void) {
  * Normally this function should be called immediately after a successful
  * BGSAVE for replication was started, or when there is one already in
  * progress that we attached our slave to. */
+/* Write an out of band replication message to a replica. Plain replicas get
+ * a direct write() like upstream does. TLS replicas get the bytes pushed
+ * through their SSL session directly, so the message keeps its place in the
+ * encrypted stream without touching the reply buffer that the bulk transfer
+ * later bypasses.
+ *
+ * Returns len on success and -1 on error. */
+static int replicationWriteToSlave(client *slave, const char *buf, int len) {
+    if (slave->flags & CLIENT_TLS) {
+        int sent = 0, waits = 0;
+
+        while (sent < len) {
+            int n = tlsWrite(slave,buf+sent,len-sent);
+            if (n > 0) {
+                sent += n;
+                continue;
+            }
+            if (errno != EAGAIN && errno != WSAEWOULDBLOCK) return -1;
+            if (++waits > 100) return -1;   /* stop blocking after ~1s */
+            aeWait(slave->fd,AE_WRITABLE,10);
+        }
+        return len;
+    }
+    return (int)write(slave->fd,buf,len);
+}
+
 int replicationSetupSlaveForFullResync(client *slave, PORT_LONGLONG offset) {
     char buf[128];
     int buflen;
@@ -441,7 +468,7 @@ int replicationSetupSlaveForFullResync(client *slave, PORT_LONGLONG offset) {
     if (!(slave->flags & CLIENT_PRE_PSYNC)) {
         buflen = snprintf(buf,sizeof(buf),"+FULLRESYNC %s %lld\r\n",
                           server.replid,offset);
-        if (write(slave->fd,buf,buflen) != buflen) {
+        if (replicationWriteToSlave(slave,buf,buflen) != buflen) {
             freeClientAsync(slave);
             return C_ERR;
         }
@@ -528,7 +555,7 @@ int masterTryPartialResynchronization(client *c) {
     } else {
         buflen = snprintf(buf,sizeof(buf),"+CONTINUE\r\n");
     }
-    if (write(c->fd,buf,buflen) != buflen) {
+    if (replicationWriteToSlave(c,buf,buflen) != buflen) {
         freeClientAsync(c);
         return C_OK;
     }
@@ -575,6 +602,22 @@ int startBgsaveForReplication(int mincapa) {
     int socket_target = server.repl_diskless_sync && (mincapa & SLAVE_CAPA_EOF);
     listIter li;
     listNode *ln;
+
+    /* The diskless path streams the RDB through the raw socket from the
+     * child process, which cannot drive a TLS session. Fall back to disk
+     * when a replica waiting for a full resync uses TLS. */
+    if (socket_target) {
+        listRewind(server.slaves,&li);
+        while((ln = listNext(&li))) {
+            client *slave = ln->value;
+            if ((slave->flags & CLIENT_TLS) &&
+                slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START)
+            {
+                socket_target = 0;
+                break;
+            }
+        }
+    }
 
     serverLog(LL_NOTICE,"Starting BGSAVE for SYNC with target: %s",
         socket_target ? "replicas sockets" : "disk");
@@ -909,12 +952,71 @@ void sendBulkToSlaveDataDone(aeEventLoop *el, int fd, void *privdata, int nwritt
     }
 }
 
+/* Disk based RDB transfer to a replica connected over TLS. The IOCP send
+ * used for plain replicas writes to the socket directly, which would corrupt
+ * the TLS stream, so the RDB is pushed through the TLS session instead and
+ * the writable event provides the backpressure. */
+void sendBulkToSlaveTls(client *slave) {
+    char buf[PROTO_IOBUF_LEN];
+    ssize_t buflen;
+    int nwritten;
+
+    if (slave->replpreamble) {
+        nwritten = tlsWrite(slave,slave->replpreamble,
+                            (int)sdslen(slave->replpreamble));
+        if (nwritten < 0) {
+            if (errno == EAGAIN || errno == WSAEWOULDBLOCK) return;
+            freeClient(slave);
+            return;
+        }
+        if ((size_t)nwritten < sdslen(slave->replpreamble)) {
+            sdsrange(slave->replpreamble,nwritten,-1);
+            return;
+        }
+        sdsfree(slave->replpreamble);
+        slave->replpreamble = NULL;
+    }
+
+    while (slave->repldboff < slave->repldbsize) {
+        lseek64(slave->repldbfd,slave->repldboff,SEEK_SET);
+        buflen = read(slave->repldbfd,buf,sizeof(buf));
+        if (buflen <= 0) {
+            serverLog(LL_WARNING,"Read error sending DB to slave: %s",
+                (buflen == 0) ? "premature EOF" : wsa_strerror(errno));
+            freeClient(slave);
+            return;
+        }
+        nwritten = tlsWrite(slave,buf,(int)buflen);
+        if (nwritten < 0) {
+            if (errno == EAGAIN || errno == WSAEWOULDBLOCK) return;
+            freeClient(slave);
+            return;
+        }
+        slave->repldboff += nwritten;
+        /* Wait for the socket to drain before reading more of the RDB:
+         * tlsWrite() refuses new plaintext while ciphertext is queued. */
+        if (slave->tls_outbuf || nwritten < buflen) return;
+    }
+
+    close(slave->repldbfd);
+    DeleteFileA(slave->replFileCopy);
+    memset(slave->replFileCopy,0,MAX_PATH);
+    slave->repldbfd = -1;
+    aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
+    putSlaveOnline(slave);
+}
+
 void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
     client *slave = privdata;
     UNUSED(el);
     UNUSED(mask);
     char *buf;
     ssize_t result, buflen;
+
+    if (slave->flags & CLIENT_TLS) {
+        sendBulkToSlaveTls(slave);
+        return;
+    }
 
     if (slave->repldboff == 0) {
         /* Write the bulk write count before to transfer the DB. In theory here
@@ -1183,7 +1285,9 @@ void replicationSendNewlineToMaster(void) {
     static time_t newline_sent;
     if (time(NULL) != newline_sent) {
         newline_sent = time(NULL);
-        if (write(server.repl_transfer_s,"\n",1) == -1) {
+        if (tlsReplActive(server.repl_transfer_s)) {
+            tlsReplWriteNewline(server.repl_transfer_s);
+        } else if (write(server.repl_transfer_s,"\n",1) == -1) {
             /* Pinging back in this stage is best-effort. */
         }
     }
@@ -1212,6 +1316,8 @@ void replicationCreateMasterClient(int fd, int dbid) {
     if (server.master->reploff == -1)
         server.master->flags |= CLIENT_PRE_PSYNC;
     if (dbid != -1) selectDb(server.master,dbid);
+    /* Continue the synchronization session with the TLS state, if any. */
+    if (tlsReplActive(fd)) tlsReplAdoptClient(server.master);
 }
 
 /* This function will try to re-enable the AOF file after the
@@ -1316,7 +1422,12 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
         readlen = (left < (signed)sizeof(buf)) ? left : (signed)sizeof(buf);
     }
 
-    nread = read(fd,buf,readlen);
+    if (tlsReplActive(fd)) {
+        nread = tlsReplReadSome(fd,buf,readlen);
+        if (nread == -2) return;   /* waiting for the queued readable event */
+    } else {
+        nread = read(fd,buf,readlen);
+    }
     if (nread <= 0) {
 #ifdef _WIN32
         if (server.repl_transfer_size) {
@@ -1481,6 +1592,10 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
          * to the new file. */
         if (aof_is_enabled) restartAOFAfterSYNC();
     }
+    /* TLS may already hold more plaintext than the 4 KB chunk consumed above.
+     * A new socket readiness event would never arrive for it. */
+    if (tlsReplActive(fd) && tlsReplPending(fd) > 0)
+        readSyncBulkPayload(el,fd,privdata,mask);
     return;
 
 error:
@@ -2065,6 +2180,18 @@ int connectWithMaster(void) {
         return C_ERR;
     }
 
+    /* With tls-replication the master is expected to listen on its TLS port.
+     * The handshake is synchronous: it uses aeWait() on this still nonblocking
+     * socket before the read handler is installed. */
+    if (server.tls_replication &&
+        tlsReplConnect(fd,(PORT_LONGLONG)server.repl_syncio_timeout*1000) != C_OK)
+    {
+        close(fd);
+        serverLog(LL_WARNING,"Unable to establish TLS with MASTER: %s",
+            IF_WIN32(wsa_strerror(errno),strerror(errno)));
+        return C_ERR;
+    }
+
     if (aeCreateFileEvent(server.el,fd,AE_READABLE|AE_WRITABLE,syncWithMaster,NULL) ==
             AE_ERR)
     {
@@ -2087,6 +2214,7 @@ void undoConnectWithMaster(void) {
     int fd = server.repl_transfer_s;
 
     aeDeleteFileEvent(server.el,fd,AE_READABLE|AE_WRITABLE);
+    if (tlsReplActive(fd)) tlsReplCleanup();
     close(fd);
     server.repl_transfer_s = -1;
 }
@@ -2421,6 +2549,8 @@ void replicationResurrectCachedMaster(int newfd) {
     server.master = server.cached_master;
     server.cached_master = NULL;
     server.master->fd = newfd;
+    /* The cached client holds the previous connection's TLS session. */
+    if (tlsReplActive(newfd)) tlsReplAdoptClient(server.master);
     server.master->flags &= ~(CLIENT_CLOSE_AFTER_REPLY|CLIENT_CLOSE_ASAP);
     server.master->authenticated = 1;
     server.master->lastinteraction = server.unixtime;
@@ -2857,6 +2987,11 @@ void replicationCron(void) {
 
         if (is_presync) {
 #ifdef _WIN32
+            if (slave->flags & CLIENT_TLS) {
+                /* Keep the newline inside the encrypted stream. */
+                replicationWriteToSlave(slave,"\n",1);
+                continue;
+            }
             if (WSIOCP_SocketSend(slave->fd, "\n", 1, server.el,
                                   NULL, NULL, NULL) == -1) {
 #else

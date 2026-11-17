@@ -29,6 +29,7 @@
  */
 
 #include "server.h"
+#include "tls.h"
 
 /* ----------------- Blocking sockets I/O with timeouts --------------------- */
 
@@ -50,6 +51,8 @@ ssize_t syncWrite(int fd, char *ptr, ssize_t size, PORT_LONGLONG timeout) {
     ssize_t nwritten, ret = size;
     PORT_LONGLONG start = mstime();
     PORT_LONGLONG remaining = timeout;
+
+    if (tlsReplActive(fd)) return tlsReplWrite(fd, ptr, size, timeout);
 
     while(1) {
         PORT_LONGLONG wait = (remaining > SYNCIO__RESOLUTION) ?
@@ -88,6 +91,7 @@ ssize_t syncRead(int fd, char *ptr, ssize_t size, PORT_LONGLONG timeout) {
     PORT_LONGLONG remaining = timeout;
 
     if (size == 0) return 0;
+    if (tlsReplActive(fd)) return tlsReplRead(fd, ptr, size, timeout);
     while(1) {
         PORT_LONGLONG wait = (remaining > SYNCIO__RESOLUTION) ?
                           remaining : SYNCIO__RESOLUTION;

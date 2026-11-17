@@ -262,6 +262,10 @@ void loadServerConfigFromString(char* config) {
             if ((server.tls_auth_clients = yesnotoi(argv[1])) == -1) {
                 err = "argument must be 'yes' or 'no'"; goto loaderr;
             }
+        } else if (!strcasecmp(argv[0],"tls-replication") && argc == 2) {
+            if ((server.tls_replication = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
         } else if (!strcasecmp(argv[0],"tcp-backlog") && argc == 2) {
             server.tcp_backlog = atoi(argv[1]);
             if (server.tcp_backlog < 0) {
@@ -1578,6 +1582,7 @@ void configGetCommand(client *c) {
     config_get_string_field("tls-ca-cert-file",server.tls_ca_cert_file);
     config_get_string_field("tls-ca-cert-dir",server.tls_ca_cert_dir);
     config_get_bool_field("tls-auth-clients",server.tls_auth_clients);
+    config_get_bool_field("tls-replication",server.tls_replication);
     config_get_string_field("unixsocket",server.unixsocket);
     config_get_string_field("logfile",server.logfile);
     config_get_string_field("pidfile",server.pidfile);

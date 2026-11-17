@@ -1676,6 +1676,7 @@ void initServerConfig(void) {
     server.tls_ca_cert_file = NULL;
     server.tls_ca_cert_dir = NULL;
     server.tls_auth_clients = 0;
+    server.tls_replication = 0;
     server.tcp_backlog = CONFIG_DEFAULT_TCP_BACKLOG;
     server.bindaddr_count = 0;
     server.unixsocket = NULL;
@@ -3416,6 +3417,41 @@ static const cmdDocKeySpec *commandKeySpecFor(const cmdDocEntry *doc,
         }
     }
     return NULL;
+}
+
+/* What one key argument needs from an ACL key pattern. Read keys need
+ * ACL_KEY_READ, keys that may be inserted, updated or deleted need
+ * ACL_KEY_WRITE. Specs marked variable_flags (SET, SETEX) depend on runtime
+ * options, so they fall back to the command-level flags instead of claiming
+ * that a plain SET reads the old value. */
+int getKeyPermissionFlags(struct redisCommand *cmd, robj **argv, int argc,
+                          int keypos) {
+    int flags = 0, variable = 0, f;
+    const cmdDocEntry *doc = commandDocLookup(cmd->name);
+    const cmdDocKeySpec *spec = commandKeySpecFor(doc, argv, argc, keypos);
+
+    if (spec) {
+        for (f = 0; f < 8 && spec->flags[f]; f++) {
+            const char *flag = spec->flags[f];
+            if (!strcasecmp(flag,"variable_flags")) {
+                variable = 1;
+            } else if (!strcasecmp(flag,"access")) {
+                flags |= ACL_KEY_READ;
+            } else if (!strcasecmp(flag,"insert") ||
+                       !strcasecmp(flag,"update") ||
+                       !strcasecmp(flag,"delete")) {
+                flags |= ACL_KEY_WRITE;
+            }
+        }
+        if (!variable) return flags;
+        flags = 0;
+    }
+
+    /* No key spec, or one whose flags depend on the options given. */
+    if (!(cmd->flags & CMD_WRITE) || (cmd->flags & CMD_READONLY))
+        flags |= ACL_KEY_READ;
+    if (cmd->flags & CMD_WRITE) flags |= ACL_KEY_WRITE;
+    return flags;
 }
 
 /* One command's documentation as a flat field/value array: summary,

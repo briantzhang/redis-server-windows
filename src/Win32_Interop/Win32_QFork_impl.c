@@ -66,6 +66,7 @@ void SetupRedisGlobals(LPVOID redisData, size_t redisDataSize, uint8_t *dictHash
 #ifndef NO_QFORKIMPL
     memcpy(&server, redisData, redisDataSize);
     dictSetHashFunctionSeed(dictHashSeed);
+    functionsReloadGlobals();
 
     //WORKAROUND: if main process was started with a config file - it contains modules
     // to be loaded in this child process, so load them here as well

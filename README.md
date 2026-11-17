@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp26
+# Redis for Windows 5.0.14.1-bp28
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp26`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp28`。
 
 ## 这个版本新增了什么
 
@@ -82,8 +82,10 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `SCAN ... TYPE type` | 6.0 | 只返回指定类型的键；未知类型名返回空页 |
 | `HELLO [protover [AUTH user pass] [SETNAME name]]` | 6.0 | 握手；接受协议 2 和 3，其它版本返回 NOPROTO；协议 3 下回复为 RESP3 map |
 | RESP3 push 帧 | 6.0 | 协议 3 下 Pub/Sub 的订阅确认、消息和 `CLIENT TRACKING` 失效用 `>` 推送；RESP2 仍是普通数组，失效继续走 `__redis__:invalidate` 频道 |
+| ACL 键读写权限（`%R~` / `%W~` / `%RW~`） | 7.0 | 每个键模式可只授读、只授写或两者；按命令键规格区分读写，`SET` 等选项相关命令按命令级写标志判断 |
 | `FUNCTION LOAD/DELETE/FLUSH/LIST/DUMP/RESTORE`、`FCALL`、`FCALL_RO` | 7.0 | 按库管理 Lua 函数，函数源码随 RDB/AOF 保存；DUMP 为本版私有格式 |
 | TLS 客户端监听（`tls-port`、证书、客户端证书认证） | 6.0 | 用 OpenSSL 3 在现有 Windows IOCP 连接上做 TLS 1.2/1.3；明文 `port` 可同时保留 |
+| TLS 主从复制（`tls-replication`） | 6.0 | 从库连主库的 `tls-port`，握手、PSYNC、RDB 传输和增量流都走加密连接 |
 | `CLIENT TRACKING` / `CACHING` / `GETREDIR` / `TRACKINGINFO` | 6.0 / 6.2 | 客户端缓存追踪；RESP3 连接直接收到 push 失效，RESP2 连接仍需 `REDIRECT` 到 `__redis__:invalidate` 订阅者 |
 | `tracking-table-max-keys` | 6.0 | TrackingTable 键数上限，CONFIG GET/SET/REWRITE |
 | `INFO clients/stats`、`MEMORY STATS` tracking 字段 | 6.0 / 6.2 | `tracking_clients`、`tracking_total_*`、`clients.tracking.table.*` |
@@ -93,13 +95,13 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 
 过期时间在秒数乘 1000、相对时间加当前时间之前做有符号 64 位溢出检查，非法值报错且不改动数据。
 
-ACL 支持 `on/off`、`>password`、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并可用 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN` 查看规则和预检权限，用 `ACL LOG` 查看拒绝记录，用 `ACL SAVE`/`ACL LOAD` 配合 `aclfile` 持久化规则。一个用户可以有多套权限：根规则之外，用 `(...)` 追加选择器，根规则或任一选择器放行即允许该命令。没有按键的读写权限位，一个选择器对匹配到的键一律放行。频道规则已生效：`&pattern` 按通配符匹配字面频道，`PSUBSCRIBE` 要求与 ACL 模式字面一致，`allchannels` 放行全部频道，新建用户默认 `resetchannels`；`default` 用户默认拥有 `allchannels`。配置了 `requirepass` 时，它仍然是 `default` 用户的口令，未认证的连接一律拒绝；`CONFIG SET requirepass` 会同步更新 `default` 用户，不配置时连接直接以 `default` 用户身份进入。删除用户会断开仍以该用户认证的连接，不会留下悬空引用。脚本内调用的命令、键与频道同样按调用者的权限检查，越权时脚本报错而不是绕过 ACL。
+ACL 支持 `on/off`、`>password`、`+@category/-@category`、`+cmd/-cmd`、`~keyglob`，并可用 `ACL CAT/USERS/GETUSER/GENPASS/DRYRUN` 查看规则和预检权限，用 `ACL LOG` 查看拒绝记录，用 `ACL SAVE`/`ACL LOAD` 配合 `aclfile` 持久化规则。一个用户可以有多套权限：根规则之外，用 `(...)` 追加选择器，根规则或任一选择器放行即允许该命令。键模式可以只授读（`%R~pattern`）、只授写（`%W~pattern`）或两者（`~pattern`、`%RW~pattern`）；`~pattern` 与 `~*`、`allkeys` 等价于读写都允许。命令是否被允许取决于它对该键的实际访问方式：只读命令要求读权限，写入、插入、删除要求写权限，`GETDEL`、`COPY` 的目标键等同时要求两者；`SET`、`SETEX` 的访问方式取决于选项，按命令级写标志判断。频道规则已生效：`&pattern` 按通配符匹配字面频道，`PSUBSCRIBE` 要求与 ACL 模式字面一致，`allchannels` 放行全部频道，新建用户默认 `resetchannels`；`default` 用户默认拥有 `allchannels`。配置了 `requirepass` 时，它仍然是 `default` 用户的口令，未认证的连接一律拒绝；`CONFIG SET requirepass` 会同步更新 `default` 用户，不配置时连接直接以 `default` 用户身份进入。删除用户会断开仍以该用户认证的连接，不会留下悬空引用。脚本内调用的命令、键与频道同样按调用者的权限检查，越权时脚本报错而不是绕过 ACL。
 
 命令语义参照 Redis `7.0.15`（BSD）手工适配，没有引入 Redis 8 的源码。完整说明见 [BACKPORT-RELEASE.md](BACKPORT-RELEASE.md)。
 
 集群模式沿用底座的 Redis 5.0 集群实现：`cluster-enabled yes` 启动后使用 16384 个槽，支持 `CLUSTER MEET`、`ADDSLOTS`、`SLOTS`、`NODES`、`KEYSLOT`、`COUNTKEYSINSLOT`、`REPLICATE` 等命令。bp25 用三个本机节点验证了组网、槽位分配、`MOVED` 重定向和槽位撤下后的 `CLUSTERDOWN`；集群总线端口固定为客户端端口 +10000，规划端口时要同时预留。
 
-TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM 证书链和私钥；设置 `tls-ca-cert-file` 后可用 `tls-auth-clients yes` 要求客户端证书。明文 `port` 可以同时保留，方便本地运维连接。TLS 由 OpenSSL 3 的 memory BIO 接入现有 IOCP 收发路径，不改变命令解析与执行线程模型；程序目录必须同时有 `libssl-3-x64.dll` 和 `libcrypto-3-x64.dll`。
+TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM 证书链和私钥；设置 `tls-ca-cert-file` 后可用 `tls-auth-clients yes` 要求客户端证书。明文 `port` 可以同时保留，方便本地运维连接。TLS 由 OpenSSL 3 的 memory BIO 接入现有 IOCP 收发路径，不改变命令解析与执行线程模型；程序目录必须同时有 `libssl-3-x64.dll` 和 `libcrypto-3-x64.dll`。从库设置 `tls-replication yes` 后可以连主库的 `tls-port`，握手、`PSYNC`、RDB 传输和后续增量命令都在同一个 TLS 会话里；主库给从库回 `+FULLRESYNC`、`+CONTINUE`、RDB 内容和心跳换行时同样走加密通道，主库启用 `repl-diskless-sync` 时遇到 TLS 从库会自动退回磁盘方式传 RDB。
 
 `CLIENT PAUSE WRITE` 只拦写命令与 `EXEC`，`CLIENT PAUSE ALL` 连读命令一起拦；被暂停的连接在恢复后按原顺序执行已解析的命令。`CONFIG SET` 多参数时逐对应用，后面的参数非法时前面的已经生效。`COMMAND LIST FILTERBY ACLCAT` 用命令级读写标志近似 `read`/`write`/`keyspace` 分类；`COMMAND GETKEYSANDFLAGS` 按每条命令的键规格给出标志，同一条命令的不同键可以不同，例如 `BITOP` 的目标键是 `OW update`、源键是 `RO access`。键位置不固定的参数（`SORT` 的 `STORE`）仍按命令级标志近似。`CLIENT KILL LADDR` 匹配的是服务端监听地址，因此同一监听地址上的所有连接都会命中；`MAXAGE` 按连接建立到现在的秒数计算。`LATENCY HISTOGRAM` 使用固定的对数桶，不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界，适合看数量级而不是精确尾延迟。`latency-tracking no` 只停止新采样，已有直方图保留到下一次重置。`WAITAOF` 在本版没有异步 fsync 确认机制：它在命令内同步刷盘后立即返回 `[本机确认, 0]`，不会阻塞到超时，也不跟踪副本的 AOF 落盘。`SHUTDOWN ABORT` 只能取消已置位但尚未执行的关闭请求，此时没有“关闭进行中”的状态。
 
@@ -107,8 +109,7 @@ TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM �
 
 以下能力不在本版中，调用会返回 `unknown command` 或沿用底座的旧行为：
 
-- 按键的读写权限位（选择器对匹配的键一律放行，不区分读与写）
-- TLS 只覆盖客户端监听：主从复制、集群总线仍走明文；不支持 `tls-replication`、`tls-cluster`、证书热加载和 TLS 会话配置项
+- 集群总线仍是明文；不支持 `tls-cluster`、证书热加载和 TLS 会话配置项
 - 客户端内存驱逐只按查询缓冲、回复缓冲和参数向量估算，不按 Redis 7 的客户端内存桶分摊
 - 多段 AOF（`appenddirname`）、新版 RDB 格式
 - Redis 8 的查询引擎
@@ -129,13 +130,13 @@ TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM �
 
 ## 验证
 
-在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，89 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
+在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，91 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
 
 ```bash
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮覆盖 `FUNCTION` / `FCALL` 及 DUMP/RESTORE 往返、三节点集群组网与重定向、TLS 明文/密文双监听、256 KiB 往返、流水线和客户端证书认证，以及 RESP3 下 Pub/Sub 与 `CLIENT TRACKING` 的 push 帧（RESP2 仍使用数组和 Pub/Sub 频道）；保留 bp23 的 RESP3 和 bp22 及更早用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮覆盖 `FUNCTION` / `FCALL` 及 DUMP/RESTORE 往返、三节点集群组网与重定向、TLS 明文/密文双监听、256 KiB 往返、流水线和客户端证书认证，TLS 主从复制的全量同步、部分重同步与增量传播，RESP3 下 Pub/Sub 与 `CLIENT TRACKING` 的 push 帧（RESP2 仍使用数组和 Pub/Sub 频道），以及 ACL 的 `%R~`/`%W~` 键读写权限；保留 bp23 的 RESP3 和 bp22 及更早用例。
 
 这轮验证不等于已合入上游全部安全补丁，也没有做生产压力测试。
 

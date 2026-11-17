@@ -1023,6 +1023,11 @@ struct redisServer {
     redisDb *db;
     dict *commands;             /* Command table */
     dict *orig_commands;        /* Command table before command renaming. */
+    /* Function dictionaries live here as well as in functions.c statics so
+     * the Windows fork child, which starts with fresh statics, can find the
+     * libraries in the mapped parent heap when it writes RDB/AOF. */
+    void *function_libs;
+    void *function_index;
     aeEventLoop *el;
     unsigned int lruclock;      /* Clock for LRU eviction */
     int shutdown_asap;          /* SHUTDOWN needed ASAP */
@@ -1058,6 +1063,7 @@ struct redisServer {
     char *tls_ca_cert_file;     /* CA bundle for client authentication */
     char *tls_ca_cert_dir;      /* CA hash directory for client authentication */
     int tls_auth_clients;       /* Require a verified client certificate */
+    int tls_replication;        /* Connect to the master over TLS */
     int tcp_backlog;            /* TCP listen() backlog */
     char *bindaddr[CONFIG_BINDADDR_MAX]; /* Addresses we should bind to */
     int bindaddr_count;         /* Number of addresses in server.bindaddr[] */
@@ -2020,6 +2026,11 @@ void freeObjAsync(robj *o);
 /* API to get key arguments from commands */
 int *getKeysFromCommand(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
 void getKeysFreeResult(int *result);
+/* Key access bits for ACL: what a command argument needs from a key pattern. */
+#define ACL_KEY_READ  (1<<0)
+#define ACL_KEY_WRITE (1<<1)
+int getKeyPermissionFlags(struct redisCommand *cmd, robj **argv, int argc,
+                          int keypos);
 int *zunionInterGetKeys(struct redisCommand *cmd,robj **argv, int argc, int *numkeys);
 int *mpopGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
 int *evalGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
@@ -2064,6 +2075,7 @@ void luaMaskCountHook(lua_State *lua, lua_Debug *ar);
 /* Functions */
 ssize_t rdbSaveAuxField(rio *rdb, void *key, size_t keylen, void *val, size_t vallen);
 void functionsInit(int setup);
+void functionsReloadGlobals(void);
 void functionCommand(client *c);
 void fcallCommand(client *c);
 void fcallRoCommand(client *c);

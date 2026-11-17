@@ -234,7 +234,7 @@ def make_tls_certificates(directory):
 class ManagedServer:
     def __init__(self, executable, directory, timeout, startup_timeout, aof=False,
                  requirepass=None, aclfile=False, cluster=False, tls=None,
-                 tls_auth_clients="no"):
+                 tls_auth_clients="no", tls_replication=False, replicaof=None):
         self.executable = executable
         self.directory = Path(directory)
         self.timeout = timeout
@@ -245,6 +245,8 @@ class ManagedServer:
         self.cluster = cluster
         self.tls = tls
         self.tls_auth_clients = tls_auth_clients
+        self.tls_replication = tls_replication
+        self.replicaof = replicaof
         self.port = reserve_cluster_port() if cluster else reserve_port()
         self.tls_port = None
         if tls:
@@ -282,26 +284,37 @@ class ManagedServer:
             aclfile_line = "aclfile %s\n" % acl.as_posix()
         tls_line = ""
         if self.tls:
+            # A replica presents its client certificate when it dials the
+            # master; its own listener is not used by these tests.
+            cert = (self.tls["client_cert"] if self.tls_replication
+                    else self.tls["server_cert"])
+            key = (self.tls["client_key"] if self.tls_replication
+                   else self.tls["server_key"])
             tls_line = (
                 "tls-port %d\ntls-cert-file %s\ntls-key-file %s\n"
                 "tls-ca-cert-file %s\ntls-auth-clients %s\n" % (
-                    self.tls_port, self.tls["server_cert"].as_posix(),
-                    self.tls["server_key"].as_posix(), self.tls["ca"].as_posix(),
-                    self.tls_auth_clients))
+                    self.tls_port, cert.as_posix(), key.as_posix(),
+                    self.tls["ca"].as_posix(), self.tls_auth_clients))
+            if self.tls_replication:
+                tls_line += "tls-replication yes\n"
+        replicaof_line = ""
+        if self.replicaof:
+            replicaof_line = "replicaof %s %d\n" % self.replicaof
         config.write_text(
             "bind 127.0.0.1\nprotected-mode yes\nport %d\n"
             "daemonize no\nsave \"\"\ndir .\ndbfilename dump.rdb\n"
             "logfile server.log\nloglevel notice\n"
             "appendonly %s\nappendfilename appendonly.aof\n"
             "appendfsync always\naof-use-rdb-preamble no\n"
-            "auto-aof-rewrite-percentage 0\n%s%s%s%s" % (
+            "auto-aof-rewrite-percentage 0\n%s%s%s%s%s" % (
                 self.port, "yes" if self.aof else "no",
                 "requirepass %s\n" % self.requirepass if self.requirepass else "",
                 aclfile_line,
                 "cluster-enabled yes\ncluster-config-file nodes.conf\n"
                 "cluster-node-timeout 5000\ncluster-require-full-coverage yes\n"
                 if self.cluster else "",
-                tls_line),
+                tls_line,
+                replicaof_line),
             encoding="ascii",
         )
         self.output = (self.directory / "stdout.log").open("ab", buffering=0)
@@ -393,7 +406,9 @@ class BackportRegression(unittest.TestCase):
                 OPTIONS.server, self.temp.name, OPTIONS.timeout,
                 OPTIONS.startup_timeout, aof="aof" in self._testMethodName,
                 aclfile="aclfile" in self._testMethodName, tls=tls_certs,
-                tls_auth_clients="yes" if "mutual" in self._testMethodName else "no",
+                tls_auth_clients="yes" if ("mutual" in self._testMethodName or
+                                           "replication" in self._testMethodName)
+                                 else "no",
             )
             self.addCleanup(self.server.close)
             self.server.start()
@@ -2712,6 +2727,9 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("ACL", "SETUSER", "bp9file", "on", ">pw",
                                   "~x:*", "+get", "resetchannels",
                                   "&x:*"), b"OK")
+        self.assertEqual(self.cmd("ACL", "SETUSER", "bp27rw", "on", ">pw2",
+                                  "%R~ro:*", "%W~wo:*",
+                                  "+@read", "+@write"), b"OK")
         self.assertEqual(self.cmd("ACL", "SAVE"), b"OK")
 
         text = (self.server.directory / "acl.conf").read_text()
@@ -2719,20 +2737,37 @@ class BackportRegression(unittest.TestCase):
         self.assertIn("~x:*", text)
         self.assertIn("resetchannels &x:*", text)
         self.assertIn("-@all +get", text)
+        self.assertIn("%R~ro:*", text)
+        self.assertIn("%W~wo:*", text)
 
         self.assertEqual(self.cmd("ACL", "DELUSER", "bp9file"), 1)
+        self.assertEqual(self.cmd("ACL", "DELUSER", "bp27rw"), 1)
         self.assertNotIn(b"bp9file", self.cmd("ACL", "USERS"))
         self.assertEqual(self.cmd("ACL", "LOAD"), b"OK")
         self.assertIn(b"bp9file", self.cmd("ACL", "USERS"))
+        self.assertIn(b"bp27rw", self.cmd("ACL", "USERS"))
         info = self.flat_map(self.cmd("ACL", "GETUSER", "bp9file"))
         self.assertEqual(info[b"keys"], [b"~x:*"])
         self.assertEqual(info[b"channels"], [b"&x:*"])
         self.assertIn(b"+get", info[b"commands"])
+        info = self.flat_map(self.cmd("ACL", "GETUSER", "bp27rw"))
+        self.assertEqual(info[b"keys"], [b"%R~ro:*", b"%W~wo:*"])
 
         probe = self.connect()
         self.addCleanup(probe.close)
         self.assertEqual(probe.command("AUTH", "bp9file", "pw"), b"OK")
         self.assertEqual(probe.command("GET", "x:1"), None)
+
+        rw = self.connect()
+        self.addCleanup(rw.close)
+        self.assertEqual(rw.command("AUTH", "bp27rw", "pw2"), b"OK")
+        self.assertEqual(self.cmd("SET", "ro:k", "v"), b"OK")
+        self.assertEqual(rw.command("GET", "ro:k"), b"v")
+        with self.assertRaises(RedisError):
+            rw.command("SET", "ro:k", "v2")
+        self.assertEqual(rw.command("SET", "wo:k", "v"), b"OK")
+        with self.assertRaises(RedisError):
+            rw.command("GET", "wo:k")
 
     def test_client_setinfo_and_list(self):
         if self.server is None:
@@ -2972,6 +3007,75 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(cleared[b"selectors"], [])
         with self.assertRaises(RedisError):
             cli.command("SET", "log:a", "2")
+
+    def test_acl_read_write_key_patterns(self):
+        # %R~ grants reads, %W~ grants writes, ~ grants both. SET is
+        # write-only unless GET is given, so %W is enough for it.
+        self.assertEqual(
+            self.cmd("ACL", "SETUSER", "bprw", "on", ">pw",
+                     "%R~ro:*", "%W~wo:*", "~both:*",
+                     "+@read", "+@write", "+set", "+get", "+del",
+                     "+getdel", "+copy", "+bitop"),
+            b"OK")
+        info = self.flat_map(self.cmd("ACL", "GETUSER", "bprw"))
+        self.assertEqual(info[b"keys"], [b"%R~ro:*", b"%W~wo:*", b"~both:*"])
+        rules = [r for r in self.cmd("ACL", "LIST") if r.startswith(b"user bprw ")]
+        self.assertEqual(len(rules), 1)
+        self.assertIn(b"%R~ro:*", rules[0])
+        self.assertIn(b"%W~wo:*", rules[0])
+
+        cli = self.connect()
+        self.addCleanup(cli.close)
+        self.assertEqual(cli.command("AUTH", "bprw", "pw"), b"OK")
+
+        # Read-only pattern: GET allowed, SET and DEL refused.
+        self.assertEqual(self.cmd("SET", "ro:a", "v"), b"OK")
+        self.assertEqual(cli.command("GET", "ro:a"), b"v")
+        with self.assertRaises(RedisError):
+            cli.command("SET", "ro:a", "v2")
+        with self.assertRaises(RedisError):
+            cli.command("DEL", "ro:a")
+
+        # Write-only pattern: SET and DEL allowed, GET refused.
+        self.assertEqual(cli.command("SET", "wo:a", "v"), b"OK")
+        self.assertEqual(cli.command("DEL", "wo:a"), 1)
+        with self.assertRaises(RedisError):
+            cli.command("GET", "wo:a")
+
+        # Both pattern: either kind of access.
+        self.assertEqual(cli.command("SET", "both:a", "v"), b"OK")
+        self.assertEqual(cli.command("GET", "both:a"), b"v")
+
+        # GETDEL reads and deletes: a write-only pattern is not enough.
+        self.assertEqual(self.cmd("SET", "wo:b", "v"), b"OK")
+        with self.assertRaises(RedisError):
+            cli.command("GETDEL", "wo:b")
+        self.assertEqual(cli.command("SET", "both:b", "v"), b"OK")
+        self.assertEqual(cli.command("GETDEL", "both:b"), b"v")
+
+        # Per-key flags: COPY reads the source and writes the destination.
+        self.assertEqual(cli.command("SET", "both:src", "v"), b"OK")
+        self.assertEqual(cli.command("COPY", "both:src", "both:dst"), 1)
+        self.assertEqual(cli.command("COPY", "both:src", "wo:dst"), 1)
+        with self.assertRaises(RedisError):
+            cli.command("COPY", "both:src", "ro:dst2")
+        self.assertEqual(self.cmd("GET", "both:dst"), b"v")
+
+        # BITOP writes the first key and reads the rest.
+        self.assertEqual(cli.command("BITOP", "AND", "both:bits", "both:src"), 1)
+        with self.assertRaises(RedisError):
+            cli.command("BITOP", "AND", "ro:bits", "ro:a")
+
+        # DRYRUN applies the same key permissions.
+        self.assertEqual(self.cmd("ACL", "DRYRUN", "bprw", "GET", "ro:a"), b"OK")
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "DRYRUN", "bprw", "SET", "ro:a", "v")
+
+        # Invalid specifiers are rejected.
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "SETUSER", "bprw", "%X~a")
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "SETUSER", "bprw", "%~a")
 
     def test_script_flush_options(self):
         sha = self.cmd("SCRIPT", "LOAD", "return 1")
@@ -3668,6 +3772,88 @@ class BackportRegression(unittest.TestCase):
             key = self.key("tls-mtls")
             self.assertEqual(tls.command("SET", key, b"mutual"), b"OK")
             self.assertEqual(tls.command("GET", key), b"mutual")
+
+    def test_tls_replication_master_replica(self):
+        """A replica with tls-replication syncs from the master's TLS port."""
+        if self.server is None or self.server.tls_port is None:
+            self.skipTest("TLS tests require a managed --server instance")
+
+        # A large value forces a multi-record RDB transfer over TLS.
+        big = self.key("tls-repl-big")
+        payload = b"r" * 200000
+        self.assertEqual(self.cmd("SET", big, payload), b"OK")
+        for i in range(50):
+            self.cmd("SET", self.key("tls-repl-%d" % i), i)
+
+        replica_dir = Path(self.temp.name) / "replica"
+        replica_dir.mkdir()
+        replica = ManagedServer(
+            OPTIONS.server, replica_dir, OPTIONS.timeout,
+            OPTIONS.startup_timeout, tls=self.server.tls,
+            tls_replication=True,
+            replicaof=("127.0.0.1", self.server.tls_port))
+        self.addCleanup(replica.close)
+        replica.start()
+
+        status = b""
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            try:
+                with RESP2("127.0.0.1", replica.port, OPTIONS.timeout) as r:
+                    info = r.command("INFO", "replication")
+            except (OSError, EOFError, RedisError):
+                info = b""
+            if b"master_link_status:up" in info:
+                status = info
+                break
+            time.sleep(0.1)
+        self.assertIn(b"master_link_status:up", status, replica.log_excerpt())
+
+        with RESP2("127.0.0.1", replica.port, OPTIONS.timeout) as r:
+            self.assertEqual(r.command("GET", big), payload)
+            self.assertEqual(r.command("GET", self.key("tls-repl-7")), b"7")
+            # Incremental propagation after the initial sync.
+            self.assertEqual(
+                self.cmd("SET", self.key("tls-repl-live"), b"live"), b"OK")
+            deadline = time.time() + 5
+            value = None
+            while time.time() < deadline:
+                value = r.command("GET", self.key("tls-repl-live"))
+                if value == b"live":
+                    break
+                time.sleep(0.05)
+            self.assertEqual(value, b"live")
+
+            # Break the link once the replica has a cached master: the
+            # reconnection has to be served by a +CONTINUE reply, which also
+            # has to travel through the TLS session.
+            before = self._sync_partial_ok()
+            self.cmd("CLIENT", "KILL", "TYPE", "replica")
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if self._sync_partial_ok() > before:
+                    break
+                time.sleep(0.1)
+            self.assertGreater(self._sync_partial_ok(), before,
+                               replica.log_excerpt())
+
+            self.assertEqual(
+                self.cmd("SET", self.key("tls-repl-after"), b"after"), b"OK")
+            deadline = time.time() + 10
+            value = None
+            while time.time() < deadline:
+                value = r.command("GET", self.key("tls-repl-after"))
+                if value == b"after":
+                    break
+                time.sleep(0.05)
+            self.assertEqual(value, b"after")
+
+    def _sync_partial_ok(self):
+        info = self.cmd("INFO", "stats")
+        for line in info.splitlines():
+            if line.startswith(b"sync_partial_ok:"):
+                return int(line.split(b":", 1)[1])
+        return 0
 
 
 def parse_args(argv):
