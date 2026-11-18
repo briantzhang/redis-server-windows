@@ -68,6 +68,34 @@ size_t getStringObjectSdsUsedMemory(robj *o) {
     }
 }
 
+/* String length held by an argument object. Like the upstream client memory
+ * buckets we deliberately ignore allocator overhead here: it stays cheap to
+ * maintain while command arguments are being parsed. */
+static size_t getStringObjectLen(robj *o) {
+    serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
+    switch(o->encoding) {
+    case OBJ_ENCODING_RAW:
+    case OBJ_ENCODING_EMBSTR: return sdslen(o->ptr);
+    default: return 0; /* Just integer encoding for now. */
+    }
+}
+
+/* Return the allocator bytes owned by the query buffer object itself. Large
+ * RESP arguments can be moved into argv without copying; callers that also
+ * charge mid_querybuf_alloc must avoid treating these as distinct payloads. */
+static size_t getQueryBufferMemory(client *c) {
+    return c->querybuf ? sdsZmallocSize(c->querybuf) : 0;
+}
+
+/* Refresh the argv bucket after arguments are parsed or rewritten. */
+static void updateClientArgvMemory(client *c) {
+    int j;
+    c->mid_argv = c->argv ? zmalloc_size(c->argv) : 0;
+    for (j = 0; j < c->argc; j++) {
+        c->mid_argv += getStringObjectLen(c->argv[j]);
+    }
+}
+
 /* Client.reply list dup and free methods. */
 void *dupClientReplyValue(void *o) {
     clientReplyBlock *old = o;
@@ -128,6 +156,8 @@ client *createClient(int fd) {
     c->querybuf = sdsempty();
     c->pending_querybuf = sdsempty();
     c->querybuf_peak = 0;
+    c->mid_querybuf_alloc = 0; /* Query buffer bytes owned by argv. */
+    c->mid_argv = 0;        /* Parsed argument vector bytes. */
     c->reqtype = 0;
     c->resp = 2;
     c->argc = 0;
@@ -1571,6 +1601,8 @@ int processInlineBuffer(client *c) {
         c->argc++;
     }
     zfree(argv);
+    updateClientArgvMemory(c);
+    c->mid_querybuf_alloc = getQueryBufferMemory(c);
     return C_OK;
 }
 
@@ -1661,10 +1693,14 @@ int processMultibulkBuffer(client *c) {
         /* Setup argv array on client structure */
         if (c->argv) zfree(c->argv);
         c->argv = zmalloc(sizeof(robj*)*c->multibulklen);
+        c->argc = 0;
+        c->mid_argv = 0;
+        updateClientArgvMemory(c);
     }
 
     serverAssertWithInfo(c,NULL,c->multibulklen > 0);
     while(c->multibulklen) {
+        size_t borrowed_size = 0;
         /* Read bulk length if unknown */
         if (c->bulklen == -1) {
             newline = strchr(c->querybuf+c->qb_pos,'\r');
@@ -1735,6 +1771,7 @@ int processMultibulkBuffer(client *c) {
                 c->bulklen >= PROTO_MBULK_BIG_ARG &&
                 sdslen(c->querybuf) == (size_t)(c->bulklen+2))
             {
+                borrowed_size = getQueryBufferMemory(c);
                 c->argv[c->argc++] = createObject(OBJ_STRING,c->querybuf);
                 sdsIncrLen(c->querybuf,-2); /* remove CRLF */
                 /* Assume that if we saw a fat argument we'll see another one
@@ -1746,6 +1783,8 @@ int processMultibulkBuffer(client *c) {
                     createStringObject(c->querybuf+c->qb_pos,c->bulklen);
                 c->qb_pos += c->bulklen+2;
             }
+            updateClientArgvMemory(c);
+            c->mid_querybuf_alloc = borrowed_size;
             c->bulklen = -1;
             c->multibulklen--;
         }
@@ -2077,7 +2116,7 @@ sds catClientInfoString(sds s, client *client) {
     if (emask & AE_WRITABLE) *p++ = 'w';
     *p = '\0';
     return sdscatfmt(s,
-        "id=%U addr=%s laddr=%s fd=%i name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i ssub=%i multi=%i qbuf=%U qbuf-free=%U obl=%U oll=%U omem=%U events=%s cmd=%s user=%s lib-name=%s lib-ver=%s tot-net-in=%U tot-net-out=%U",
+        "id=%U addr=%s laddr=%s fd=%i name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i ssub=%i multi=%i qbuf=%U qbuf-free=%U qbuf-mem=%U argv-mem=%U obl=%U oll=%U omem=%U tot-mem=%U events=%s cmd=%s user=%s lib-name=%s lib-ver=%s tot-net-in=%U tot-net-out=%U",
         (PORT_ULONGLONG) client->id,
         getClientPeerId(client),
         laddr,
@@ -2093,9 +2132,12 @@ sds catClientInfoString(sds s, client *client) {
         (client->flags & CLIENT_MULTI) ? client->mstate.count : -1,
         (PORT_ULONGLONG) sdslen(client->querybuf),
         (PORT_ULONGLONG) sdsavail(client->querybuf),
+        (PORT_ULONGLONG) getQueryBufferMemory(client) + client->mid_querybuf_alloc,
+        (PORT_ULONGLONG) client->mid_argv,
         (PORT_ULONGLONG) client->bufpos,
         (PORT_ULONGLONG) listLength(client->reply),
         (PORT_ULONGLONG) getClientOutputBufferMemoryUsage(client),
+        (PORT_ULONGLONG) getClientMemoryUsage(client),
         events,
         client->lastcmd ? client->lastcmd->name : "NULL",
         client->user ? ACLUserName(client->user) : "",
@@ -2865,6 +2907,7 @@ void rewriteClientCommandVector(client *c, int argc, ...) {
     /* Replace argv and argc with our new versions. */
     c->argv = argv;
     c->argc = argc;
+    updateClientArgvMemory(c);
     c->cmd = lookupCommandOrOriginal(c->argv[0]->ptr);
     serverAssertWithInfo(c,NULL,c->cmd != NULL);
     va_end(ap);
@@ -2876,6 +2919,7 @@ void replaceClientCommandVector(client *c, int argc, robj **argv) {
     zfree(c->argv);
     c->argv = argv;
     c->argc = argc;
+    updateClientArgvMemory(c);
     c->cmd = lookupCommandOrOriginal(c->argv[0]->ptr);
     serverAssertWithInfo(c,NULL,c->cmd != NULL);
 }
@@ -2900,7 +2944,9 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
         c->argv[i] = NULL;
     }
     oldval = c->argv[i];
+    if (oldval) c->mid_argv -= getStringObjectLen(oldval);
     c->argv[i] = newval;
+    c->mid_argv += getStringObjectLen(newval);
     incrRefCount(newval);
     if (oldval) decrRefCount(oldval);
 
@@ -2922,13 +2968,22 @@ PORT_ULONG getClientOutputBufferMemoryUsage(client *c) {
     return c->reply_bytes + (list_item_size*listLength(c->reply));
 }
 
-/* Memory held for one client: the pending reply, the query being read and
- * the parsed argument vector. Replicas, masters and monitors are accounted
- * elsewhere and are never candidates for client eviction. */
+/* Memory held for one client, split into buckets that are cheap to maintain
+ * while commands are parsed. Replicas, masters and monitors are accounted
+ * elsewhere and are never candidates for client eviction.
+ *
+ * The query buffer and the parsed argv share their backing storage for large
+ * RESP arguments: processMultibulkBuffer() hands that SDS to argv and replaces
+ * querybuf with an empty buffer. We cache the borrowed allocation in
+ * mid_querybuf_alloc, so the full input peak is visible while the command is
+ * being handled. argv bytes are refreshed at parse time. */
 PORT_ULONG getClientMemoryUsage(client *c) {
     PORT_ULONG usage = getClientOutputBufferMemoryUsage(c);
-    if (c->querybuf) usage += sdsAllocSize(c->querybuf);
-    usage += (PORT_ULONG)(c->argc * sizeof(robj *));
+    usage += (PORT_ULONG)sizeof(c->buf);
+    usage += (PORT_ULONG)c->mid_querybuf_alloc;
+    usage += (PORT_ULONG)c->mid_argv;
+    usage += (PORT_ULONG)getQueryBufferMemory(c);
+    usage += (PORT_ULONG)zmalloc_size(c);
     return usage;
 }
 

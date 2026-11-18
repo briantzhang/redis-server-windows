@@ -811,6 +811,9 @@ typedef struct client {
                                replication stream that we are receiving from
                                the master. */
     size_t querybuf_peak;   /* Recent (100ms or more) peak of querybuf size. */
+    size_t mid_querybuf_alloc; /* Allocated querybuf bytes when a command was
+                                  last parsed, without its argv objects. */
+    size_t mid_argv;        /* Allocator bytes held by the current argv. */
     int argc;               /* Num of arguments of current command. */
     robj **argv;            /* Arguments of current command. */
     struct redisCommand *cmd, *lastcmd;  /* Last command executed. */

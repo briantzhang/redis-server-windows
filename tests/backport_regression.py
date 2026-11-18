@@ -2186,6 +2186,58 @@ class BackportRegression(unittest.TestCase):
         self.assertNotIn(b"evicted_clients:0", info)
         admin.command("CONFIG", "SET", "maxmemory-clients", "0")
 
+    def test_client_query_and_argv_memory_buckets(self):
+        if self.server is None:
+            self.skipTest("client memory tests require --server")
+        with self.connect() as probe:
+            info = probe.command("CLIENT", "INFO")
+        for field in (b"qbuf-mem=", b"argv-mem=", b"tot-mem="):
+            self.assertIn(field, info)
+
+        # Pause execution so the large SET command stays parsed in argv and
+        # its borrowed query-buffer allocation remains visible in the buckets.
+        self.assertEqual(self.cmd("CLIENT", "PAUSE", "1000", "ALL"), b"OK")
+        self.addCleanup(self.cmd, "CLIENT", "UNPAUSE")
+        victim = self.connect()
+        self.addCleanup(victim.close)
+        victim.sock.sendall(RESP2.encode((
+            "SET", self.key("client:argv:mem"), b"y" * 200000)))
+        time.sleep(0.05)
+        info = self.cmd("CLIENT", "LIST")
+        victim_line = None
+        for line in info.splitlines():
+            if b"flags=u" in line:
+                victim_line = line
+                break
+        self.assertIsNotNone(victim_line, info)
+        fields = dict(part.split(b"=", 1) for part in victim_line.split()
+                      if b"=" in part)
+        self.assertGreaterEqual(int(fields[b"qbuf-mem"]), 200000)
+        self.assertGreaterEqual(int(fields[b"tot-mem"]), 200000)
+        self.cmd("CLIENT", "UNPAUSE")
+        self.assertEqual(victim._read(), b"OK")
+
+        # argv is accounted for a client paused after parsing but before
+        # execution; BLPOP is used because PAUSE ALL skips parsing entirely.
+        key = self.key("client:argv:mem:list")
+        blocked = self.connect()
+        self.addCleanup(blocked.close)
+        blocked.sock.sendall(RESP2.encode(("BLPOP", key, "5")))
+        time.sleep(0.05)
+        info = self.cmd("CLIENT", "LIST")
+        blocked_line = None
+        for line in info.splitlines():
+            if b"cmd=blpop" in line.lower():
+                blocked_line = line
+                break
+        self.assertIsNotNone(blocked_line, info)
+        fields = dict(part.split(b"=", 1) for part in blocked_line.split()
+                      if b"=" in part)
+        self.assertGreater(int(fields[b"argv-mem"]), 0)
+        self.assertGreaterEqual(int(fields[b"tot-mem"]), 20000)
+        self.assertEqual(self.cmd("LPUSH", key, "v"), 1)
+        self.assertEqual(blocked._read(), [key, b"v"])
+
     def test_stream_xtrim_minid_and_limit(self):
         key = self.key("xtrim:minid")
         for ms in range(1, 7):
