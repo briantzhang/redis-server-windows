@@ -1440,6 +1440,46 @@ static int configSetOne(client *c, robj *nameobj, robj *o) {
             addReplyError(c,tlsLastConfigError());
             return C_ERR;
         }
+    } config_set_special_field("tls-cert-file") {
+        char *old = server.tls_cert_file;
+        server.tls_cert_file = zstrdup(o->ptr);
+        if (tlsApplyConfig() != C_OK) {
+            zfree(server.tls_cert_file);
+            server.tls_cert_file = old;
+            addReplyError(c,tlsLastConfigError());
+            return C_ERR;
+        }
+        zfree(old);
+    } config_set_special_field("tls-key-file") {
+        char *old = server.tls_key_file;
+        server.tls_key_file = zstrdup(o->ptr);
+        if (tlsApplyConfig() != C_OK) {
+            zfree(server.tls_key_file);
+            server.tls_key_file = old;
+            addReplyError(c,tlsLastConfigError());
+            return C_ERR;
+        }
+        zfree(old);
+    } config_set_special_field("tls-ca-cert-file") {
+        char *old = server.tls_ca_cert_file;
+        server.tls_ca_cert_file = zstrdup(o->ptr);
+        if (tlsApplyConfig() != C_OK) {
+            zfree(server.tls_ca_cert_file);
+            server.tls_ca_cert_file = old;
+            addReplyError(c,tlsLastConfigError());
+            return C_ERR;
+        }
+        zfree(old);
+    } config_set_special_field("tls-ca-cert-dir") {
+        char *old = server.tls_ca_cert_dir;
+        server.tls_ca_cert_dir = zstrdup(o->ptr);
+        if (tlsApplyConfig() != C_OK) {
+            zfree(server.tls_ca_cert_dir);
+            server.tls_ca_cert_dir = old;
+            addReplyError(c,tlsLastConfigError());
+            return C_ERR;
+        }
+        zfree(old);
 
     /* Boolean fields.
      * config_set_bool_field(name,var). */

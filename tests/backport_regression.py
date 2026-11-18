@@ -5508,6 +5508,46 @@ class BackportRegression(unittest.TestCase):
         with self.tls_connect(client_cert=True) as tls:
             self.assertEqual(tls.command("GET", key), b"anonymous")
 
+    def test_tls_certificate_options_reload(self):
+        """CONFIG SET reloads certificate, key and CA files for new sessions."""
+        if self.server is None or self.server.tls_port is None:
+            self.skipTest("TLS tests require a managed --server instance")
+        tls = self.server.tls
+        names = ("tls-cert-file", "tls-key-file", "tls-ca-cert-file",
+                 "tls-ca-cert-dir")
+
+        def config_map():
+            values = self.cmd("CONFIG", "GET", *names)
+            return dict(zip(values[::2], values[1::2]))
+
+        self.assertEqual(config_map()[b"tls-cert-file"].replace(b"\\", b"/"),
+                         str(tls["server_cert"]).replace("\\", "/").encode())
+        # Existing sessions keep using the old SSL_CTX; new ones use the
+        # freshly built context after every successful CONFIG SET.
+        with self.tls_connect() as live:
+            self.assertEqual(live.command("PING"), b"PONG")
+            self.assertEqual(
+                self.cmd("CONFIG", "SET", "tls-cert-file",
+                         str(tls["server_cert"])), b"OK")
+            self.assertEqual(live.command("PING"), b"PONG")
+            with self.tls_connect() as fresh:
+                self.assertEqual(fresh.command("PING"), b"PONG")
+
+        # A missing file is rejected and the previous path is restored.
+        missing = self.server.directory / "missing-server.crt"
+        with self.assertRaises(RedisError):
+            self.cmd("CONFIG", "SET", "tls-cert-file", str(missing))
+        self.assertEqual(config_map()[b"tls-cert-file"].replace(b"\\", b"/"),
+                         str(tls["server_cert"]).replace("\\", "/").encode())
+
+        # A missing CA file is likewise rejected without leaving a bad path.
+        with self.assertRaises(RedisError):
+            self.cmd("CONFIG", "SET", "tls-ca-cert-file", str(missing))
+        self.assertEqual(config_map()[b"tls-ca-cert-file"].replace(b"\\", b"/"),
+                         str(tls["ca"]).replace("\\", "/").encode())
+        with self.tls_connect(client_cert=True) as tls_client:
+            self.assertEqual(tls_client.command("PING"), b"PONG")
+
     def test_tls_protocol_and_cipher_options(self):
         """TLS protocol, cipher and session options apply at runtime."""
         if self.server is None or self.server.tls_port is None:
