@@ -1,6 +1,6 @@
 # 运维手册
 
-适用版本：Redis for Windows `5.0.14.1-bp45`，仅 Windows x64，支持单机和集群模式。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
+适用版本：Redis for Windows `5.0.14.1-bp46`，仅 Windows x64，支持单机和集群模式。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
 
 本文只覆盖这一个可执行文件的日常操作。AOF 采用 Redis 7 的多段布局：`appenddirname` 目录里放 manifest、一个 base 文件和一个增量文件，旧单文件 AOF 会在首次重写时自动迁移。TLS 覆盖客户端监听、主从复制和集群总线，见第 4c、4d、4e 节；主动切换主库见第 4f 节。集群模式沿用底座实现，见第 4b 节。ACL 已按 Redis 6 的范围实现，见第 3 节。
 
@@ -39,7 +39,7 @@
 .\redis-server.exe --version
 ```
 
-应看到 `v=5.0.14.1-bp45`。如果不是这个版本号，说明运行的不是这份回移。
+应看到 `v=5.0.14.1-bp46`。如果不是这个版本号，说明运行的不是这份回移。
 
 另开一个窗口检查存活：
 
@@ -569,7 +569,7 @@ BGREWRITEAOF
 
 AOF 启动失败：
 
-- 保留现场后，用底座自带的方式检查：`redis-check-aof --fix <文件>` 会截掉文件末尾不完整的最后一条命令。多段 AOF 下要对出错的那个 `.incr.aof`（或 `.base.aof`）单独执行，manifest 本身不需要检查；先备份整个 `appendonlydir` 再操作。
+- 保留现场后先整体备份 `appendonlydir`。本版 `redis-check-aof` 可直接检查多段目录：`redis-check-aof appendonlydir` 按 manifest 顺序检查 base 与增量文件；`redis-check-aof --fix appendonlydir` 只截断最后一个增量文件末尾不完整的命令。也可以对出错的单个 `.incr.aof`/`.base.aof` 执行并单独修复。
 - 本版已修复一处 AOF 写入崩溃：带过期参数的 `SET`（如 `SET k v PX 180000`）在旧二进制上会触发访问冲突。确认 `redis-server --version` 是 `5.0.14.1-bp1` 或之后的版本，且构建提交为 `71377016` 之后的版本。
 
 内存涨个不停：

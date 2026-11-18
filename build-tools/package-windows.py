@@ -8,7 +8,7 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '5.0.14.1-bp45'
+VERSION = '5.0.14.1-bp46'
 NAME = 'Redis-x64-' + VERSION
 DIST = ROOT / 'dist'
 PKG = DIST / NAME
@@ -106,10 +106,11 @@ if not exist data mkdir data
 "%~dp0redis-server.exe" "%~dp0redis.windows.conf" --dir "%~dp0data"
 popd
 ''', encoding='ascii', newline='\r\n')
-    (PKG/'README.md').write_text('''# Redis Windows 5.0.14.1-bp45
+    (PKG/'README.md').write_text('''# Redis Windows 5.0.14.1-bp46
 
 Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；关闭窗口或 Ctrl+C 停止。
-默认监听 127.0.0.1:6379，AOF 每秒同步，数据保存在同目录 data/。
+默认监听 127.0.0.1:6379，AOF 每秒同步，多段文件保存在 data/appendonlydir/；
+异常停机后可用 redis-check-aof.exe data/appendonlydir 检查，--fix 修复坏尾。
 确认没有其他 Redis 占用 6379；如需调整端口，编辑 redis.windows.conf。
 这是自维护命令回移版，不是官方 Redis 6/7/8。具体命令、限制及来源见 BACKPORT-RELEASE.md。
 

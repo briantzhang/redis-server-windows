@@ -43,6 +43,8 @@
 #define strncasecmp _strnicmp
 #endif
 
+#define AOF_CHECK_LINE_MAX 1024
+
 #define ERROR(...) { \
     char __buf[1024]; \
     snprintf(__buf, sizeof(__buf), __VA_ARGS__); \
@@ -51,8 +53,79 @@
 
 static char error[1044];
 static off_t epos;
+static int check_errors;
+static int check_fixed;
 
-int consumeNewline(char *buf) {
+/* When running as a standalone tool, server.aof_* still holds the compiled-in
+ * defaults. initServerConfig() allocates those strings and the shared objects
+ * needed by the RDB preamble checker without starting an event loop. */
+static void initCheckConfig(void) {
+    initServerConfig();
+    if (shared.integers[0] == NULL) createSharedObjects();
+    server.loading_process_events_interval_bytes = 0;
+}
+
+/* Directory arguments are treated as a multi-part AOF: read the manifest and
+ * check every referenced file in order. Manifest parsing here is deliberately
+ * independent of the server's in-memory manifest, so a broken manifest is
+ * reported as a check error instead of being silently repaired. */
+static int readManifest(const char *dir, const char *name, list *files) {
+    sds manifest_path = sdscatprintf(sdsempty(),"%s/%s.manifest",dir,name);
+    char line[AOF_CHECK_LINE_MAX];
+    FILE *fp = fopen(manifest_path,"r");
+    int seen_incr = 0, retval = C_ERR;
+    size_t prefix = strlen(name);
+
+    if (fp == NULL) {
+        printf("Cannot open AOF manifest: %s\n", manifest_path);
+        goto cleanup;
+    }
+    while (fgets(line,sizeof(line),fp) != NULL) {
+        char file[AOF_CHECK_LINE_MAX];
+        PORT_LONGLONG seq;
+        char type;
+        char *p = line, *end;
+        sds path;
+
+        while (*p == ' ' || *p == '\t') p++;
+        end = p + strlen(p);
+        while (end > p && (end[-1] == '\n' || end[-1] == '\r' ||
+                           end[-1] == ' ' || end[-1] == '\t')) end--;
+        *end = '\0';
+        if (*p == '\0' || *p == '#') continue;
+        if (sscanf(p,"file %1023s seq %lld type %c",file,&seq,&type) != 3 ||
+            seq <= 0 || strncmp(file,name,prefix) != 0 || file[prefix] != '.' ||
+            strchr(file,'/') != NULL || strchr(file,'\\') != NULL ||
+            (type != 'b' && type != 'i'))
+        {
+            printf("Invalid line in AOF manifest %s: %s\n", manifest_path, p);
+            goto cleanup;
+        }
+        if (type == 'b' && listLength(files) != 0) {
+            printf("AOF manifest %s lists a base file out of order\n", manifest_path);
+            goto cleanup;
+        }
+        if (type == 'i') seen_incr = 1;
+        path = sdscatprintf(sdsempty(),"%s/%s",dir,file);
+        listAddNodeTail(files,path);
+    }
+    if (!seen_incr) {
+        printf("AOF manifest %s lists no incremental file\n", manifest_path);
+        goto cleanup;
+    }
+    retval = C_OK;
+cleanup:
+    sdsfree(manifest_path);
+    if (fp) fclose(fp);
+    return retval;
+}
+
+static void freePathList(list *files) {
+    listSetFreeMethod(files,sdsfree);
+    listRelease(files);
+}
+
+static int consumeNewline(char *buf) {
     if (strncmp(buf,"\r\n",2) != 0) {
         ERROR("Expected \\r\\n, got: %02x%02x",buf[0],buf[1]);
         return 0;
@@ -153,33 +226,9 @@ off_t process(FILE *fp) {
     return pos;
 }
 
-int redis_check_aof_main(int argc, char **argv) {
-    char *filename;
-    int fix = 0;
-#ifdef _WIN32
-    _fmode = _O_BINARY;
-    setmode(_fileno(stdin), _O_BINARY);
-    setmode(_fileno(stdout), _O_BINARY);
-    setmode(_fileno(stderr), _O_BINARY);
-#endif
-
-    if (argc < 2) {
-        printf("Usage: %s [--fix] <file.aof>\n", argv[0]);
-        exit(1);
-    } else if (argc == 2) {
-        filename = argv[1];
-    } else if (argc == 3) {
-        if (strcmp(argv[1],"--fix") != 0) {
-            printf("Invalid argument: %s\n", argv[1]);
-            exit(1);
-        }
-        filename = argv[2];
-        fix = 1;
-    } else {
-        printf("Invalid arguments\n");
-        exit(1);
-    }
-
+static void checkSingleFile(const char *filename, int fix) {
+    char *check_argv[2] = { (char*)filename, NULL };
+    int check_argc = 2;
     FILE *fp = fopen(filename, IF_WIN32("r+b", "r+"));
     if (fp == NULL) {
         printf("Cannot open file: %s\n", filename);
@@ -208,7 +257,7 @@ int redis_check_aof_main(int argc, char **argv) {
         if (has_preamble) {
             printf("The AOF appears to start with an RDB preamble.\n"
                    "Checking the RDB preamble to start:\n");
-            if (redis_check_rdb_main(argc,argv,fp) == C_ERR) {
+            if (redis_check_rdb_main(check_argc,check_argv,fp) == C_ERR) {
                 printf("RDB preamble of AOF file is not sane, aborting.\n");
                 exit(1);
             } else {
@@ -233,19 +282,94 @@ int redis_check_aof_main(int argc, char **argv) {
             }
             if (ftruncate(fileno(fp), pos) == -1) {
                 printf("Failed to truncate AOF\n");
-                exit(1);
+                check_errors++;
             } else {
                 printf("Successfully truncated AOF\n");
+                check_fixed++;
             }
         } else {
             printf("AOF is not valid. "
                    "Use the --fix option to try fixing it.\n");
-            exit(1);
+            check_errors++;
         }
-    } else {
-        printf("AOF is valid\n");
+    } else if (strlen(error) > 0) {
+        check_errors++;
     }
 
     fclose(fp);
+}
+
+int redis_check_aof_main(int argc, char **argv) {
+    char *filename;
+    int fix = 0, is_dir = 0;
+#ifdef _WIN32
+    _fmode = _O_BINARY;
+    setmode(_fileno(stdin), _O_BINARY);
+    setmode(_fileno(stdout), _O_BINARY);
+    setmode(_fileno(stderr), _O_BINARY);
+#endif
+
+    if (argc < 2) {
+        printf("Usage: %s [--fix] <file.aof|directory>\n", argv[0]);
+        exit(1);
+    } else if (argc == 2) {
+        filename = argv[1];
+    } else if (argc == 3) {
+        if (strcmp(argv[1],"--fix") != 0) {
+            printf("Invalid argument: %s\n", argv[1]);
+            exit(1);
+        }
+        filename = argv[2];
+        fix = 1;
+    } else {
+        printf("Invalid arguments\n");
+        exit(1);
+    }
+
+    initCheckConfig();
+
+    {
+        struct redis_stat sb;
+        if (redis_stat(filename,&sb) != 0) {
+            printf("Cannot open file: %s\n", filename);
+            exit(1);
+        }
+#ifndef _WIN32
+        is_dir = S_ISDIR(sb.st_mode);
+#else
+        is_dir = (sb.st_mode & _S_IFMT) == _S_IFDIR;
+#endif
+    }
+
+    if (is_dir) {
+        list *files = listCreate();
+        listNode *ln;
+        listIter li;
+        int i = 0;
+
+        if (readManifest(filename,server.aof_filename,files) != C_OK) {
+            freePathList(files);
+            exit(1);
+        }
+        listRewind(files,&li);
+        while ((ln = listNext(&li)) != NULL) {
+            sds path = listNodeValue(ln);
+            printf("Checking AOF part %d: %s\n", ++i, path);
+            error[0] = '\0';
+
+            /* checkSingleFile() needs the same argv[1] as a single-file run for
+             * the RDB preamble checker. Temporarily point it at this part. */
+            argv[1] = path;
+            checkSingleFile(path, fix && i == listLength(files));
+        }
+        freePathList(files);
+        printf("AOF parts checked: %d, errors: %d, fixed: %d\n",
+            i, check_errors, check_fixed);
+    } else {
+        checkSingleFile(filename, fix);
+    }
+
+    if (check_errors > 0) exit(1);
+    printf("AOF is valid\n");
     exit(0);
 }

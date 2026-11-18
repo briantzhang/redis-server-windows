@@ -2148,6 +2148,9 @@ void sentinelTimer(void);
 char *sentinelHandleConfiguration(char **argv, int argc);
 void sentinelIsRunning(void);
 
+void initServerConfig(void);
+void createSharedObjects(void);
+
 /* redis-check-rdb & aof */
 int redis_check_rdb(char *rdbfilename, FILE *fp);
 int redis_check_rdb_main(int argc, char **argv, FILE *fp);

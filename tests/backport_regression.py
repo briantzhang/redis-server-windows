@@ -1455,6 +1455,78 @@ class BackportRegression(unittest.TestCase):
         self.restart()
         self.assertEqual(self.cmd("GET", key), b"legacy-value")
 
+    def check_aof_tool(self, *args, cwd=None, stdin=b""):
+        """Run the redis-check-aof binary next to the managed server."""
+        if self.server is None:
+            self.skipTest("redis-check-aof tests require --server")
+        tool = Path(self.server.executable).with_name("redis-check-aof.exe")
+        result = subprocess.run(
+            [str(tool)] + [str(arg) for arg in args],
+            cwd=str(cwd or self.server.directory), input=stdin,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+        return result.returncode, result.stdout.decode("utf-8", "replace")
+
+    def test_aof_check_multipart(self):
+        """redis-check-aof reads appendonlydir through its manifest, checks
+        each part and can truncate a corrupt tail on the last incremental."""
+        if self.server is None:
+            self.skipTest("redis-check-aof tests require --server")
+        key, later = self.key("check:key"), self.key("check:later")
+        aof_dir = self.server.directory / "appendonlydir"
+        self.assertEqual(self.cmd("SET", key, b"first"), b"OK")
+        self.assertEqual(self.cmd("BGREWRITEAOF"),
+                         b"Background append only file rewriting started")
+        self.wait_info_field("persistence", "aof_rewrite_in_progress", "0")
+        self.assertEqual(self.cmd("SET", later, b"second"), b"OK")
+        self.client.close()
+        self.server.stop()
+
+        code, output = self.check_aof_tool(aof_dir)
+        self.assertEqual(code, 0, output)
+        self.assertIn("AOF parts checked: 2", output)
+        self.assertIn("AOF is valid", output)
+
+        incr = aof_dir / "appendonly.aof.2.incr.aof"
+        size = incr.stat().st_size
+        with incr.open("ab") as handle:
+            handle.write(b"*3\r\n$3\r\nSET\r\n$5\r\ntrunc")
+        code, output = self.check_aof_tool(aof_dir)
+        self.assertNotEqual(code, 0)
+        self.assertIn("not valid", output)
+        self.assertEqual(incr.stat().st_size, size + len(b"*3\r\n$3\r\nSET\r\n$5\r\ntrunc"))
+
+        code, output = self.check_aof_tool("--fix", aof_dir, stdin=b"y\n")
+        self.assertEqual(code, 0, output)
+        self.assertIn("Successfully truncated AOF", output)
+        self.assertEqual(incr.stat().st_size, size)
+
+        self.server.start()
+        self.client = self.connect()
+        self.addCleanup(self.client.close)
+        self.assertEqual(self.cmd("MGET", key, later), [b"first", b"second"])
+
+    def test_aof_check_bad_manifest(self):
+        """A manifest with no incremental file is rejected instead of being
+        silently repaired or ignored by the checker."""
+        if self.server is None:
+            self.skipTest("redis-check-aof tests require --server")
+        aof_dir = self.server.directory / "appendonlydir"
+        self.assertEqual(self.cmd("SET", self.key("check:bad"), b"v"), b"OK")
+        manifest = aof_dir / "appendonly.aof.manifest"
+        original = manifest.read_text()
+        self.client.close()
+        self.server.stop()
+        manifest.write_text("file appendonly.aof.1.base.aof seq 1 type b\n")
+        code, output = self.check_aof_tool(aof_dir)
+        self.assertNotEqual(code, 0)
+        self.assertIn("no incremental file", output)
+        manifest.write_text(original)
+        code, output = self.check_aof_tool(aof_dir)
+        self.assertEqual(code, 0, output)
+        self.server.start()
+        self.client = self.connect()
+        self.addCleanup(self.client.close)
+
     def test_aof_multipart_truncated_tail(self):
         """A truncated command in the current incremental file is trimmed on
         load without losing the commands before it."""

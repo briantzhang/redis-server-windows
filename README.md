@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp45
+# Redis for Windows 5.0.14.1-bp46
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp45`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp46`。
 
 ## 这个版本新增了什么
 
@@ -127,7 +127,7 @@ TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM �
 - 新版 RDB 格式（沿用 Redis 5 的 RDB 版本，多段 AOF 的 base 文件可选 RDB 前导）
 - Redis 8 的查询引擎
 
-持久化使用多段 AOF（`appendonlydir`、manifest、base 与增量文件）和原有的 RDB 格式。`redis-check-aof` 仍只接受单个 AOF 文件，不接受目录或 manifest，需要检查时对具体的 `.incr.aof`/`.base.aof` 执行。`appenddirname` 与 `appendfilename` 一样只能在启动配置里设置，`CONFIG GET` 可读、`CONFIG REWRITE` 会写回，但不支持 `CONFIG SET`。流的 RDB 格式没有升级，`entries-added` 与 `max-deleted-entry-id` 不写入 RDB 快照：重启后前者按当前长度恢复、后者归零；AOF（含重写）会保留这两个计数。带 TTL 的写入在 AOF 里记成普通 `SET` 加一条绝对时间的 `PEXPIREAT`，重放时不会把相对过期时间再算一遍。
+持久化使用多段 AOF（`appendonlydir`、manifest、base 与增量文件）和原有的 RDB 格式。`redis-check-aof` 既能检查单个 AOF 文件，也能接受 `appendonlydir` 目录：按 manifest 顺序检查每个 base/增量文件，`--fix` 只截断最后一个增量文件的坏尾。仍然可以对具体的 `.incr.aof`/`.base.aof` 单独执行。`appenddirname` 与 `appendfilename` 一样只能在启动配置里设置，`CONFIG GET` 可读、`CONFIG REWRITE` 会写回，但不支持 `CONFIG SET`。流的 RDB 格式没有升级，`entries-added` 与 `max-deleted-entry-id` 不写入 RDB 快照：重启后前者按当前长度恢复、后者归零；AOF（含重写）会保留这两个计数。带 TTL 的写入在 AOF 里记成普通 `SET` 加一条绝对时间的 `PEXPIREAT`，重放时不会把相对过期时间再算一遍。
 
 ## 构建
 
@@ -143,7 +143,7 @@ TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM �
 
 ## 验证
 
-在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，110 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
+在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，115 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
 
 ```bash
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
