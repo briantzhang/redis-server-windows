@@ -4512,7 +4512,7 @@ static void clusterReplyShards(client *c) {
                 !(node->slaves[i]->flags & CLUSTER_NODE_NOANNOUNCE))
                 healthy_slaves++;
 
-        addReplyMapLen(c,2);
+        addReplyMapLen(c,3);
         addReplyBulkCString(c,"slots");
         {
             /* A node with sparse slots needs one start/end pair per range. */
@@ -4536,6 +4536,8 @@ static void clusterReplyShards(client *c) {
                 }
             }
         }
+        addReplyBulkCString(c,"shard-id");
+        addReplyBulkCBuffer(c,node->name,CLUSTER_NAMELEN);
         addReplyBulkCString(c,"nodes");
         addReplyArrayLen(c,1+healthy_slaves);
         clusterReplyShardNode(c,node);
@@ -4683,6 +4685,97 @@ void clusterReplyMultiBulkSlots(client *c) {
     setDeferredMultiBulkLength(c, slot_replylen, num_masters);
 }
 
+/* CLUSTER MIGRATION reports the local view of slots currently moving in or
+ * out of this node. Importing slots are keyed by their source node id and
+ * migrating slots by the destination node id, matching SETSLOT. */
+static void clusterReplyMigration(client *c) {
+    int count = 0, j;
+    void *replylen = addDeferredMultiBulkLength(c);
+
+    for (j = 0; j < CLUSTER_SLOTS; j++) {
+        clusterNode *peer = NULL;
+        const char *state = NULL;
+        if (server.cluster->importing_slots_from[j]) {
+            peer = server.cluster->importing_slots_from[j];
+            state = "importing";
+        } else if (server.cluster->migrating_slots_to[j]) {
+            peer = server.cluster->migrating_slots_to[j];
+            state = "migrating";
+        } else {
+            continue;
+        }
+        addReplyMapLen(c,3);
+        addReplyBulkCString(c,"slot");
+        addReplyLongLong(c,j);
+        addReplyBulkCString(c,"state");
+        addReplyBulkCString(c,state);
+        addReplyBulkCString(c,"node");
+        addReplyBulkCBuffer(c,peer->name,CLUSTER_NAMELEN);
+        count++;
+    }
+    setDeferredMultiBulkLength(c,replylen,count);
+}
+
+/* CLUSTER SLOT-STATS [SLOTSRANGE start end ...] reports one map per slot
+ * range, with the local key count and the owner of each range. The optional
+ * range filter uses the same syntax as CLUSTER ADDSLOTSRANGE. */
+static void clusterReplySlotStats(client *c) {
+    int ranges[CLUSTER_SLOTS/2][2];
+    int nranges = 0, i, j;
+
+    if (c->argc == 2) {
+        ranges[0][0] = 0;
+        ranges[0][1] = CLUSTER_SLOTS-1;
+        nranges = 1;
+    } else {
+        if ((c->argc-2) % 3 != 0) {
+            addReplyError(c,"CLUSTER SLOT-STATS requires SLOTSRANGE start end pairs");
+            return;
+        }
+        for (i = 2; i + 2 < c->argc; i += 3) {
+            PORT_LONGLONG start, end;
+            if (strcasecmp(c->argv[i]->ptr,"SLOTSRANGE") != 0 ||
+                getLongLongFromObjectOrReply(c,c->argv[i+1],&start,NULL) != C_OK ||
+                getLongLongFromObjectOrReply(c,c->argv[i+2],&end,NULL) != C_OK)
+            {
+                addReplyError(c,"Invalid SLOTSRANGE for CLUSTER SLOT-STATS");
+                return;
+            }
+            if (start < 0 || start >= CLUSTER_SLOTS ||
+                end < start || end >= CLUSTER_SLOTS)
+            {
+                addReplyError(c,"Invalid slot range");
+                return;
+            }
+            ranges[nranges][0] = (int)start;
+            ranges[nranges][1] = (int)end;
+            nranges++;
+        }
+    }
+
+    void *replylen = addDeferredMultiBulkLength(c);
+    for (i = 0; i < nranges; i++) {
+        unsigned long long keys = 0;
+        for (j = ranges[i][0]; j <= ranges[i][1]; j++)
+            keys += countKeysInSlot(j);
+        int owners = 0;
+        for (j = ranges[i][0]; j <= ranges[i][1]; j++) {
+            if (j == ranges[i][0] || server.cluster->slots[j] !=
+                server.cluster->slots[j-1]) owners++;
+        }
+        addReplyMapLen(c,4);
+        addReplyBulkCString(c,"start-slot");
+        addReplyLongLong(c,ranges[i][0]);
+        addReplyBulkCString(c,"end-slot");
+        addReplyLongLong(c,ranges[i][1]);
+        addReplyBulkCString(c,"keys");
+        addReplyLongLong(c,keys);
+        addReplyBulkCString(c,"owners");
+        addReplyLongLong(c,owners);
+    }
+    setDeferredMultiBulkLength(c,replylen,nranges);
+}
+
 void clusterCommand(client *c) {
     if (server.cluster_enabled == 0) {
         addReplyError(c,"This instance has cluster support disabled");
@@ -4706,7 +4799,9 @@ void clusterCommand(client *c) {
 "KEYSLOT <key> -- Return the hash slot for <key>.",
 "LINKS -- Return information about the cluster bus links.",
 "MEET <ip> <port> [bus-port] -- Connect nodes into a working cluster.",
+"MIGRATION -- Return local importing and migrating slots.",
 "MYID -- Return the node id.",
+"MYSHARDID -- Return the shard id of this node.",
 "NODES -- Return cluster configuration seen by node. Output format:",
 "    <id> <ip:port> <flags> <master> <pings> <pongs> <epoch> <link> <slot> ... <slot>",
 "REPLICATE <node-id> -- Configure current node as replica to <node-id>.",
@@ -4715,6 +4810,7 @@ void clusterCommand(client *c) {
 "SETSLOT <slot> (importing|migrating|stable|node <node-id>) -- Set slot state.",
 "SHARDS -- Return information about slot ranges and their shard nodes.",
 "REPLICAS <node-id> -- Return <node-id> replicas.",
+"SLOT-STATS [SLOTSRANGE start end ...] -- Return local slot statistics.",
 "SLOTS -- Return information about slots range mappings. Each range is made of:",
 "    start, end, master and replicas IP addresses, ports and ids",
 NULL
@@ -4759,6 +4855,18 @@ NULL
     } else if (!strcasecmp(c->argv[1]->ptr,"myid") && c->argc == 2) {
         /* CLUSTER MYID */
         addReplyBulkCBuffer(c,myself->name, CLUSTER_NAMELEN);
+    } else if (!strcasecmp(c->argv[1]->ptr,"migration") && c->argc == 2) {
+        /* CLUSTER MIGRATION */
+        clusterReplyMigration(c);
+    } else if (!strcasecmp(c->argv[1]->ptr,"myshardid") && c->argc == 2) {
+        /* A replica belongs to the shard identified by its master. */
+        clusterNode *shard = myself->slaveof ? myself->slaveof : myself;
+        addReplyBulkCBuffer(c,shard->name, CLUSTER_NAMELEN);
+    } else if (!strcasecmp(c->argv[1]->ptr,"slot-stats") &&
+               (c->argc == 2 || (c->argc > 2 && (c->argc-2) % 3 == 0)))
+    {
+        /* CLUSTER SLOT-STATS [SLOTSRANGE start end ...] */
+        clusterReplySlotStats(c);
     } else if (!strcasecmp(c->argv[1]->ptr,"slots") && c->argc == 2) {
         /* CLUSTER SLOTS */
         clusterReplyMultiBulkSlots(c);

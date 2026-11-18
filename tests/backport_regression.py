@@ -3156,6 +3156,75 @@ class BackportRegression(unittest.TestCase):
             for node in nodes:
                 node.close()
 
+    def test_cluster_operational_commands(self):
+        """MYSHARDID, SHARDS shard-id, SLOT-STATS and MIGRATION report state."""
+        if self.server is None:
+            self.skipTest("cluster tests require --server")
+        nodes = []
+        clients = []
+        try:
+            directory = Path(self.temp.name) / "cluster-ops"
+            directory.mkdir()
+            node = ManagedServer(
+                OPTIONS.server, str(directory), OPTIONS.timeout,
+                OPTIONS.startup_timeout, cluster=True,
+            )
+            node.start()
+            nodes.append(node)
+            clients.append(RESP2("127.0.0.1", node.port, OPTIONS.timeout))
+            admin = clients[0]
+
+            myid = admin.command("CLUSTER", "MYID")
+            self.assertEqual(admin.command("CLUSTER", "MYSHARDID"), myid)
+            self.assertEqual(
+                admin.command("CLUSTER", "MIGRATION"), [])
+            stats = [self.flat_map(x) for x in
+                     admin.command("CLUSTER", "SLOT-STATS")]
+            self.assertEqual(len(stats), 1)
+            self.assertEqual(stats[0][b"start-slot"], 0)
+            self.assertEqual(stats[0][b"end-slot"], 16383)
+            self.assertEqual(stats[0][b"keys"], 0)
+
+            admin.command("CLUSTER", "ADDSLOTSRANGE", "0", "16383")
+            deadline = time.time() + 5
+            while True:
+                info = admin.command("CLUSTER", "INFO").decode("utf-8", "replace")
+                if "cluster_state:ok" in info:
+                    break
+                if time.time() >= deadline:
+                    self.fail(info)
+                time.sleep(0.05)
+            key = self.key("cluster:ops:key")
+            slot = admin.command("CLUSTER", "KEYSLOT", key)
+            admin.command("SET", key, "v")
+            filtered = [self.flat_map(x) for x in admin.command(
+                "CLUSTER", "SLOT-STATS", "SLOTSRANGE", str(slot), str(slot))]
+            self.assertEqual(len(filtered), 1)
+            self.assertGreaterEqual(filtered[0][b"keys"], 1)
+            with self.assertRaises(RedisError):
+                admin.command("CLUSTER", "SLOT-STATS", "SLOTSRANGE", "0")
+
+            shard = self.flat_map(admin.command("CLUSTER", "SHARDS")[0])
+            self.assertEqual(shard[b"shard-id"], myid)
+            help_text = b"\n".join(admin.command("CLUSTER", "HELP"))
+            for name in (b"MYSHARDID", b"MIGRATION", b"SLOT-STATS"):
+                self.assertIn(name, help_text)
+
+            # SETSLOT is enough to expose migration state without a peer.
+            admin.command("CLUSTER", "SETSLOT", "50", "migrating", myid)
+            migration = [self.flat_map(x) for x in
+                         admin.command("CLUSTER", "MIGRATION")]
+            self.assertEqual(len(migration), 1)
+            self.assertEqual(migration[0][b"slot"], 50)
+            self.assertEqual(migration[0][b"state"], b"migrating")
+            self.assertEqual(migration[0][b"node"], myid)
+            admin.command("CLUSTER", "SETSLOT", "50", "stable")
+        finally:
+            for client in clients:
+                client.close()
+            for node in nodes:
+                node.close()
+
     def test_cluster_tls_bus(self):
         if self.server is None:
             self.skipTest("cluster tests require --server")
