@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp44
+# Redis for Windows 5.0.14.1-bp45
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -101,12 +101,12 @@ ACL 支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@categor
 
 ## 持久化适配
 
-- 保留原有 RDB 格式、单文件 AOF、Windows 后台保存机制。
+- 保留原有 RDB 格式和 Windows 后台保存机制；AOF 升级为 Redis 7 的多段布局，数据放在 `appenddirname`（默认 `appendonlydir`）目录，由 `appendonly.aof.manifest` 记录一个 base 文件和一个增量文件。重写完成后先写临时 manifest、再改名原子切换，随后删除旧文件；启动时如果只有旧的单文件 `appendonly.aof`，会先加载它，再在后台重写迁移到新布局。
 - 流的 RDB 仍使用旧格式，`entries-added` 与 `max-deleted-entry-id` 不落快照：RDB 恢复后前者等于当前长度、后者归零；AOF 重放和重写通过带 `ENTRIESADDED`/`MAXDELETEDID` 的 `XSETID` 保留这两个计数。
 - 成功的带 TTL 的 SET 在 AOF 中记录为普通 SET + 绝对 PEXPIREAT；KEEPTTL 记录实际保留的截止时间。
 - GETEX 的写入记录为 PEXPIREAT、PERSIST 或 DEL/UNLINK；GETDEL 记录为 DEL。
 - 条件过期仅记录成功结果的绝对截止时间，恢复时不重新判断 NX/XX/GT/LT。
-- RESP3 接入了类型、握手和 push：`HELLO 3` 把该连接切到协议 3，map、set、null、bool、double 和 verbatim 按协议编码，`RESET` 退回协议 2。Pub/Sub 的订阅确认、消息、分片消息以及 TRACKING 失效在协议 3 下都是 `>` push 帧；协议 2 保持普通数组，TRACKING 失效仍走 Pub/Sub。协议 3 的订阅连接可以继续执行普通命令，协议 2 的订阅态限制不变。不迁入新版 RDB 格式或多段 AOF。TLS 覆盖客户端监听、主从复制链路（`tls-replication yes`）和集群总线（`tls-cluster yes`）；证书只在启动时加载，`CONFIG SET` 只调整协议、套件与会话参数，不重新读取证书文件。网络收发由多个 IO 线程分担，命令解析与执行仍在主线程。ACL 键权限按命令键规格区分读与写。`COMMAND DOCS` 的文档取自 Redis 7.0.15 的命令表，`ZRANK`/`ZREVRANK` 的 `WITHSCORE` 取自 7.2.5。原底座已有功能保留，但本版没有对其做现代化升级。
+- RESP3 接入了类型、握手和 push：`HELLO 3` 把该连接切到协议 3，map、set、null、bool、double 和 verbatim 按协议编码，`RESET` 退回协议 2。Pub/Sub 的订阅确认、消息、分片消息以及 TRACKING 失效在协议 3 下都是 `>` push 帧；协议 2 保持普通数组，TRACKING 失效仍走 Pub/Sub。协议 3 的订阅连接可以继续执行普通命令，协议 2 的订阅态限制不变。不迁入新版 RDB 格式，AOF 使用多段布局。TLS 覆盖客户端监听、主从复制链路（`tls-replication yes`）和集群总线（`tls-cluster yes`）；证书只在启动时加载，`CONFIG SET` 只调整协议、套件与会话参数，不重新读取证书文件。网络收发由多个 IO 线程分担，命令解析与执行仍在主线程。ACL 键权限按命令键规格区分读与写。`COMMAND DOCS` 的文档取自 Redis 7.0.15 的命令表，`ZRANK`/`ZREVRANK` 的 `WITHSCORE` 取自 7.2.5。原底座已有功能保留，但本版没有对其做现代化升级。
 - `maxmemory-clients` 限制普通客户端的查询缓冲、回复缓冲和参数向量之和，超出时断开占用最大的连接。`CLIENT NO-EVICT` 的连接以及副本、主连接和 MONITOR 不参与。占用按这三项估算，不是 Redis 7 的客户端内存桶。
 - `WAITAOF` 没有 7.2 的异步 fsync 完成队列：开启 AOF 时在命令内调用 `flushAppendOnlyFile` 并 `fsync`，然后立即返回；`numreplicas` 只做参数校验，回复中的副本数恒为 0，不阻塞到超时。
 - `XINFO CONSUMERS` 的 `inactive`/`active_time` 是运行时数据，不写入本版 RDB：快照恢复后 `inactive` 回到 -1，直到再次成功投递。

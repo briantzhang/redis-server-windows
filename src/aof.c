@@ -45,6 +45,7 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/param.h>
+#include <dirent.h>
 #else
 #include "Win32_Interop/Win32_QFork.h"
 #include <direct.h>
@@ -53,6 +54,441 @@
 
 void aofUpdateCurrentSize(void);
 void aofClosePipes(void);
+
+/* ----------------------------------------------------------------------------
+ * Multi-part AOF manifest
+ *
+ * The AOF lives in a directory (appenddirname) as one base file plus one or
+ * more incremental files. The manifest, <appendfilename>.manifest, lists the
+ * files to load in order and is replaced atomically after every rewrite.
+ *
+ * An AOF written by an older build (a single <appendfilename> file in the
+ * working directory) is still loaded, and the first rewrite migrates it to
+ * the multi-part layout.
+ * ------------------------------------------------------------------------- */
+
+#define AOF_MANIFEST_LINE_MAX 1024
+
+static void aofInfoFree(void *ptr) {
+    aofInfo *ai = ptr;
+
+    if (ai == NULL) return;
+    sdsfree(ai->file_name);
+    zfree(ai);
+}
+
+static aofInfo *aofInfoCreate(const char *name, PORT_LONGLONG seq, int type) {
+    aofInfo *ai = zcalloc(sizeof(*ai));
+
+    ai->file_name = sdsnew(name);
+    ai->seq = seq;
+    ai->type = type;
+    return ai;
+}
+
+static sds aofGetManifestPath(void) {
+    return sdscatprintf(sdsempty(),"%s/%s.manifest",
+        server.aof_dirname, server.aof_filename);
+}
+
+static sds aofGetAofPath(const char *file_name) {
+    return sdscatprintf(sdsempty(),"%s/%s",server.aof_dirname,file_name);
+}
+
+static sds aofGetBaseFileName(PORT_LONGLONG seq) {
+    return sdscatprintf(sdsempty(),"%s.%lld.base.%s",server.aof_filename,
+        (long long)seq, server.aof_use_rdb_preamble ? "rdb" : "aof");
+}
+
+static sds aofGetIncrFileName(PORT_LONGLONG seq) {
+    return sdscatprintf(sdsempty(),"%s.%lld.incr.aof",server.aof_filename,
+        (long long)seq);
+}
+
+static aofManifest *aofManifestCreate(void) {
+    aofManifest *am = zcalloc(sizeof(*am));
+
+    am->incr_aof_list = listCreate();
+    am->dirname = sdsnew(server.aof_dirname);
+    am->file_name = sdsnew(server.aof_filename);
+    am->manifest_filepath = aofGetManifestPath();
+    return am;
+}
+
+void aofFreeManifest(aofManifest *am) {
+    if (am == NULL) return;
+    if (am->base_aof_info) aofInfoFree(am->base_aof_info);
+    listSetFreeMethod(am->incr_aof_list,aofInfoFree);
+    listRelease(am->incr_aof_list);
+    sdsfree(am->dirname);
+    sdsfree(am->file_name);
+    sdsfree(am->manifest_filepath);
+    zfree(am);
+}
+
+static int aofManifestAddFile(aofManifest *am, const char *name,
+                              PORT_LONGLONG seq, int type)
+{
+    if (type == AOF_FILE_TYPE_BASE) {
+        if (am->base_aof_info != NULL) return C_ERR;
+        am->base_aof_info = aofInfoCreate(name,seq,type);
+        if (seq > am->curr_base_file_seq) am->curr_base_file_seq = seq;
+    } else {
+        aofInfo *ai = aofInfoCreate(name,seq,type);
+        listAddNodeTail(am->incr_aof_list,ai);
+        if (seq > am->curr_incr_file_seq) am->curr_incr_file_seq = seq;
+    }
+    return C_OK;
+}
+
+static int aofManifestHasFile(const char *name) {
+    aofManifest *am = server.aof_manifest;
+    listIter li;
+    listNode *ln;
+
+    if (am == NULL) return 0;
+    if (am->base_aof_info &&
+        strcmp(am->base_aof_info->file_name,name) == 0) return 1;
+    listRewind(am->incr_aof_list,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        aofInfo *ai = listNodeValue(ln);
+        if (strcmp(ai->file_name,name) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Write the in-memory manifest to <appendfilename>.manifest. The file is
+ * written to a temporary name and renamed into place, so a crash leaves
+ * either the old or the new manifest. */
+int aofRewriteManifest(void) {
+    aofManifest *am = server.aof_manifest;
+    sds tmpfile;
+    FILE *fp;
+    listIter li;
+    listNode *ln;
+
+    if (am == NULL) return C_ERR;
+    tmpfile = sdscatprintf(sdsempty(),"%s.tmp-%d",
+        am->manifest_filepath,(int)getpid());
+    fp = fopen(tmpfile,"wb");
+    if (fp == NULL) {
+        serverLog(LL_WARNING,"Can't open the AOF manifest %s for writing: %s",
+            tmpfile, IF_WIN32(wsa_strerror(errno), strerror(errno)));
+        sdsfree(tmpfile);
+        return C_ERR;
+    }
+    if (am->base_aof_info) {
+        fprintf(fp,"file %s seq %lld type b\n",
+            am->base_aof_info->file_name,(long long)am->base_aof_info->seq);
+    }
+    listRewind(am->incr_aof_list,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        aofInfo *ai = listNodeValue(ln);
+        fprintf(fp,"file %s seq %lld type i\n",
+            ai->file_name,(long long)ai->seq);
+    }
+    if (fflush(fp) == EOF || fsync(fileno(fp)) == -1) {
+        serverLog(LL_WARNING,"Can't flush the AOF manifest %s: %s",
+            tmpfile, IF_WIN32(wsa_strerror(errno), strerror(errno)));
+        fclose(fp);
+        unlink(tmpfile);
+        sdsfree(tmpfile);
+        return C_ERR;
+    }
+    fclose(fp);
+    if (rename(tmpfile,am->manifest_filepath) == -1) {
+        serverLog(LL_WARNING,"Can't rename the AOF manifest %s to %s: %s",
+            tmpfile, am->manifest_filepath,
+            IF_WIN32(wsa_strerror(errno), strerror(errno)));
+        unlink(tmpfile);
+        sdsfree(tmpfile);
+        return C_ERR;
+    }
+    sdsfree(tmpfile);
+    return C_OK;
+}
+
+static int aofManifestParseLine(char *line, aofManifest *am) {
+    char name[AOF_MANIFEST_LINE_MAX];
+    long long seq = 0;
+    char type = 0;
+    size_t prefix = strlen(server.aof_filename);
+
+    if (sscanf(line,"file %1023s seq %lld type %c",name,&seq,&type) != 3)
+        return C_ERR;
+    if (seq <= 0) return C_ERR;
+    if (strncmp(name,server.aof_filename,prefix) != 0 ||
+        name[prefix] != '.' ||
+        strchr(name,'/') != NULL ||
+        strchr(name,'\\') != NULL) return C_ERR;
+    if (type == 'b')
+        return aofManifestAddFile(am,name,(PORT_LONGLONG)seq,
+                                  AOF_FILE_TYPE_BASE);
+    if (type == 'i')
+        return aofManifestAddFile(am,name,(PORT_LONGLONG)seq,
+                                  AOF_FILE_TYPE_INCR);
+    return C_ERR;
+}
+
+static int aofManifestRead(void) {
+    aofManifest *am = server.aof_manifest;
+    char line[AOF_MANIFEST_LINE_MAX];
+    int lineno = 0;
+    FILE *fp;
+
+    fp = fopen(am->manifest_filepath,"r");
+    if (fp == NULL) return C_ERR;
+    while (fgets(line,sizeof(line),fp) != NULL) {
+        char *p = line;
+        size_t len;
+
+        lineno++;
+        while (*p == ' ' || *p == '\t') p++;
+        len = strlen(p);
+        while (len > 0 && (p[len-1] == '\n' || p[len-1] == '\r' ||
+                           p[len-1] == ' ' || p[len-1] == '\t'))
+        {
+            p[--len] = '\0';
+        }
+        if (len == 0 || p[0] == '#') continue;
+        if (aofManifestParseLine(p,am) != C_OK) {
+            serverLog(LL_WARNING,"Invalid line %d in AOF manifest %s: %s",
+                lineno, am->manifest_filepath, p);
+            fclose(fp);
+            return C_ERR;
+        }
+    }
+    fclose(fp);
+    if (listLength(am->incr_aof_list) == 0) {
+        serverLog(LL_WARNING,"AOF manifest %s lists no incremental file",
+            am->manifest_filepath);
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+static int aofEnsureDir(void) {
+    struct redis_stat sb;
+
+    if (redis_stat(server.aof_dirname,&sb) == 0) return C_OK;
+#ifdef _WIN32
+    if (_mkdir(server.aof_dirname) == -1) return C_ERR;
+#else
+    if (mkdir(server.aof_dirname,0755) == -1) return C_ERR;
+#endif
+    return C_OK;
+}
+
+static int aofCreateEmptyFile(const char *file_name) {
+    sds path = aofGetAofPath(file_name);
+    int fd;
+
+    fd = open(path,O_WRONLY|O_CREAT|O_TRUNC WIN32_ONLY(|_O_BINARY),
+              IF_WIN32(_S_IREAD|_S_IWRITE,0644));
+    sdsfree(path);
+    if (fd == -1) return C_ERR;
+    close(fd);
+    return C_OK;
+}
+
+/* Remove files inside appenddirname that the manifest does not reference,
+ * for example the base file of a rewrite that crashed before the manifest
+ * switch. Only names starting with "<appendfilename>." are considered. */
+void aofCleanupUnusedFiles(void) {
+    aofManifest *am = server.aof_manifest;
+    sds prefix, manifest_name;
+
+    if (am == NULL) return;
+    prefix = sdscatprintf(sdsempty(),"%s.",server.aof_filename);
+    manifest_name = sdscatprintf(sdsempty(),"%s.manifest",server.aof_filename);
+#ifdef _WIN32
+    {
+        WIN32_FIND_DATAA fd;
+        HANDLE h;
+        sds pattern = sdscatprintf(sdsempty(),"%s\\%s.*",
+            server.aof_dirname,server.aof_filename);
+
+        h = FindFirstFileA(pattern,&fd);
+        sdsfree(pattern);
+        if (h == INVALID_HANDLE_VALUE) {
+            sdsfree(prefix);
+            sdsfree(manifest_name);
+            return;
+        }
+        do {
+            sds path;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (strncmp(fd.cFileName,prefix,sdslen(prefix)) != 0) continue;
+            if (aofManifestHasFile(fd.cFileName)) continue;
+            if (strcmp(fd.cFileName,manifest_name) == 0) continue;
+            path = aofGetAofPath(fd.cFileName);
+            unlink(path);
+            sdsfree(path);
+        } while (FindNextFileA(h,&fd));
+        FindClose(h);
+    }
+#else
+    {
+        DIR *dir = opendir(server.aof_dirname);
+        struct dirent *de;
+
+        if (dir == NULL) {
+            sdsfree(prefix);
+            sdsfree(manifest_name);
+            return;
+        }
+        while ((de = readdir(dir)) != NULL) {
+            sds path;
+            if (strncmp(de->d_name,prefix,sdslen(prefix)) != 0) continue;
+            if (aofManifestHasFile(de->d_name)) continue;
+            if (strcmp(de->d_name,manifest_name) == 0) continue;
+            path = aofGetAofPath(de->d_name);
+            unlink(path);
+            sdsfree(path);
+        }
+        closedir(dir);
+    }
+#endif
+    sdsfree(prefix);
+    sdsfree(manifest_name);
+}
+
+/* Load (or create) the manifest for an AOF-enabled server. When a legacy
+ * single-file AOF is found instead, aof_use_legacy_file is set so that the
+ * regular load path reads it, and a rewrite is scheduled to migrate it. */
+int aofLoadManifestFromDisk(void) {
+    struct redis_stat sb;
+    sds manifest_path;
+    int manifest_exists, legacy_exists;
+
+    if (server.aof_manifest) {
+        aofFreeManifest(server.aof_manifest);
+        server.aof_manifest = NULL;
+    }
+    server.aof_use_legacy_file = 0;
+
+    manifest_path = aofGetManifestPath();
+    manifest_exists = (redis_stat(manifest_path,&sb) == 0);
+    sdsfree(manifest_path);
+    legacy_exists = (redis_stat(server.aof_filename,&sb) == 0);
+
+    if (manifest_exists) {
+        if (legacy_exists) {
+            serverLog(LL_NOTICE,
+                "AOF manifest found, ignoring the legacy file %s",
+                server.aof_filename);
+        }
+        server.aof_manifest = aofManifestCreate();
+        if (aofManifestRead() != C_OK) {
+            aofFreeManifest(server.aof_manifest);
+            server.aof_manifest = NULL;
+            return C_ERR;
+        }
+    } else if (legacy_exists) {
+        server.aof_use_legacy_file = 1;
+        /* Keep an empty in-memory manifest so the first rewrite can migrate the
+         * legacy file to the multi-part layout. */
+        server.aof_manifest = aofManifestCreate();
+    } else {
+        aofManifest *am;
+        sds incr_name;
+
+        if (aofEnsureDir() != C_OK) {
+            serverLog(LL_WARNING,"Can't create the AOF directory %s: %s",
+                server.aof_dirname,
+                IF_WIN32(wsa_strerror(errno), strerror(errno)));
+            return C_ERR;
+        }
+        am = aofManifestCreate();
+        incr_name = aofGetIncrFileName(1);
+        if (aofCreateEmptyFile(incr_name) != C_OK ||
+            aofManifestAddFile(am,incr_name,1,AOF_FILE_TYPE_INCR) != C_OK)
+        {
+            serverLog(LL_WARNING,"Can't create the initial AOF file: %s",
+                IF_WIN32(wsa_strerror(errno), strerror(errno)));
+            sdsfree(incr_name);
+            aofFreeManifest(am);
+            return C_ERR;
+        }
+        sdsfree(incr_name);
+        server.aof_manifest = am;
+        if (aofRewriteManifest() != C_OK) {
+            aofFreeManifest(server.aof_manifest);
+            server.aof_manifest = NULL;
+            return C_ERR;
+        }
+    }
+    aofCleanupUnusedFiles();
+    return C_OK;
+}
+
+/* Open the file new writes are appended to: the last incremental file of the
+ * manifest, or the legacy single file while an upgrade is pending. */
+int aofOpenCurrentAofFile(void) {
+    sds path;
+    int fd;
+
+    if (server.aof_use_legacy_file || server.aof_manifest == NULL) {
+        path = sdsnew(server.aof_filename);
+    } else {
+        aofInfo *ai = listNodeValue(listLast(server.aof_manifest->incr_aof_list));
+        path = aofGetAofPath(ai->file_name);
+    }
+    fd = open(path,O_WRONLY|O_APPEND|O_CREAT WIN32_ONLY(|_O_BINARY),
+              IF_WIN32(_S_IREAD|_S_IWRITE,0644));
+    if (fd == -1) {
+        serverLog(LL_WARNING,"Can't open the append-only file %s: %s",
+            path, IF_WIN32(wsa_strerror(errno), strerror(errno)));
+        sdsfree(path);
+        return C_ERR;
+    }
+    sdsfree(path);
+    server.aof_fd = fd;
+    aofUpdateCurrentSize();
+    server.aof_fsync_offset = server.aof_current_size;
+    return C_OK;
+}
+
+/* Load the base file and every incremental file listed by the manifest. */
+int aofLoadAppendOnlyFiles(void) {
+    aofManifest *am = server.aof_manifest;
+    listIter li;
+    listNode *ln;
+    struct redis_stat sb;
+
+    if (server.aof_use_legacy_file || am == NULL) {
+        if (loadAppendOnlyFile(server.aof_filename) != C_OK) return C_ERR;
+        server.aof_base_size = 0;
+        if (redis_stat(server.aof_filename,&sb) == 0)
+            server.aof_rewrite_base_size = sb.st_size;
+        else
+            server.aof_rewrite_base_size = 0;
+        /* Migrate the legacy file to the multi-part layout. */
+        server.aof_rewrite_scheduled = 1;
+        return C_OK;
+    }
+
+    if (am->base_aof_info) {
+        sds path = aofGetAofPath(am->base_aof_info->file_name);
+        if (loadAppendOnlyFile(path) != C_OK) { sdsfree(path); return C_ERR; }
+        if (redis_stat(path,&sb) == 0)
+            server.aof_base_size = sb.st_size;
+        else
+            server.aof_base_size = 0;
+        sdsfree(path);
+    } else {
+        server.aof_base_size = 0;
+    }
+    listRewind(am->incr_aof_list,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        aofInfo *ai = listNodeValue(ln);
+        sds path = aofGetAofPath(ai->file_name);
+        if (loadAppendOnlyFile(path) != C_OK) { sdsfree(path); return C_ERR; }
+        sdsfree(path);
+    }
+    server.aof_rewrite_base_size = server.aof_base_size;
+    return C_OK;
+}
 
 /* ----------------------------------------------------------------------------
  * AOF rewrite buffer implementation.
@@ -267,6 +703,9 @@ void stopAppendOnly(void) {
     server.aof_selected_db = -1;
     server.aof_state = AOF_OFF;
     killAppendOnlyChild();
+    /* Keep the manifest in memory: a BGREWRITEAOF issued while the AOF is off
+     * still has to produce the next base/incremental files, and the files it
+     * references must not be garbage collected until the rewrite completes. */
 }
 
 /* Called when the user switches from "appendonly no" to "appendonly yes"
@@ -275,19 +714,28 @@ int startAppendOnly(void) {
     char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
     int newfd;
 
-    newfd = open(server.aof_filename,O_WRONLY|O_APPEND|O_CREAT WIN32_ONLY(|_O_BINARY), IF_WIN32(_S_IREAD|_S_IWRITE, 0644));
     serverAssert(server.aof_state == AOF_OFF);
-    if (newfd == -1) {
+    if (server.aof_manifest == NULL &&
+        !server.aof_use_legacy_file &&
+        aofLoadManifestFromDisk() != C_OK)
+    {
+        serverLog(LL_WARNING,
+            "Redis needs to enable the AOF but can't load or create "
+            "the AOF manifest");
+        return C_ERR;
+    }
+    if (aofOpenCurrentAofFile() != C_OK) {
         char *cwdp = IF_WIN32(_getcwd, getcwd)(cwd, MAXPATHLEN);
 
         serverLog(LL_WARNING,
             "Redis needs to enable the AOF but can't open the "
-            "append only file %s (in server root dir %s): %s",
-            server.aof_filename,
+            "append only file %s/%s (in server root dir %s): %s",
+            server.aof_dirname, server.aof_filename,
             cwdp ? cwdp : "unknown",
             IF_WIN32(wsa_strerror(errno), strerror(errno)));
         return C_ERR;
     }
+    newfd = server.aof_fd;
     if (server.rdb_child_pid != -1) {
         server.aof_rewrite_scheduled = 1;
         serverLog(LL_WARNING,"AOF was enabled but there is already a child process saving an RDB file on disk. An AOF background was scheduled to start when possible.");
@@ -773,9 +1221,9 @@ int loadAppendOnlyFile(char *filename) {
      * operation is received. */
     if (fp && redis_fstat(fileno(fp),&sb) != -1 && sb.st_size == 0) {
         server.aof_current_size = 0;
-        server.aof_fsync_offset = server.aof_current_size;
+        server.aof_fsync_offset = 0;
         fclose(fp);
-        return C_ERR;
+        return C_OK;
     }
 
     /* Temporarily disable AOF, to prevent EXEC from feeding a MULTI
@@ -922,9 +1370,7 @@ loaded_ok: /* DB loaded, cleanup and return C_OK to the caller. */
     freeFakeClient(fakeClient);
     server.aof_state = old_aof_state;
     stopLoading();
-    aofUpdateCurrentSize();
-    server.aof_rewrite_base_size = server.aof_current_size;
-    server.aof_fsync_offset = server.aof_current_size;
+    /* Sizes are accounted by the caller, which knows the manifest. */
     return C_OK;
 
 readerr: /* Read error. If feof(fp) is true, fall through to unexpected EOF. */
@@ -1798,184 +2244,213 @@ void aofUpdateCurrentSize(void) {
  * Handle this. */
 void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
     if (!bysignal && exitcode == 0) {
-        int newfd, oldfd;
+        int newfd = -1;
+        int oldfd = server.aof_fd;
         char tmpfile[256];
+        sds base_name = NULL, incr_name = NULL;
+        sds base_path = NULL, incr_path = NULL;
+        aofManifest *am = server.aof_manifest;
+        aofInfo *old_base = NULL;
+        list *old_incr = NULL;
+        sds old_legacy = NULL;
+        PORT_LONGLONG new_seq, old_base_seq, old_incr_seq;
         PORT_LONGLONG now = ustime();
         mstime_t latency;
+        struct redis_stat sb;
+        listIter li;
+        listNode *ln;
 
         serverLog(LL_NOTICE,
             "Background AOF rewrite terminated with success");
 
-        /* Flush the differences accumulated by the parent to the
-         * rewritten AOF. */
-        latencyStartMonitor(latency);
-#ifdef _WIN32
-        snprintf(tmpfile,256,"temp-rewriteaof-bg-%d.aof",
-            getpid());
-        newfd = open(tmpfile,O_WRONLY|O_APPEND|O_CREAT|_O_BINARY,_S_IREAD|_S_IWRITE);
-#else
-        snprintf(tmpfile,256,"temp-rewriteaof-bg-%d.aof",
-            (int)server.aof_child_pid);
-        newfd = open(tmpfile,O_WRONLY|O_APPEND);
-#endif
-        if (newfd == -1) {
+        if (am == NULL && server.aof_state == AOF_OFF) {
+            /* BGREWRITEAOF while the AOF is disabled still has to produce a
+             * loadable multi-part AOF, so start from an empty manifest. */
+            am = server.aof_manifest = aofManifestCreate();
+        }
+        if (am == NULL) {
             serverLog(LL_WARNING,
-                "Unable to open the temporary AOF produced by the child: %s", IF_WIN32(wsa_strerror(errno), strerror(errno)));
-            goto cleanup;
+                "AOF manifest is missing, keeping the previous AOF files");
+            goto rewrite_cleanup;
         }
 
+        new_seq = (am->curr_base_file_seq > am->curr_incr_file_seq ?
+                   am->curr_base_file_seq : am->curr_incr_file_seq) + 1;
+        base_name = aofGetBaseFileName(new_seq);
+        incr_name = aofGetIncrFileName(new_seq);
+        base_path = aofGetAofPath(base_name);
+        incr_path = aofGetAofPath(incr_name);
+
+        /* The directory may not exist yet when migrating a legacy single-file
+         * AOF to the multi-part layout. */
+        if (aofEnsureDir() != C_OK) {
+            serverLog(LL_WARNING,"Can't create the AOF directory %s: %s",
+                server.aof_dirname,
+                IF_WIN32(wsa_strerror(errno), strerror(errno)));
+            goto rewrite_cleanup;
+        }
+
+        /* Flush the differences accumulated by the parent to the rewritten
+         * base file. */
+        latencyStartMonitor(latency);
+        snprintf(tmpfile,256,"temp-rewriteaof-bg-%d.aof",
+            IF_WIN32((int)getpid(),(int)server.aof_child_pid));
+        newfd = open(tmpfile,O_WRONLY|O_APPEND|O_CREAT WIN32_ONLY(|_O_BINARY),
+                     IF_WIN32(_S_IREAD|_S_IWRITE,0644));
+        if (newfd == -1) {
+            serverLog(LL_WARNING,
+                "Unable to open the temporary AOF produced by the child: %s",
+                IF_WIN32(wsa_strerror(errno), strerror(errno)));
+            goto rewrite_cleanup;
+        }
         if (aofRewriteBufferWrite(newfd) == -1) {
             serverLog(LL_WARNING,
-                "Error trying to flush the parent diff to the rewritten AOF: %s", IF_WIN32(wsa_strerror(errno), strerror(errno)));
+                "Error trying to flush the parent diff to the rewritten AOF: %s",
+                IF_WIN32(wsa_strerror(errno), strerror(errno)));
             close(newfd);
-            goto cleanup;
+            newfd = -1;
+            goto rewrite_cleanup;
         }
+        if (redis_fsync(newfd) == -1) {
+            serverLog(LL_WARNING,
+                "Error trying to fsync the rewritten AOF: %s",
+                IF_WIN32(wsa_strerror(errno), strerror(errno)));
+        }
+        close(newfd);
+        newfd = -1;
         latencyEndMonitor(latency);
         latencyAddSampleIfNeeded("aof-rewrite-diff-write",latency);
 
         serverLog(LL_NOTICE,
             "Residual parent diff successfully flushed to the rewritten AOF (%.2f MB)", (double) (aofRewriteBufferSize() / (1024*1024)));  WIN_PORT_FIX
 
-        /* The only remaining thing to do is to rename the temporary file to
-         * the configured file and switch the file descriptor used to do AOF
-         * writes. We don't want close(2) or rename(2) calls to block the
-         * server on old file deletion.
-         *
-         * There are two possible scenarios:
-         *
-         * 1) AOF is DISABLED and this was a one time rewrite. The temporary
-         * file will be renamed to the configured file. When this file already
-         * exists, it will be unlinked, which may block the server.
-         *
-         * 2) AOF is ENABLED and the rewritten AOF will immediately start
-         * receiving writes. After the temporary file is renamed to the
-         * configured file, the original AOF file descriptor will be closed.
-         * Since this will be the last reference to that file, closing it
-         * causes the underlying file to be unlinked, which may block the
-         * server.
-         *
-         * To mitigate the blocking effect of the unlink operation (either
-         * caused by rename(2) in scenario 1, or by close(2) in scenario 2), we
-         * use a background thread to take care of this. First, we
-         * make scenario 1 identical to scenario 2 by opening the target file
-         * when it exists. The unlink operation after the rename(2) will then
-         * be executed upon calling close(2) for its descriptor. Everything to
-         * guarantee atomicity for this switch has already happened by then, so
-         * we don't care what the outcome or duration of that close operation
-         * is, as long as the file descriptor is released again. */
-#ifdef _WIN32
-         // On Windows, if AOF is disabled and an AOF file already exists,
-         // we don't need to open it since it will have to be closed anyway
-         // before renaming the temp AOF.
-        oldfd = -1; /* We'll set this to the current AOF filedes later. */
-
-        char tmpfile_win_old[256];
-        snprintf(tmpfile_win_old, 256, "temp-rewriteaof-old-%d.aof",
-            (int) server.aof_child_pid);
-
-        if (server.aof_fd != -1) {
-            // AOF enabled, close the existing AOF file
-            close(server.aof_fd);
-            // Now rename the existing AOF file to allow the new file to be renamed
-            if (rename(server.aof_filename, tmpfile_win_old) == -1) {
-                serverLog(LL_WARNING,
-                    "Error trying to rename the existing AOF to old tempfile: %s", IF_WIN32(wsa_strerror(errno), strerror(errno)));
-                // Let's clean the Windows-specific temp file here
-                unlink(tmpfile_win_old);
-                goto cleanup;
-            }
-        }
+        /* Move the base file into place and create the new incremental file. */
         latencyStartMonitor(latency);
-        // Close the temp AOF file before renaming it
-        close(newfd);
-        if (rename(tmpfile, server.aof_filename) == -1) {
+        if (rename(tmpfile,base_path) == -1) {
             serverLog(LL_WARNING,
                 "Error trying to rename the temporary AOF file %s into %s: %s",
-                tmpfile,
-                server.aof_filename,
+                tmpfile, base_path,
                 IF_WIN32(wsa_strerror(errno), strerror(errno)));
-            if (server.aof_fd != -1) {
-                if (rename(tmpfile_win_old, server.aof_filename) == -1) {
-                    serverLog(LL_WARNING,
-                        "Error trying to rename the old tempfile %s into the existing AOF file %s: %s",
-                        tmpfile,
-                        server.aof_filename,
-                        IF_WIN32(wsa_strerror(errno), strerror(errno)));
-                    serverLog(LL_WARNING,
-                        "Error trying to rename the existing AOF from old tempfile: %s", IF_WIN32(wsa_strerror(errno), strerror(errno)));
-                    // The Windows-specific temp file couldn't be renamed to
-                    // the configured AOF file, that should never happen but
-                    // if it happens we leave the file behind in case the user
-                    // needs it
-                }
-            }
-            goto cleanup;
+            goto rewrite_cleanup;
         }
-        /* now open the files again with new names */
-        newfd = open(server.aof_filename, O_WRONLY | O_APPEND | _O_BINARY, 0);
-        if (newfd == -1) {
-            /* Windows fix: More info */
-            serverLog(LL_WARNING, "Not able to reopen the temporary AOF file after rename");
-            goto cleanup;
-        }
-        if (server.aof_fd != -1) {
-            server.aof_fd = open(
-                tmpfile_win_old,
-                O_WRONLY | O_APPEND | O_CREAT | _O_BINARY | _O_TEMPORARY,     // _O_TEMPORARY forces delete on close flag in CreateFile call. File will be deleted in BIO_CLOSE_FILE job.
-                0644);
-        }
-#else
-        if (server.aof_fd == -1) {
-            /* AOF disabled */
-
-            /* Don't care if this fails: oldfd will be -1 and we handle that.
-             * One notable case of -1 return is if the old file does
-             * not exist. */
-            oldfd = open(server.aof_filename,O_RDONLY|O_NONBLOCK);
-        } else {
-            /* AOF enabled */
-            oldfd = -1; /* We'll set this to the current AOF filedes later. */
-        }
-
-        /* Rename the temporary file. This will not unlink the target file if
-         * it exists, because we reference it with "oldfd". */
-        latencyStartMonitor(latency);
-        if (rename(tmpfile,server.aof_filename) == -1) {
-            serverLog(LL_WARNING,
-                "Error trying to rename the temporary AOF file %s into %s: %s",
-                tmpfile,
-                server.aof_filename,
-                strerror(errno));
-            close(newfd);
-            if (oldfd != -1) close(oldfd);
-            goto cleanup;
-        }
-#endif
         latencyEndMonitor(latency);
         latencyAddSampleIfNeeded("aof-rename",latency);
 
-        if (server.aof_fd == -1) {
-            /* AOF disabled, we don't need to set the AOF file descriptor
-             * to this new file, so we can close it. */
-            close(newfd);
-        } else {
-            /* AOF enabled, replace the old fd with the new one. */
-            oldfd = server.aof_fd;
-            server.aof_fd = newfd;
-            if (server.aof_fsync == AOF_FSYNC_ALWAYS)
-                redis_fsync(newfd);
-            else if (server.aof_fsync == AOF_FSYNC_EVERYSEC)
-                aof_background_fsync(newfd);
-            server.aof_selected_db = -1; /* Make sure SELECT is re-issued */
-            aofUpdateCurrentSize();
-            server.aof_rewrite_base_size = server.aof_current_size;
-            server.aof_fsync_offset = server.aof_current_size;
+        if (aofCreateEmptyFile(incr_name) != C_OK) {
+            serverLog(LL_WARNING,
+                "Error trying to create the new incremental AOF file %s: %s",
+                incr_name, IF_WIN32(wsa_strerror(errno), strerror(errno)));
+            unlink(base_path);
+            goto rewrite_cleanup;
+        }
+        newfd = open(incr_path,O_WRONLY|O_APPEND WIN32_ONLY(|_O_BINARY),
+                     IF_WIN32(_S_IREAD|_S_IWRITE,0644));
+        if (newfd == -1) {
+            serverLog(LL_WARNING,
+                "Error trying to open the new incremental AOF file %s: %s",
+                incr_path, IF_WIN32(wsa_strerror(errno), strerror(errno)));
+            unlink(base_path);
+            unlink(incr_path);
+            goto rewrite_cleanup;
+        }
 
-            /* Clear regular AOF buffer since its contents was just written to
-             * the new AOF from the background rewrite buffer. */
+        /* Build the new manifest in memory and write it. The previous files
+         * are kept until the manifest points at the new ones. */
+        old_base = am->base_aof_info;
+        old_incr = am->incr_aof_list;
+        old_base_seq = am->curr_base_file_seq;
+        old_incr_seq = am->curr_incr_file_seq;
+        if (server.aof_use_legacy_file) old_legacy = sdsnew(server.aof_filename);
+
+        am->base_aof_info = NULL;
+        am->incr_aof_list = listCreate();
+        listSetFreeMethod(am->incr_aof_list,aofInfoFree);
+        aofManifestAddFile(am,base_name,new_seq,AOF_FILE_TYPE_BASE);
+        aofManifestAddFile(am,incr_name,new_seq,AOF_FILE_TYPE_INCR);
+        am->curr_base_file_seq = new_seq;
+        am->curr_incr_file_seq = new_seq;
+
+        if (aofRewriteManifest() != C_OK) {
+            /* Roll back to the previous manifest: its files are intact. */
+            aofInfoFree(am->base_aof_info);
+            listSetFreeMethod(am->incr_aof_list,aofInfoFree);
+            listRelease(am->incr_aof_list);
+            am->base_aof_info = old_base;
+            am->incr_aof_list = old_incr;
+            am->curr_base_file_seq = old_base_seq;
+            am->curr_incr_file_seq = old_incr_seq;
+            old_base = NULL;
+            old_incr = NULL;
+            if (old_legacy) {
+                sdsfree(old_legacy);
+                old_legacy = NULL;
+            }
+            close(newfd);
+            newfd = -1;
+            unlink(base_path);
+            unlink(incr_path);
+            goto rewrite_cleanup;
+        }
+
+        /* From here on the new manifest is authoritative. */
+        if (server.aof_fd == -1) {
+            /* AOF disabled: keep the rewritten files, close our descriptor. */
+            close(newfd);
+            newfd = -1;
+        } else {
+#ifdef _WIN32
+            /* Windows can't unlink a file while it is open. */
+            close(server.aof_fd);
+            oldfd = -1;
+#endif
+            server.aof_fd = newfd;
+            newfd = -1;
+            if (server.aof_fsync == AOF_FSYNC_ALWAYS)
+                redis_fsync(server.aof_fd);
+            else if (server.aof_fsync == AOF_FSYNC_EVERYSEC)
+                aof_background_fsync(server.aof_fd);
+            server.aof_selected_db = -1;
+
+            /* The rewrite buffer was just written into the base file. */
             sdsfree(server.aof_buf);
             server.aof_buf = sdsempty();
         }
+        server.aof_use_legacy_file = 0;
+
+        if (server.aof_fd != -1) {
+            aofUpdateCurrentSize();
+            server.aof_fsync_offset = server.aof_current_size;
+        }
+        if (redis_stat(base_path,&sb) == 0)
+            server.aof_base_size = sb.st_size;
+        else
+            server.aof_base_size = 0;
+        server.aof_rewrite_base_size = server.aof_base_size;
+
+        /* Remove the files the previous manifest referenced. */
+        if (old_base) {
+            sds path = aofGetAofPath(old_base->file_name);
+            unlink(path);
+            sdsfree(path);
+            aofInfoFree(old_base);
+        }
+        listSetFreeMethod(old_incr,aofInfoFree);
+        listRewind(old_incr,&li);
+        while ((ln = listNext(&li)) != NULL) {
+            aofInfo *ai = listNodeValue(ln);
+            sds path = aofGetAofPath(ai->file_name);
+            unlink(path);
+            sdsfree(path);
+        }
+        listRelease(old_incr);
+        if (old_legacy) {
+            unlink(old_legacy);
+            sdsfree(old_legacy);
+        }
+#ifndef _WIN32
+        if (oldfd != -1)
+            bioCreateBackgroundJob(BIO_CLOSE_FILE,(void*)(long)oldfd,NULL,NULL);
+#endif
 
         server.aof_lastbgrewrite_status = C_OK;
 
@@ -1984,11 +2459,15 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
         if (server.aof_state == AOF_WAIT_REWRITE)
             server.aof_state = AOF_ON;
 
-        /* Asynchronously close the overwritten AOF. */
-        if (oldfd != -1) bioCreateBackgroundJob(BIO_CLOSE_FILE,(void*)(long)oldfd,NULL,NULL);
-
         serverLog(LL_VERBOSE,
             "Background AOF rewrite signal handler took %lldus", ustime()-now);
+
+rewrite_cleanup:
+        if (newfd != -1) close(newfd);
+        if (base_name) sdsfree(base_name);
+        if (incr_name) sdsfree(incr_name);
+        if (base_path) sdsfree(base_path);
+        if (incr_path) sdsfree(incr_path);
     } else if (!bysignal && exitcode != 0) {
         server.aof_lastbgrewrite_status = C_ERR;
 

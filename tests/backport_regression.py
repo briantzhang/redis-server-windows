@@ -1337,9 +1337,11 @@ class BackportRegression(unittest.TestCase):
         self.wait_info_field("persistence", "aof_rewrite_in_progress", "0")
         self.assertEqual(
             self.info_fields("persistence")["aof_last_bgrewrite_status"], "ok")
-        aof_path = self.server.directory / "appendonly.aof"
-        self.assertTrue(aof_path.exists(), "rewrite produced no appendonly.aof")
-        self.assertIn(b"after-aof", aof_path.read_bytes())
+        aof_dir = self.server.directory / "appendonlydir"
+        base_files = sorted(aof_dir.glob("*.base.aof"))
+        self.assertTrue(base_files, "rewrite produced no base AOF file")
+        self.assertIn(b"after-aof",
+                      b"".join(path.read_bytes() for path in base_files))
 
         # With AOF off the rewrite child still has to run and be reaped.
         self.assertEqual(self.cmd("CONFIG", "SET", "appendonly", "no"), b"OK")
@@ -1358,6 +1360,124 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("SAVE"), b"OK")
         self.restart()
         self.assertEqual(self.cmd("GET", key), b"after-aof")
+
+    @staticmethod
+    def parse_aof_manifest(path):
+        entries = []
+        for line in path.read_text().splitlines():
+            parts = line.split()
+            if (len(parts) != 6 or parts[0] != "file" or parts[2] != "seq"
+                    or parts[4] != "type"):
+                raise AssertionError("bad manifest line: %r" % line)
+            entries.append((parts[1], int(parts[3]), parts[5]))
+        return entries
+
+    @staticmethod
+    def resp(*args):
+        out = b"*%d\r\n" % len(args)
+        for arg in args:
+            out += b"$%d\r\n%s\r\n" % (len(arg), arg)
+        return out
+
+    def test_aof_multipart_manifest_rotation(self):
+        """The AOF lives in appendonlydir with a manifest, and BGREWRITEAOF
+        rotates the base/incremental sequence and removes the old files."""
+        if self.server is None:
+            self.skipTest("AOF multipart tests require --server")
+        key, later = self.key("multipart:key"), self.key("multipart:later")
+        aof_dir = self.server.directory / "appendonlydir"
+        manifest = aof_dir / "appendonly.aof.manifest"
+        self.assertEqual(self.cmd("CONFIG", "GET", "appenddirname"),
+                         [b"appenddirname", b"appendonlydir"])
+        self.assertEqual(self.cmd("SET", key, b"first"), b"OK")
+        self.assertTrue(manifest.exists(), "no manifest in appendonlydir")
+        self.assertEqual(self.parse_aof_manifest(manifest),
+                         [("appendonly.aof.1.incr.aof", 1, "i")])
+
+        self.assertEqual(self.cmd("BGREWRITEAOF"),
+                         b"Background append only file rewriting started")
+        self.wait_info_field("persistence", "aof_rewrite_in_progress", "0")
+        self.assertEqual(
+            self.info_fields("persistence")["aof_last_bgrewrite_status"], "ok")
+        self.assertEqual(sorted(self.parse_aof_manifest(manifest)),
+                         [("appendonly.aof.2.base.aof", 2, "b"),
+                          ("appendonly.aof.2.incr.aof", 2, "i")])
+        self.assertEqual(sorted(path.name for path in aof_dir.iterdir()),
+                         ["appendonly.aof.2.base.aof",
+                          "appendonly.aof.2.incr.aof",
+                          "appendonly.aof.manifest"])
+        self.assertIn(b"first", (aof_dir / "appendonly.aof.2.base.aof").read_bytes())
+
+        self.assertEqual(self.cmd("SET", later, b"second"), b"OK")
+        self.restart()
+        self.assertEqual(self.cmd("MGET", key, later), [b"first", b"second"])
+        self.assertEqual(self.cmd("DEBUG", "LOADAOF"), b"OK")
+        self.assertEqual(self.cmd("MGET", key, later), [b"first", b"second"])
+
+        # A second rewrite rotates again and drops the seq-2 files.
+        self.assertEqual(self.cmd("BGREWRITEAOF"),
+                         b"Background append only file rewriting started")
+        self.wait_info_field("persistence", "aof_rewrite_in_progress", "0")
+        self.assertEqual(sorted(self.parse_aof_manifest(manifest)),
+                         [("appendonly.aof.3.base.aof", 3, "b"),
+                          ("appendonly.aof.3.incr.aof", 3, "i")])
+        self.assertEqual(sorted(path.name for path in aof_dir.iterdir()),
+                         ["appendonly.aof.3.base.aof",
+                          "appendonly.aof.3.incr.aof",
+                          "appendonly.aof.manifest"])
+        self.restart()
+        self.assertEqual(self.cmd("MGET", key, later), [b"first", b"second"])
+
+    def test_aof_multipart_legacy_migration(self):
+        """A legacy single-file AOF is loaded and migrated to appendonlydir."""
+        if self.server is None:
+            self.skipTest("AOF multipart tests require --server")
+        key = self.key("legacy:key")
+        aof_dir = self.server.directory / "appendonlydir"
+        legacy = self.server.directory / "appendonly.aof"
+        self.client.close()
+        self.server.stop()
+        shutil.rmtree(aof_dir)
+        legacy.write_bytes(self.resp(b"SELECT", b"0") +
+                           self.resp(b"SET", key, b"legacy-value"))
+        self.server.start()
+        self.client = self.connect()
+        self.addCleanup(self.client.close)
+
+        self.wait_info_field("persistence", "aof_rewrite_scheduled", "0")
+        self.wait_info_field("persistence", "aof_rewrite_in_progress", "0")
+        self.assertEqual(self.cmd("GET", key), b"legacy-value")
+        self.assertFalse(legacy.exists(), "legacy AOF was not removed")
+        manifest = aof_dir / "appendonly.aof.manifest"
+        self.assertTrue(manifest.exists(), "migration wrote no manifest")
+        self.assertEqual([entry[2] for entry in self.parse_aof_manifest(manifest)],
+                         ["b", "i"])
+        self.restart()
+        self.assertEqual(self.cmd("GET", key), b"legacy-value")
+
+    def test_aof_multipart_truncated_tail(self):
+        """A truncated command in the current incremental file is trimmed on
+        load without losing the commands before it."""
+        if self.server is None:
+            self.skipTest("AOF multipart tests require --server")
+        key = self.key("truncated:key")
+        aof_dir = self.server.directory / "appendonlydir"
+        self.assertEqual(self.cmd("SET", key, b"value"), b"OK")
+        incr = aof_dir / "appendonly.aof.1.incr.aof"
+        self.client.close()
+        self.server.stop()
+        size = incr.stat().st_size
+        with incr.open("ab") as handle:
+            handle.write(b"*3\r\n$3\r\nSET\r\n$5\r\ntrunc")
+        self.server.start()
+        self.client = self.connect()
+        self.addCleanup(self.client.close)
+
+        self.assertEqual(self.cmd("GET", key), b"value")
+        self.assertEqual(incr.stat().st_size, size,
+                         "truncated tail was not trimmed")
+        self.restart()
+        self.assertEqual(self.cmd("GET", key), b"value")
 
     def test_zunion_zinter_zdiff(self):
         self.cmd("DEL", "za", "zb", "out")
@@ -2316,7 +2436,13 @@ class BackportRegression(unittest.TestCase):
         """aof-timestamp-enabled writes #TS annotations that reload cleanly."""
         if self.server is None:
             self.skipTest("AOF timestamp test requires --server")
-        aof = self.server.directory / "appendonly.aof"
+        aof_dir = self.server.directory / "appendonlydir"
+
+        def aof_data():
+            return b"".join(
+                path.read_bytes() for path in sorted(aof_dir.glob("appendonly.aof.*"))
+                if path.name != "appendonly.aof.manifest")
+
         self.assertEqual(self.cmd("CONFIG", "GET", "aof-timestamp-enabled"),
                          [b"aof-timestamp-enabled", b"no"])
         self.assertEqual(
@@ -2324,7 +2450,7 @@ class BackportRegression(unittest.TestCase):
 
         key = self.key("aof:timestamp")
         self.assertEqual(self.cmd("SET", key, b"value"), b"OK")
-        data = aof.read_bytes()
+        data = aof_data()
         stamps = [int(line[4:]) for line in data.splitlines()
                   if line.startswith(b"#TS:")]
         self.assertTrue(stamps, data[:80])
@@ -2342,7 +2468,7 @@ class BackportRegression(unittest.TestCase):
             time.sleep(0.05)
         else:
             self.fail("AOF rewrite did not finish")
-        data = aof.read_bytes()
+        data = aof_data()
         self.assertTrue(data.startswith(b"#TS:"), data[:80])
 
         # Comments are skipped when the file is loaded back.
@@ -2354,7 +2480,7 @@ class BackportRegression(unittest.TestCase):
             self.cmd("CONFIG", "SET", "aof-timestamp-enabled", "no"), b"OK")
         self.assertEqual(self.cmd("SET", self.key("aof:no-timestamp"),
                                   b"value"), b"OK")
-        self.assertEqual(aof.read_bytes().count(b"#TS:"), 1)
+        self.assertEqual(aof_data().count(b"#TS:"), 1)
 
     def test_bitcount_bitpos_bit_ranges(self):
         key = self.key("bits")

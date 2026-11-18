@@ -376,10 +376,14 @@ NULL
         serverLog(LL_WARNING,"DB reloaded by DEBUG RELOAD");
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"loadaof")) {
+        if (server.aof_manifest == NULL && !server.aof_use_legacy_file) {
+            addReplyError(c,"AOF is not enabled");
+            return;
+        }
         if (server.aof_state != AOF_OFF) flushAppendOnlyFile(1);
         emptyDb(-1,EMPTYDB_NO_FLAGS,NULL);
         protectClient(c);
-        int ret = loadAppendOnlyFile(server.aof_filename);
+        int ret = aofLoadAppendOnlyFiles();
         unprotectClient(c);
         if (ret != C_OK) {
             addReply(c,shared.err);

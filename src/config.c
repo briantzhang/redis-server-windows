@@ -662,6 +662,13 @@ void loadServerConfigFromString(char* config) {
             }
             zfree(server.aof_filename);
             server.aof_filename = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"appenddirname") && argc == 2) {
+            if (!pathIsBaseName(argv[1])) {
+                err = "appenddirname can't be a path, just a directory name";
+                goto loaderr;
+            }
+            zfree(server.aof_dirname);
+            server.aof_dirname = zstrdup(argv[1]);
         } else if (!strcasecmp(argv[0],"no-appendfsync-on-rewrite")
                    && argc == 2) {
             if ((server.aof_no_fsync_on_rewrite= yesnotoi(argv[1])) == -1) {
@@ -1783,6 +1790,8 @@ void configGetCommand(client *c) {
 
     /* String values */
     config_get_string_field("dbfilename",server.rdb_filename);
+    config_get_string_field("appendfilename",server.aof_filename);
+    config_get_string_field("appenddirname",server.aof_dirname);
     config_get_string_field("requirepass",server.requirepass);
     config_get_string_field("aclfile",server.acl_filename);
     config_get_numerical_field("acllog-max-len",server.acllog_max_len);
@@ -2711,6 +2720,7 @@ int rewriteConfig(char *path) {
     rewriteConfigNumericalOption(state,"active-defrag-max-scan-fields",server.active_defrag_max_scan_fields,CONFIG_DEFAULT_DEFRAG_MAX_SCAN_FIELDS);
     rewriteConfigYesNoOption(state,"appendonly",server.aof_state != AOF_OFF,0);
     rewriteConfigStringOption(state,"appendfilename",server.aof_filename,CONFIG_DEFAULT_AOF_FILENAME);
+    rewriteConfigStringOption(state,"appenddirname",server.aof_dirname,CONFIG_DEFAULT_AOF_DIRNAME);
     rewriteConfigEnumOption(state,"appendfsync",server.aof_fsync,aof_fsync_enum,CONFIG_DEFAULT_AOF_FSYNC);
     rewriteConfigYesNoOption(state,"no-appendfsync-on-rewrite",server.aof_no_fsync_on_rewrite,CONFIG_DEFAULT_AOF_NO_FSYNC_ON_REWRITE);
     rewriteConfigNumericalOption(state,"auto-aof-rewrite-percentage",server.aof_rewrite_perc,AOF_REWRITE_PERC);

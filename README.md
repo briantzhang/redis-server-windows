@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp44
+# Redis for Windows 5.0.14.1-bp45
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp44`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp45`。
 
 ## 这个版本新增了什么
 
@@ -85,6 +85,7 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | RESP3 订阅态命令 | 7.0 | 协议 3 的订阅连接可以继续执行普通命令，回包与 push 消息可区分；协议 2 仍只允许订阅管理和 PING/QUIT/RESET |
 | keyspace 通知 `n` / `m` | 7.0 | 新增键发 `new` 事件，读取不存在的键发 `keymiss` 事件；`A` 别名不含这两类 |
 | AOF 时间戳注释（`aof-timestamp-enabled`） | 7.0 | 每次写入最多每秒追加一条 `#TS:<unix>` 注释，重写时在文件开头记录一次；加载时跳过注释行 |
+| 多段 AOF（`appenddirname`、manifest、base/增量文件） | 7.0 | AOF 位于 `appendonlydir`，manifest 记录 base 与增量文件；重写原子替换 manifest，旧文件在切换后删除；单文件旧布局启动后自动迁移 |
 | ACL 键读写权限（`%R~` / `%W~` / `%RW~`） | 7.0 | 每个键模式可只授读、只授写或两者；按命令键规格区分读写，`SET` 等选项相关命令按命令级写标志判断 |
 | `CLUSTER ADDSLOTSRANGE start end [start end ...]` / `CLUSTER DELSLOTSRANGE start end [start end ...]` | 7.0 | 按区间分配或删除本节点槽位，一条命令可以给多段；任一段非法则整条命令不生效 |
 | `CLUSTER SHARDS` / `CLUSTER LINKS` | 7.0 | 按分片汇总槽位与主从节点；列出集群总线连接的方向、建立时间与收发字节 |
@@ -123,10 +124,10 @@ TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM �
 
 - 证书与 `tls-cluster` 的切换只能在启动配置时完成，`CONFIG SET` 不会热加载证书或重建集群总线 TLS 上下文
 - 客户端内存驱逐只按查询缓冲、回复缓冲和参数向量估算，不按 Redis 7 的客户端内存桶分摊
-- 多段 AOF（`appenddirname`）、新版 RDB 格式
+- 新版 RDB 格式（沿用 Redis 5 的 RDB 版本，多段 AOF 的 base 文件可选 RDB 前导）
 - Redis 8 的查询引擎
 
-持久化仍是底座的单文件 AOF 和原有 RDB。流的 RDB 格式没有升级，`entries-added` 与 `max-deleted-entry-id` 不写入 RDB 快照：重启后前者按当前长度恢复、后者归零；AOF（含重写）会保留这两个计数。带 TTL 的写入在 AOF 里记成普通 `SET` 加一条绝对时间的 `PEXPIREAT`，重放时不会把相对过期时间再算一遍。
+持久化使用多段 AOF（`appendonlydir`、manifest、base 与增量文件）和原有的 RDB 格式。`redis-check-aof` 仍只接受单个 AOF 文件，不接受目录或 manifest，需要检查时对具体的 `.incr.aof`/`.base.aof` 执行。`appenddirname` 与 `appendfilename` 一样只能在启动配置里设置，`CONFIG GET` 可读、`CONFIG REWRITE` 会写回，但不支持 `CONFIG SET`。流的 RDB 格式没有升级，`entries-added` 与 `max-deleted-entry-id` 不写入 RDB 快照：重启后前者按当前长度恢复、后者归零；AOF（含重写）会保留这两个计数。带 TTL 的写入在 AOF 里记成普通 `SET` 加一条绝对时间的 `PEXPIREAT`，重放时不会把相对过期时间再算一遍。
 
 ## 构建
 

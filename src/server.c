@@ -1742,6 +1742,10 @@ void initServerConfig(void) {
     server.pidfile = NULL;
     server.rdb_filename = zstrdup(CONFIG_DEFAULT_RDB_FILENAME);
     server.aof_filename = zstrdup(CONFIG_DEFAULT_AOF_FILENAME);
+    server.aof_dirname = zstrdup(CONFIG_DEFAULT_AOF_DIRNAME);
+    server.aof_manifest = NULL;
+    server.aof_use_legacy_file = 0;
+    server.aof_base_size = 0;
     server.requirepass = NULL;
     server.acl_filename = NULL;
     server.acllog_max_len = 128;
@@ -2424,18 +2428,11 @@ void initServer(void) {
                 "blocked clients subsystem.");
     }
 
-    /* Open the AOF file if needed. */
+    /* Load or create the multi-part AOF manifest. The file new writes are
+     * appended to is opened once the dataset has been loaded. */
     if (server.aof_state == AOF_ON) {
-#ifdef _WIN32
-        server.aof_fd = open(server.aof_filename,
-            O_WRONLY | O_APPEND | O_CREAT | _O_BINARY, _S_IREAD | _S_IWRITE);
-#else
-        server.aof_fd = open(server.aof_filename,
-                               O_WRONLY|O_APPEND|O_CREAT,0644);
-#endif
-        if (server.aof_fd == -1) {
-            serverLog(LL_WARNING, "Can't open the append-only file: %s",
-                IF_WIN32(wsa_strerror(errno), strerror(errno)));
+        if (aofLoadManifestFromDisk() != C_OK) {
+            serverLog(LL_WARNING, "Fatal error: can't load the AOF manifest");
             exit(1);
         }
     }
@@ -4065,7 +4062,7 @@ sds genRedisInfoString(char *section) {
                 "aof_pending_bio_fsync:%llu\r\n"
                 "aof_delayed_fsync:%Iu\r\n", WIN_PORT_FIX /* %lu -> %Iu */
                 (PORT_LONGLONG) server.aof_current_size,
-                (PORT_LONGLONG) server.aof_rewrite_base_size,
+                (PORT_LONGLONG) server.aof_base_size,
                 server.aof_rewrite_scheduled,
                 sdslen(server.aof_buf),
                 aofRewriteBufferSize(),
@@ -4785,8 +4782,14 @@ int checkForSentinelMode(int argc, char **argv) {
 void loadDataFromDisk(void) {
     PORT_LONGLONG start = ustime();
     if (server.aof_state == AOF_ON) {
-        if (loadAppendOnlyFile(server.aof_filename) == C_OK)
-            serverLog(LL_NOTICE,"DB loaded from append only file: %.3f seconds",(float)(ustime()-start)/1000000);
+        if (aofLoadAppendOnlyFiles() != C_OK) {
+            serverLog(LL_WARNING,
+                "Fatal error loading the append only file, aborting");
+            exit(1);
+        }
+        if (aofOpenCurrentAofFile() != C_OK) exit(1);
+        serverLog(LL_NOTICE,"DB loaded from append only file: %.3f seconds",
+            (float)(ustime()-start)/1000000);
     } else {
         rdbSaveInfo rsi = RDB_SAVE_INFO_INIT;
         if (rdbLoad(server.rdb_filename,&rsi) == C_OK) {

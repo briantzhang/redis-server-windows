@@ -174,6 +174,7 @@ typedef PORT_LONGLONG ustime_t; /* microsecond time type. */
 #define CONFIG_DEFAULT_LFU_LOG_FACTOR 10
 #define CONFIG_DEFAULT_LFU_DECAY_TIME 1
 #define CONFIG_DEFAULT_AOF_FILENAME "appendonly.aof"
+#define CONFIG_DEFAULT_AOF_DIRNAME "appendonlydir"
 #define CONFIG_DEFAULT_AOF_NO_FSYNC_ON_REWRITE 0
 #define CONFIG_DEFAULT_AOF_LOAD_TRUNCATED 1
 #define CONFIG_DEFAULT_AOF_USE_RDB_PREAMBLE 1
@@ -1038,6 +1039,28 @@ typedef enum {
     CLIENT_PAUSE_ALL      /* Pause all commands */
 } pause_type;
 
+/* Multi-part AOF, using the Redis 7 layout: a directory (appenddirname) holds
+ * one base file and one or more incremental files, described by a manifest
+ * named <appendfilename>.manifest. */
+#define AOF_FILE_TYPE_BASE 0
+#define AOF_FILE_TYPE_INCR 1
+
+typedef struct aofInfo {
+    sds file_name;          /* Base name of the file inside appenddirname. */
+    PORT_LONGLONG seq;      /* Sequence number carried by file_name. */
+    int type;               /* AOF_FILE_TYPE_BASE or AOF_FILE_TYPE_INCR. */
+} aofInfo;
+
+typedef struct aofManifest {
+    aofInfo *base_aof_info;     /* Current base file, NULL before first rewrite. */
+    list *incr_aof_list;        /* aofInfo entries; the last one is open. */
+    sds dirname;                /* appenddirname as configured. */
+    sds file_name;              /* appendfilename. */
+    sds manifest_filepath;      /* dirname/file_name.manifest */
+    PORT_LONGLONG curr_base_file_seq;
+    PORT_LONGLONG curr_incr_file_seq;
+} aofManifest;
+
 struct redisServer {
     /* General */
     pid_t pid;                  /* Main process pid. */
@@ -1200,6 +1223,10 @@ struct redisServer {
     int aof_state;                  /* AOF_(ON|OFF|WAIT_REWRITE) */
     int aof_fsync;                  /* Kind of fsync() policy */
     char *aof_filename;             /* Name of the AOF file */
+    char *aof_dirname;              /* Directory holding the multi-part AOF */
+    aofManifest *aof_manifest;      /* Multi-part AOF manifest, NULL until loaded */
+    int aof_use_legacy_file;        /* 1 while a pre-manifest AOF is still used */
+    off_t aof_base_size;            /* Size of the current base file */
     int aof_no_fsync_on_rewrite;    /* Don't fsync if a rewrite is in prog. */
     int aof_rewrite_perc;           /* Rewrite AOF if % growth is > M and... */
     off_t aof_rewrite_min_size;     /* the AOF file is at least N bytes. */
@@ -1823,6 +1850,12 @@ void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int a
 void aofRemoveTempFile(pid_t childpid);
 int rewriteAppendOnlyFileBackground(void);
 int loadAppendOnlyFile(char *filename);
+int aofLoadManifestFromDisk(void);
+void aofFreeManifest(aofManifest *am);
+int aofOpenCurrentAofFile(void);
+int aofLoadAppendOnlyFiles(void);
+int aofRewriteManifest(void);
+void aofCleanupUnusedFiles(void);
 void stopAppendOnly(void);
 int startAppendOnly(void);
 void backgroundRewriteDoneHandler(int exitcode, int bysignal);

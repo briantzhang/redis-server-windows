@@ -1,8 +1,8 @@
 # 运维手册
 
-适用版本：Redis for Windows `5.0.14.1-bp44`，仅 Windows x64，支持单机和集群模式。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
+适用版本：Redis for Windows `5.0.14.1-bp45`，仅 Windows x64，支持单机和集群模式。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
 
-本文只覆盖这一个可执行文件的日常操作。它不包含多段 AOF，相关配置项写进 `redis.conf` 也不会生效。TLS 覆盖客户端监听、主从复制和集群总线，见第 4c、4d、4e 节；主动切换主库见第 4f 节。集群模式沿用底座实现，见第 4b 节。ACL 已按 Redis 6 的范围实现，见第 3 节。
+本文只覆盖这一个可执行文件的日常操作。AOF 采用 Redis 7 的多段布局：`appenddirname` 目录里放 manifest、一个 base 文件和一个增量文件，旧单文件 AOF 会在首次重写时自动迁移。TLS 覆盖客户端监听、主从复制和集群总线，见第 4c、4d、4e 节；主动切换主库见第 4f 节。集群模式沿用底座实现，见第 4b 节。ACL 已按 Redis 6 的范围实现，见第 3 节。
 
 ## 1. 目录与文件
 
@@ -20,7 +20,7 @@
 | 文件 | 来源 | 说明 |
 | --- | --- | --- |
 | `dump.rdb` | `dbfilename` | RDB 快照 |
-| `appendonly.aof` | `appendfilename` | 单文件 AOF，默认关闭 |
+| `appendonlydir/` | `appenddirname` | AOF 目录：`appendonly.aof.manifest` 记录清单，另有 base 与增量文件，默认关闭 |
 | 日志 | `logfile` | 默认空，输出到控制台 |
 
 部署时把这三个路径指到独立的数据盘目录，不要和程序目录混在一起。
@@ -39,7 +39,7 @@
 .\redis-server.exe --version
 ```
 
-应看到 `v=5.0.14.1-bp44`。如果不是这个版本号，说明运行的不是这份回移。
+应看到 `v=5.0.14.1-bp45`。如果不是这个版本号，说明运行的不是这份回移。
 
 另开一个窗口检查存活：
 
@@ -90,6 +90,7 @@ save 60 10000
 
 appendonly yes
 appendfilename appendonly.aof
+appenddirname appendonlydir
 appendfsync everysec
 auto-aof-rewrite-percentage 100
 auto-aof-rewrite-min-size 64mb
@@ -238,7 +239,7 @@ CLIENT NO-TOUCH off
 CLIENT NO-EVICT on
 ```
 
-`CLIENT NO-TOUCH` 让这个连接后续读取键时不再更新 LRU/LFU，`TOUCH` 命令本身仍会更新；`OBJECT IDLETIME`/`OBJECT FREQ` 可以用来核对。`CLIENT NO-EVICT` 只记录标志：本版没有实现 Redis 7 的客户端内存驱逐（`maxmemory-clients`），因此不会真的因为内存压力保留或驱逐某个连接。`RESET` 会清除这两个标志。
+`CLIENT NO-TOUCH` 让这个连接后续读取键时不再更新 LRU/LFU，`TOUCH` 命令本身仍会更新；`OBJECT IDLETIME`/`OBJECT FREQ` 可以用来核对。`CLIENT NO-EVICT` 的连接不会被客户端内存驱逐选中。本版按查询缓冲、回复缓冲和参数向量估算每个连接的内存占用，超过 `maxmemory-clients` 时优先断开占用最大的普通连接；副本连接与带 `NO-EVICT` 标志的连接不参与驱逐。`RESET` 会清除这两个标志。
 
 原子取出旧值并写入：
 
@@ -425,7 +426,7 @@ openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
 openssl s_client -connect 127.0.0.1:6380 -servername redis.example -CAfile ca.crt
 ```
 
-需要客户端证书时再带 `-cert client.crt -key client.key`。TLS 覆盖客户端连接和主从复制；集群总线、Sentinel 仍是明文，证书路径也不支持热加载。
+需要客户端证书时再带 `-cert client.crt -key client.key`。TLS 覆盖客户端连接、主从复制和集群总线（`tls-cluster yes`）；Sentinel 仍是明文，证书路径也不支持热加载。
 
 ## 4d. TLS 主从复制
 
@@ -510,13 +511,13 @@ AOF 重写（压缩日志、用当前数据重放生成新文件）：
 BGREWRITEAOF
 ```
 
-重写期间写入会先进重写缓冲区，完成后再追加，不需要停机。本版是底座的单文件 AOF，没有 Redis 7 的多段 AOF，所以重写是整文件替换。
+重写期间写入会先进重写缓冲区，子进程写完后由父进程把缓冲区追加进新的 base 文件，再用临时文件加改名的方式原子替换 manifest。新 manifest 生效后旧 base 与旧增量文件才会删除，所以重写过程不需要停机。`appenddirname` 里通常是一个 `*.base.aof`（或 `*.base.rdb`，取决于 `aof-use-rdb-preamble`）、一个 `*.incr.aof` 和 manifest，重启时按 manifest 的顺序依次加载。不要往这个目录里放其他文件：启动时会删除名字以 `<appendfilename>.` 开头、但没有被 manifest 引用的文件（默认即 `appendonly.aof.` 前缀）。
 
 恢复步骤：
 
 1. `SHUTDOWN` 停掉实例，确认进程已退出。
 2. 把整个 `dir` 目录拷走一份，作为回退点。
-3. 用要恢复的 `dump.rdb` 和 `appendonly.aof` 覆盖数据目录里的同名文件。只恢复快照时，移走 `appendonly.aof`，否则 AOF 会覆盖 RDB 的内容。
+3. 用要恢复的 `dump.rdb` 覆盖数据目录里的同名文件，并用备份的整个 `appendonlydir` 目录替换现有的目录。只恢复快照时，移走 `appendonlydir`（以及旧版遗留的 `appendonly.aof`），否则 AOF 会覆盖 RDB 的内容。
 4. 启动后抽查键数量和关键业务键：`INFO keyspace`、`GET`、`TTL`。
 
 本版把带过期时间的 `SET` 记成 `SET` 加绝对时间的 `PEXPIREAT`。所以从 AOF 恢复后，TTL 不会因为“重放时重新计算相对时间”而变长。
@@ -546,7 +547,7 @@ BGSAVE
 BGREWRITEAOF
 ```
 
-等 `INFO persistence` 里两次后台任务的状态都变成 `ok`，再复制 `dir` 下的 `dump.rdb` 和 `appendonly.aof`。复制过程中不要 `SHUTDOWN`，也不要再手动触发保存。
+等 `INFO persistence` 里两次后台任务的状态都变成 `ok`，再复制 `dir` 下的 `dump.rdb` 和整个 `appendonlydir` 目录。复制过程中不要 `SHUTDOWN`，也不要再手动触发保存。
 
 备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp35-20261117.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
 
@@ -568,7 +569,7 @@ BGREWRITEAOF
 
 AOF 启动失败：
 
-- 保留现场后，用底座自带的方式检查：`redis-check-aof --fix` 会截掉文件末尾不完整的最后一条命令。只在确认丢失末尾这一条可以接受时使用，并先备份原文件。
+- 保留现场后，用底座自带的方式检查：`redis-check-aof --fix <文件>` 会截掉文件末尾不完整的最后一条命令。多段 AOF 下要对出错的那个 `.incr.aof`（或 `.base.aof`）单独执行，manifest 本身不需要检查；先备份整个 `appendonlydir` 再操作。
 - 本版已修复一处 AOF 写入崩溃：带过期参数的 `SET`（如 `SET k v PX 180000`）在旧二进制上会触发访问冲突。确认 `redis-server --version` 是 `5.0.14.1-bp1` 或之后的版本，且构建提交为 `71377016` 之后的版本。
 
 内存涨个不停：
