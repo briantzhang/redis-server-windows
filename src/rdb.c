@@ -784,6 +784,7 @@ size_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg) {
  * Returns -1 on error, number of bytes written on success. */
 ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key) {
     ssize_t n = 0, nwritten = 0;
+    int stream_counters_present = 0;
 
     if (o->type == OBJ_STRING) {
         /* Save a string value */
@@ -955,6 +956,18 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key) {
         nwritten += n;
         if ((n = rdbSaveLen(rdb,s->last_id.seq)) == -1) return -1;
         nwritten += n;
+        /* Redis 6.2 stores stream counters after the last ID. A sentinel
+         * length marks their presence so snapshots written by the older
+         * single-file format can still be loaded. */
+        if ((n = rdbSaveLen(rdb,STREAM_RDB_EXT_MARK)) == -1) return -1;
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb,s->entries_added)) == -1) return -1;
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb,s->max_deleted_entry_id.ms)) == -1) return -1;
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb,s->max_deleted_entry_id.seq)) == -1) return -1;
+        nwritten += n;
+        stream_counters_present = 1;
 
         /* The consumer groups and their clients are part of the stream
          * type, so serialize every consumer group. */
@@ -981,6 +994,14 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key) {
                 nwritten += n;
                 if ((n = rdbSaveLen(rdb,cg->last_id.seq)) == -1) return -1;
                 nwritten += n;
+                if (stream_counters_present) {
+                    if ((n = rdbSaveLen(rdb,STREAM_RDB_EXT_MARK)) == -1)
+                        return -1;
+                    nwritten += n;
+                    if ((n = rdbSaveLen(rdb,cg->entries_read)) == -1)
+                        return -1;
+                    nwritten += n;
+                }
 
                 /* Save the global PEL. */
                 if ((n = rdbSaveStreamPEL(rdb,cg->pel,1)) == -1) return -1;
@@ -1748,6 +1769,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, robj *key) {
         o = createStreamObject();
         stream *s = o->ptr;
         uint64_t listpacks = rdbLoadLen(rdb,NULL);
+        int stream_counters_present = 0;
 
         while(listpacks--) {
             /* Get the master ID, the one we'll use as key of the radix tree
@@ -1786,11 +1808,17 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, robj *key) {
         /* Load the last entry ID. */
         s->last_id.ms = rdbLoadLen(rdb,NULL);
         s->last_id.seq = rdbLoadLen(rdb,NULL);
-        /* The legacy stream RDB format does not store the counters added in
-         * 6.2, so after a snapshot reload the number of added entries is
-         * the current length and no deleted entry ID is remembered. AOF
-         * replay restores both via XSETID. */
         s->entries_added = s->length;
+        /* A sentinel length marks the local extension that carries the 6.2
+         * stream counters. Snapshots from the old single-file layout omit it
+         * and keep the historical behaviour of deriving the counters from
+         * the current stream. */
+        if (rdbLoadLen(rdb,NULL) == STREAM_RDB_EXT_MARK) {
+            s->entries_added = rdbLoadLen(rdb,NULL);
+            s->max_deleted_entry_id.ms = rdbLoadLen(rdb,NULL);
+            s->max_deleted_entry_id.seq = rdbLoadLen(rdb,NULL);
+            stream_counters_present = 1;
+        }
 
         /* Consumer groups loading */
         size_t cgroups_count = rdbLoadLen(rdb,NULL);
@@ -1806,10 +1834,19 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, robj *key) {
             }
             cg_id.ms = rdbLoadLen(rdb,NULL);
             cg_id.seq = rdbLoadLen(rdb,NULL);
+            uint64_t entries_read = 0;
+            int group_counters_present = 0;
+            if (stream_counters_present &&
+                rdbLoadLen(rdb,NULL) == STREAM_RDB_EXT_MARK)
+            {
+                entries_read = rdbLoadLen(rdb,NULL);
+                group_counters_present = 1;
+            }
             streamCG *cgroup = streamCreateCG(s,cgname,sdslen(cgname),&cg_id);
             if (cgroup == NULL)
                 rdbExitReportCorruptRDB("Duplicated consumer group name %s",
                                          cgname);
+            if (group_counters_present) cgroup->entries_read = entries_read;
             sdsfree(cgname);
 
             /* Load the global PEL for this consumer group, however we'll
@@ -3346,6 +3383,7 @@ static int dumpValidateObject(dumpCursor *c, int rdbtype) {
     case RDB_TYPE_STREAM_LISTPACKS: {
         uint64_t listpacks, length, last_ms, last_seq, cgroups;
         uint64_t j;
+        int stream_counters_present = 0;
         if (dumpLen(c, &listpacks) == C_ERR) return C_ERR;
         for (i = 0; i < listpacks; i++) {
             size_t count;
@@ -3363,12 +3401,31 @@ static int dumpValidateObject(dumpCursor *c, int rdbtype) {
         if (dumpLen(c, &length) == C_ERR) return C_ERR;
         if (dumpLen(c, &last_ms) == C_ERR) return C_ERR;
         if (dumpLen(c, &last_seq) == C_ERR) return C_ERR;
+        /* The local stream extension starts with a fixed 9-byte 64-bit
+         * length: RDB_64BITLEN plus the sentinel. Peek instead of consuming
+         * so old snapshots keep their group count at this position. */
+        if (dumpNeed(c, 9) == C_OK && c->p[c->pos] == RDB_64BITLEN &&
+            dumpReadU64BE(c->p + c->pos + 1) == STREAM_RDB_EXT_MARK)
+        {
+            uint64_t entries_added, maxdel_ms, maxdel_seq;
+            c->pos += 9;
+            if (dumpLen(c, &entries_added) == C_ERR) return C_ERR;
+            if (dumpLen(c, &maxdel_ms) == C_ERR) return C_ERR;
+            if (dumpLen(c, &maxdel_seq) == C_ERR) return C_ERR;
+            stream_counters_present = 1;
+        }
         if (dumpLen(c, &cgroups) == C_ERR) return C_ERR;
         for (i = 0; i < cgroups; i++) {
             uint64_t ms, seq, pel, consumers;
             if (dumpReadString(c, &s, 0) == C_ERR) return C_ERR;
             if (dumpLen(c, &ms) == C_ERR) return C_ERR;
             if (dumpLen(c, &seq) == C_ERR) return C_ERR;
+            if (stream_counters_present) {
+                uint64_t marker, entries_read;
+                if (dumpLen(c, &marker) == C_ERR) return C_ERR;
+                if (marker != STREAM_RDB_EXT_MARK) return C_ERR;
+                if (dumpLen(c, &entries_read) == C_ERR) return C_ERR;
+            }
             if (dumpLen(c, &pel) == C_ERR) return C_ERR;
             if (pel > (uint64_t)c->len) return C_ERR;
             for (j = 0; j < pel; j++) {

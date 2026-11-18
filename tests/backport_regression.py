@@ -2475,6 +2475,48 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual([self.flat_map(consumer)[b"name"] for consumer in
                           self.cmd("XINFO", "CONSUMERS", key, "g")], [b"c1"])
 
+    def test_stream_rdb_counters_and_group_lag(self):
+        """Stream counters and consumer-group lag survive SAVE/restart, and a
+        sanitizing RESTORE accepts the new RDB layout on another instance."""
+        if self.server is None:
+            self.skipTest("stream RDB tests require --server")
+        key = self.key("stream:rdb:counters")
+        for ms in range(1, 4):
+            self.cmd("XADD", key, "%d-1" % ms, "f", ms)
+        self.assertEqual(self.cmd("XDEL", key, "1-1"), 1)
+        self.assertEqual(self.cmd("XSETID", key, "9-9", "ENTRIESADDED", "42",
+                                  "MAXDELETEDID", "1-1"), b"OK")
+        self.assertEqual(self.cmd("XGROUP", "CREATE", key, "g", "0"), b"OK")
+        self.assertEqual(self.cmd("XGROUP", "SETID", key, "g", "9-9",
+                                  "ENTRIESREAD", "7"), b"OK")
+
+        def check_counters(client):
+            info = self.flat_map(client.command("XINFO", "STREAM", key))
+            self.assertEqual(info[b"entries-added"], 42)
+            self.assertEqual(info[b"max-deleted-entry-id"], b"1-1")
+            groups = [self.flat_map(row)
+                      for row in client.command("XINFO", "GROUPS", key)]
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0][b"entries-read"], 7)
+            self.assertEqual(groups[0][b"lag"], 35)
+
+        check_counters(self.client)
+        self.assertEqual(self.cmd("SAVE"), b"OK")
+        self.restart()
+        check_counters(self.client)
+
+        payload = self.cmd("DUMP", key)
+        directory = Path(self.temp.name) / "stream-sanitize"
+        directory.mkdir()
+        server = ManagedServer(
+            self.server.executable, directory, OPTIONS.timeout,
+            OPTIONS.startup_timeout, extra_config="sanitize-dump-payload yes\n")
+        self.addCleanup(server.close)
+        server.start()
+        with RESP2("127.0.0.1", server.port, OPTIONS.timeout) as client:
+            self.assertEqual(client.command("RESTORE", key, 0, payload), b"OK")
+            check_counters(client)
+
     def test_stream_aof_rewrite_counters(self):
         if self.server is None:
             self.skipTest("AOF rewrite test requires --server")

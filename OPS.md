@@ -1,6 +1,6 @@
 # 运维手册
 
-适用版本：Redis for Windows `5.0.14.1-bp48`，仅 Windows x64，支持单机和集群模式。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
+适用版本：Redis for Windows `5.0.14.1-bp49`，仅 Windows x64，支持单机和集群模式。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
 
 本文只覆盖这一个可执行文件的日常操作。AOF 采用 Redis 7 的多段布局：`appenddirname` 目录里放 manifest、一个 base 文件和一个增量文件，旧单文件 AOF 会在首次重写时自动迁移。TLS 覆盖客户端监听、主从复制和集群总线，见第 4c、4d、4e 节；主动切换主库见第 4f 节。集群模式沿用底座实现，见第 4b 节。ACL 已按 Redis 6 的范围实现，见第 3 节。
 
@@ -39,7 +39,7 @@
 .\redis-server.exe --version
 ```
 
-应看到 `v=5.0.14.1-bp48`。如果不是这个版本号，说明运行的不是这份回移。
+应看到 `v=5.0.14.1-bp49`。如果不是这个版本号，说明运行的不是这份回移。
 
 另开一个窗口检查存活：
 

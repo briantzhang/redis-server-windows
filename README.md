@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp48
+# Redis for Windows 5.0.14.1-bp49
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp48`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp49`。
 
 ## 这个版本新增了什么
 
@@ -44,7 +44,7 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `XADD ... [NOMKSTREAM] [MAXLEN\|MINID [~\|=] threshold [LIMIT n]]` | 6.2 | 追加时按长度或最小 ID 裁剪，支持近似裁剪与工作量上限；`NOMKSTREAM` 不自动建键 |
 | `XTRIM key MAXLEN\|MINID [~\|=] threshold [LIMIT n]` | 6.2 | 按长度或最小 ID 裁剪；`LIMIT` 只能与 `~` 一起使用 |
 | `XGROUP CREATECONSUMER key group consumer` | 6.2 | 显式创建消费者；`XREADGROUP ... NOACK` 创建的消费者也会同步到 AOF 和副本 |
-| `XSETID key id [ENTRIESADDED n] [MAXDELETEDID id]` | 6.2 / 7.0 | 校正流计数；AOF 重写会保留这些计数 |
+| `XSETID key id [ENTRIESADDED n] [MAXDELETEDID id]` | 6.2 / 7.0 | 校正流计数；RDB 快照与 AOF 重写都会保留这些计数 |
 | `XPENDING key group [IDLE ms] start end count [consumer]` | 6.2 | 只返回空闲时间达到阈值的待处理消息 |
 | `XAUTOCLAIM key group consumer min-idle start [COUNT n] [JUSTID]` | 6.2 | 批量转移待处理消息，返回游标，并清理流条目已删除的 PEL 记录 |
 | `XINFO STREAM key [FULL [COUNT n]]` | 6.2 / 7.0 | `FULL` 输出条目、组、消费者与 PEL；摘要新增 `max-deleted-entry-id`、`entries-added`、`recorded-first-entry-id` |
@@ -68,7 +68,7 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `ACL LOG [count\|RESET]` | 6.0 | 记录被拒绝的命令、键和认证失败，相同条目在 60 秒内合并计数；`acllog-max-len` 控制上限 |
 | `ACL SAVE` / `ACL LOAD` 与 `aclfile` 配置 | 6.0 | 把用户规则写入文件并在启动或手动加载时恢复；规则文件损坏时保留内存中的旧用户 |
 | `CLIENT SETINFO lib-name\|lib-ver` | 7.2 | 记录客户端库名称与版本，显示在 `CLIENT LIST`/`CLIENT INFO` 的 `lib-name=`、`lib-ver=` |
-| `XGROUP SETID ... [ENTRIESREAD n]`、`XINFO GROUPS` 的 `entries-read`/`lag` | 7.0 | 记录消费组已读条目数并据此计算积压 |
+| `XGROUP SETID ... [ENTRIESREAD n]`、`XINFO GROUPS` 的 `entries-read`/`lag` | 7.0 | 记录消费组已读条目数并据此计算积压；快照重启后仍保留 |
 | `INFO errorstats` | 6.2 | 按错误码统计回复数量，`CONFIG RESETSTAT` 清零 |
 | `SSUBSCRIBE`/`SUNSUBSCRIBE`/`SPUBLISH`、`PUBSUB SHARDCHANNELS`/`SHARDNUMSUB` | 7.0 | 分片频道订阅与发布；单机下按本节点投递，与普通频道互不影响 |
 | `LATENCY HISTOGRAM [command ...]` | 7.0 | 每条命令的调用次数与延迟直方图（1024ns 起、按 2 的幂分桶，回复单位为微秒） |
@@ -128,7 +128,7 @@ TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM �
 - 新版 RDB 格式（沿用 Redis 5 的 RDB 版本，多段 AOF 的 base 文件可选 RDB 前导）
 - Redis 8 的查询引擎
 
-持久化使用多段 AOF（`appendonlydir`、manifest、base 与增量文件）和原有的 RDB 格式。`redis-check-aof` 既能检查单个 AOF 文件，也能接受 `appendonlydir` 目录：按 manifest 顺序检查每个 base/增量文件，`--fix` 只截断最后一个增量文件的坏尾。仍然可以对具体的 `.incr.aof`/`.base.aof` 单独执行。`appenddirname` 与 `appendfilename` 一样只能在启动配置里设置，`CONFIG GET` 可读、`CONFIG REWRITE` 会写回，但不支持 `CONFIG SET`。流的 RDB 格式没有升级，`entries-added` 与 `max-deleted-entry-id` 不写入 RDB 快照：重启后前者按当前长度恢复、后者归零；AOF（含重写）会保留这两个计数。带 TTL 的写入在 AOF 里记成普通 `SET` 加一条绝对时间的 `PEXPIREAT`，重放时不会把相对过期时间再算一遍。
+持久化使用多段 AOF（`appendonlydir`、manifest、base 与增量文件）和原有的 RDB 格式。`redis-check-aof` 既能检查单个 AOF 文件，也能接受 `appendonlydir` 目录：按 manifest 顺序检查每个 base/增量文件，`--fix` 只截断最后一个增量文件的坏尾。仍然可以对具体的 `.incr.aof`/`.base.aof` 单独执行。`appenddirname` 与 `appendfilename` 一样只能在启动配置里设置，`CONFIG GET` 可读、`CONFIG REWRITE` 会写回，但不支持 `CONFIG SET`。流的快照在 Redis 5 的 RDB 版本内用兼容扩展保存 `entries-added`、`max-deleted-entry-id` 和消费组 `entries-read`；旧版快照仍按当前长度恢复计数。AOF（含重写）继续通过 `XSETID`/`XGROUP SETID` 保留这些计数。带 TTL 的写入在 AOF 里记成普通 `SET` 加一条绝对时间的 `PEXPIREAT`，重放时不会把相对过期时间再算一遍。
 
 ## 构建
 
@@ -144,7 +144,7 @@ TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM �
 
 ## 验证
 
-在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，118 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
+在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，119 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
 
 ```bash
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe

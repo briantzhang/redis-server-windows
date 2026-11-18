@@ -91,6 +91,10 @@
 #define RDB_TYPE_HASH_ZIPLIST  13
 #define RDB_TYPE_LIST_QUICKLIST 14
 #define RDB_TYPE_STREAM_LISTPACKS 15
+/* Sentinel length used by our local stream RDB extension. It marks a pair of
+ * counters after the last stream ID or a group's last ID, followed by the real
+ * count of the field that would otherwise come next. */
+#define STREAM_RDB_EXT_MARK 0x3ffffffffffffffeULL
 /* NOTE: WHEN ADDING NEW RDB TYPE, UPDATE rdbIsObjectType() BELOW */
 
 /* Test if a type is an object type. */
