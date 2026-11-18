@@ -2382,6 +2382,7 @@ PORT_LONG listPopRangeAndReplyWithKey(client *c, robj *o, robj *key, int where, 
 void appendCommand(client *c);
 void strlenCommand(client *c);
 void lcsCommand(client *c);
+void stralgoCommand(client *c);
 void zrankCommand(client *c);
 void zrevrankCommand(client *c);
 void hsetCommand(client *c);

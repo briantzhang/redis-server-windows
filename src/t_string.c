@@ -562,6 +562,23 @@ void strlenCommand(client *c) {
  * Longest common subsequence of the two string values. With IDX the reply
  * is the flat RESP2 form of the map {"matches": [...], "len": N}; each match
  * is [[start,end],[start,end]] optionally followed by its length. */
+/* STRALGO is the Redis 6.0 name for the LCS command. The algorithm and
+ * replies are shared; only the subcommand prefix and its position differ. */
+void stralgoCommand(client *c) {
+    robj *subcommand = c->argv[1];
+    int j;
+
+    if (strcasecmp(subcommand->ptr,"LCS") != 0) {
+        addReply(c,shared.syntaxerr);
+        return;
+    }
+    for (j = 2; j < c->argc; j++) {
+        c->argv[j-1] = c->argv[j];
+    }
+    c->argc--;
+    lcsCommand(c);
+}
+
 void lcsCommand(client *c) {
     uint32_t i, j;
     PORT_LONGLONG minmatchlen = 0;

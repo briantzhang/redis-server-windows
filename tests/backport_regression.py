@@ -2635,6 +2635,22 @@ class BackportRegression(unittest.TestCase):
         with self.assertRaises(RedisError):
             self.cmd("LCS", wrong, b)
 
+    def test_stralgo_lcs_alias(self):
+        a = self.key("stralgo:a")
+        b = self.key("stralgo:b")
+        self.cmd("SET", a, "ohmytext")
+        self.cmd("SET", b, "mynewtext")
+        self.assertEqual(self.cmd("STRALGO", "LCS", a, b), b"mytext")
+        self.assertEqual(self.cmd("STRALGO", "LCS", a, b, "LEN"), 6)
+        self.assertEqual(self.cmd("STRALGO", "LCS", a, b, "IDX", "WITHMATCHLEN"), [
+            b"matches", [[[4, 7], [5, 8], 4], [[2, 3], [0, 1], 2]],
+            b"len", 6,
+        ])
+        with self.assertRaises(RedisError):
+            self.cmd("STRALGO", "NOSUCH", a, b)
+        with self.assertRaises(RedisError):
+            self.cmd("STRALGO", "LCS", a, b, "LEN", "IDX")
+
     def test_sort_ro(self):
         key = self.key("sortro")
         self.cmd("RPUSH", key, "3", "1", "2")
@@ -3642,6 +3658,54 @@ class BackportRegression(unittest.TestCase):
             self.cmd("WAITAOF", "-1", "0", "100")
         with self.assertRaises(RedisError):
             self.cmd("WAITAOF", "0", "-1", "100")
+
+    def test_wait_aof_after_multipart_rewrite(self):
+        """WAITAOF acknowledges the current incremental file before and after
+        BGREWRITEAOF rotates the manifest to a new base/incremental pair."""
+        if self.server is None:
+            self.skipTest("WAITAOF multipart tests require --server")
+        key = self.key("waitaof:key")
+        aof_dir = self.server.directory / "appendonlydir"
+        self.assertEqual(self.cmd("SET", key, b"before"), b"OK")
+        self.assertEqual(self.cmd("WAITAOF", "1", "0", "100"), [1, 0])
+
+        self.assertEqual(self.cmd("BGREWRITEAOF"),
+                         b"Background append only file rewriting started")
+        self.wait_info_field("persistence", "aof_rewrite_in_progress", "0")
+        self.assertEqual(
+            self.info_fields("persistence")["aof_last_bgrewrite_status"], "ok")
+        self.assertEqual(self.cmd("SET", key, b"after"), b"OK")
+        self.assertEqual(self.cmd("WAITAOF", "1", "0", "100"), [1, 0])
+        self.assertEqual(self.parse_aof_manifest(aof_dir / "appendonly.aof.manifest")[0][0],
+                         "appendonly.aof.2.base.aof")
+
+        # A later WAITAOF call must still target the file the server appends to.
+        self.assertEqual(self.cmd("SET", key, b"final"), b"OK")
+        self.assertEqual(self.cmd("WAITAOF", "1", "0", "100"), [1, 0])
+        self.restart()
+        self.assertEqual(self.cmd("GET", key), b"final")
+
+    def test_wait_aof_everysec_on_multipart(self):
+        """WAITAOF forces a synchronous fsync even when appendfsync is
+        everysec and the AOF lives in a multi-part directory."""
+        if self.server is None:
+            self.skipTest("WAITAOF multipart tests require --server")
+        directory = Path(self.temp.name) / "waitaof-everysec"
+        directory.mkdir()
+        server = ManagedServer(
+            self.server.executable, directory, OPTIONS.timeout,
+            OPTIONS.startup_timeout, aof=True,
+            extra_config="appendfsync everysec\n")
+        self.addCleanup(server.close)
+        server.start()
+        with RESP2("127.0.0.1", server.port, OPTIONS.timeout) as client:
+            key = self.key("waitaof:everysec")
+            self.assertEqual(client.command("SET", key, b"value"), b"OK")
+            self.assertEqual(client.command("WAITAOF", "1", "0", "100"), [1, 0])
+            self.assertEqual(client.command("CONFIG", "GET", "appendfsync"),
+                             [b"appendfsync", b"everysec"])
+            self.assertTrue((directory / "appendonlydir" /
+                             "appendonly.aof.manifest").exists())
 
     def test_wait_durability_without_appendonly(self):
         if self.server is None:

@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp46
+# Redis for Windows 5.0.14.1-bp48
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp46`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp48`。
 
 ## 这个版本新增了什么
 
@@ -12,6 +12,7 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `SET key value [NX\|XX] [GET] [EX\|PX\|EXAT\|PXAT time\|KEEPTTL]` | 6.0 / 6.2；NX+GET 取自 7.0 | 覆盖时可保留原 TTL，可原子返回旧值，可按绝对时间过期 |
 | `GETEX key [EX\|PX\|EXAT\|PXAT time\|PERSIST]` | 6.2 | 原子读取并更新或去掉 TTL；不带选项时不改 TTL |
 | `GETDEL key` | 6.2 | 原子读取并删除字符串 |
+| `STRALGO LCS ...` | 6.0 | `LCS` 的旧命令别名，参数和回复与 `LCS` 一致 |
 | `EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT` 的 `NX\|XX\|GT\|LT` | 7.0 | 按条件更新 TTL；允许 XX+GT、XX+LT，拒绝冲突组合 |
 | `EXPIRETIME key` / `PEXPIRETIME key` | 7.0 | 查询绝对过期时间；键不存在返回 -2，没有 TTL 返回 -1 |
 | `SMISMEMBER key member [member ...]` | 6.2 | 一次判断多个集合成员 |
@@ -143,7 +144,7 @@ TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM �
 
 ## 验证
 
-在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，115 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
+在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，118 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
 
 ```bash
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe

@@ -3276,11 +3276,16 @@ void waitaofCommand(client *c) {
     }
 
     if (numlocal > 0) {
+        /* The manifest may be rebuilt by a concurrent rewrite between two
+         * WAITAOF calls. The fd recorded in the server state always points at
+         * the file that receives new writes, whether that is the current
+         * incremental file or a legacy single AOF. */
         flushAppendOnlyFile(1);
-        if (redis_fsync(server.aof_fd) == -1) {
+        if (server.aof_fd == -1 || redis_fsync(server.aof_fd) == -1) {
             addReplyError(c,"Error trying to fsync the AOF file");
             return;
         }
+        server.aof_fsync_offset = server.aof_current_size;
         acked_local = 1;
     }
 

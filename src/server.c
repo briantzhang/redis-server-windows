@@ -345,6 +345,7 @@ struct redisCommand redisCommandTable[] = {
     {"bitcount",bitcountCommand,-2,"r",0,NULL,1,1,1,0,0},
     {"bitpos",bitposCommand,-3,"r",0,NULL,1,1,1,0,0},
     {"lcs",lcsCommand,-3,"r",0,NULL,1,1,1,0,0},
+    {"stralgo",stralgoCommand,-4,"r",0,NULL,2,2,1,0,0},
     {"wait",waitCommand,3,"s",0,NULL,0,0,0,0,0},
     {"waitaof",waitaofCommand,4,"s",0,NULL,0,0,0,0,0},
     {"command",commandCommand,0,"ltR",0,NULL,0,0,0,0,0},
