@@ -2238,6 +2238,25 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("LPUSH", key, "v"), 1)
         self.assertEqual(blocked._read(), [key, b"v"])
 
+    def test_rdb_version_10_payload(self):
+        if self.server is None:
+            self.skipTest("RDB tests require --server")
+        key = self.key("rdb:version:10")
+        self.cmd("SET", key, "v")
+        self.assertEqual(self.cmd("SAVE"), b"OK")
+        rdb_path = Path(self.server.directory) / "dump.rdb"
+        with rdb_path.open("rb") as f:
+            magic = f.read(9)
+        self.assertEqual(magic, b"REDIS0010")
+
+        payload = self.cmd("DUMP", key)
+        self.assertEqual(len(payload), 13)  # value, version 10, checksum
+        self.assertEqual(payload[2:3], b"v")
+        self.assertEqual(payload[3:5], struct.pack("<H", 10))
+        self.assertEqual(self.cmd("DEL", key), 1)
+        self.assertEqual(self.cmd("RESTORE", key, "0", payload), b"OK")
+        self.assertEqual(self.cmd("GET", key), b"v")
+
     def test_stream_xtrim_minid_and_limit(self):
         key = self.key("xtrim:minid")
         for ms in range(1, 7):
