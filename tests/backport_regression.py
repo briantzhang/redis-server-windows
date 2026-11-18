@@ -3781,6 +3781,35 @@ class BackportRegression(unittest.TestCase):
         with self.assertRaises(RedisError):
             self.cmd("ACL", "WHOAMI", "extra")
 
+    def test_client_info_protocol_and_tracking_fields(self):
+        if self.server is None:
+            self.skipTest("client tests require --server")
+        info = self.cmd("CLIENT", "INFO")
+        for field in (b"redir=-1", b"resp=2"):
+            self.assertIn(field, info)
+
+        other = self.connect()
+        self.addCleanup(other.close)
+        other_id = other.command("CLIENT", "ID")
+        self.assertEqual(
+            other.command("CLIENT", "TRACKING", "ON", "REDIRECT", self.cmd("CLIENT", "ID")),
+            b"OK",
+        )
+        info = self.cmd("CLIENT", "LIST")
+        line = None
+        for candidate in info.splitlines():
+            if b"id=%d " % other_id in candidate:
+                line = candidate
+                break
+        self.assertIsNotNone(line, info)
+        self.assertIn(b"redir=%d" % self.cmd("CLIENT", "ID"), line)
+        self.assertIn(b"flags=", line)
+
+        # RESP3 connections report their negotiated protocol version.
+        with self.connect() as resp3:
+            self.assertEqual(resp3.command("HELLO", "3")[0][0], b"server")
+            self.assertIn(b"resp=3", resp3.command("CLIENT", "INFO"))
+
     def test_client_kill_options_and_list_fields(self):
         if self.server is None:
             self.skipTest("CLIENT tests require --server")

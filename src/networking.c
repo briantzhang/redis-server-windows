@@ -2116,7 +2116,7 @@ sds catClientInfoString(sds s, client *client) {
     if (emask & AE_WRITABLE) *p++ = 'w';
     *p = '\0';
     return sdscatfmt(s,
-        "id=%U addr=%s laddr=%s fd=%i name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i ssub=%i multi=%i qbuf=%U qbuf-free=%U qbuf-mem=%U argv-mem=%U obl=%U oll=%U omem=%U tot-mem=%U events=%s cmd=%s user=%s lib-name=%s lib-ver=%s tot-net-in=%U tot-net-out=%U",
+        "id=%U addr=%s laddr=%s fd=%i name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i ssub=%i multi=%i qbuf=%U qbuf-free=%U qbuf-mem=%U argv-mem=%U obl=%U oll=%U omem=%U tot-mem=%U events=%s cmd=%s user=%s redir=%I resp=%i lib-name=%s lib-ver=%s tot-net-in=%U tot-net-out=%U",
         (PORT_ULONGLONG) client->id,
         getClientPeerId(client),
         laddr,
@@ -2141,6 +2141,8 @@ sds catClientInfoString(sds s, client *client) {
         events,
         client->lastcmd ? client->lastcmd->name : "NULL",
         client->user ? ACLUserName(client->user) : "",
+        (client->flags & CLIENT_TRACKING) ? (PORT_LONGLONG)client->client_tracking_redirection : -1,
+        client->resp,
         client->lib_name ? client->lib_name : "",
         client->lib_ver ? client->lib_ver : "",
         client->net_in_bytes,
