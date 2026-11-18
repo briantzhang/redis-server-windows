@@ -13,6 +13,8 @@
 
 static SSL_CTX *tls_ctx = NULL;
 static SSL_CTX *tls_client_ctx = NULL;
+static SSL_CTX *tls_cluster_ctx = NULL;
+static char tls_config_error[256];
 
 static int tlsEnsureHandshake(client *c);
 static int tlsFlush(client *c);
@@ -28,64 +30,200 @@ static void tlsLogError(const char *what) {
     }
 }
 
-int tlsInit(void) {
-    if (tls_ctx) return C_OK;
-    if (server.tls_cert_file == NULL || server.tls_key_file == NULL) {
-        serverLog(LL_WARNING, "TLS enabled but tls-cert-file or tls-key-file is missing");
-        return C_ERR;
-    }
+const char *tlsLastConfigError(void) {
+    return tls_config_error[0] ? tls_config_error : "Invalid TLS configuration";
+}
 
-    tls_ctx = SSL_CTX_new(TLS_server_method());
-    if (!tls_ctx) {
-        tlsLogError("SSL_CTX_new");
-        return C_ERR;
-    }
-    SSL_CTX_set_min_proto_version(tls_ctx, TLS1_2_VERSION);
-    SSL_CTX_set_mode(tls_ctx,
-        SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    SSL_CTX_set_session_cache_mode(tls_ctx, SSL_SESS_CACHE_SERVER);
+static void tlsSetConfigError(const char *what, const char *value) {
+    if (value)
+        snprintf(tls_config_error,sizeof(tls_config_error),"%s: %s",what,value);
+    else
+        snprintf(tls_config_error,sizeof(tls_config_error),"%s",what);
+}
 
-    if (SSL_CTX_use_certificate_chain_file(tls_ctx, server.tls_cert_file) != 1) {
-        tlsLogError("SSL_CTX_use_certificate_chain_file");
-        SSL_CTX_free(tls_ctx);
-        tls_ctx = NULL;
-        return C_ERR;
-    }
-    if (SSL_CTX_use_PrivateKey_file(tls_ctx, server.tls_key_file,
-                                    SSL_FILETYPE_PEM) != 1) {
-        tlsLogError("SSL_CTX_use_PrivateKey_file");
-        SSL_CTX_free(tls_ctx);
-        tls_ctx = NULL;
-        return C_ERR;
-    }
-    if (SSL_CTX_check_private_key(tls_ctx) != 1) {
-        tlsLogError("SSL_CTX_check_private_key");
-        SSL_CTX_free(tls_ctx);
-        tls_ctx = NULL;
-        return C_ERR;
-    }
+/* Apply tls-protocols, tls-ciphers, tls-ciphersuites and the related options
+ * to a fresh SSL_CTX. Returns C_ERR with tls_config_error set when a value
+ * cannot be applied, so CONFIG SET can reject it and keep the old one. */
+static int tlsApplySettings(SSL_CTX *ctx, int is_server) {
+    if (server.tls_protocols && server.tls_protocols[0]) {
+        sds *tokens;
+        int count, j, min = 0, max = 0;
 
-    if (server.tls_ca_cert_file || server.tls_ca_cert_dir) {
-        if (SSL_CTX_load_verify_locations(tls_ctx,
-                server.tls_ca_cert_file, server.tls_ca_cert_dir) != 1)
+        tokens = sdssplitlen(server.tls_protocols,
+                             (int)strlen(server.tls_protocols)," ",1,&count);
+        for (j = 0; j < count; j++) {
+            int version;
+
+            if (!strcasecmp(tokens[j],"TLSv1")) version = TLS1_VERSION;
+            else if (!strcasecmp(tokens[j],"TLSv1.1")) version = TLS1_1_VERSION;
+            else if (!strcasecmp(tokens[j],"TLSv1.2")) version = TLS1_2_VERSION;
+            else if (!strcasecmp(tokens[j],"TLSv1.3")) version = TLS1_3_VERSION;
+            else {
+                tlsSetConfigError("Invalid tls-protocols value",tokens[j]);
+                sdsfreesplitres(tokens,count);
+                return C_ERR;
+            }
+            if (!min || version < min) min = version;
+            if (version > max) max = version;
+        }
+        sdsfreesplitres(tokens,count);
+        if (SSL_CTX_set_min_proto_version(ctx,min) != 1 ||
+            SSL_CTX_set_max_proto_version(ctx,max) != 1)
         {
-            tlsLogError("SSL_CTX_load_verify_locations");
-            SSL_CTX_free(tls_ctx);
-            tls_ctx = NULL;
+            tlsSetConfigError("Unsupported tls-protocols value",
+                              server.tls_protocols);
             return C_ERR;
         }
-        SSL_CTX_set_verify(tls_ctx,
-            server.tls_auth_clients ?
-                SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT :
-                SSL_VERIFY_NONE, NULL);
-    } else if (server.tls_auth_clients) {
-        serverLog(LL_WARNING,
-            "tls-auth-clients yes requires tls-ca-cert-file or tls-ca-cert-dir");
-        SSL_CTX_free(tls_ctx);
-        tls_ctx = NULL;
+    } else {
+        /* Historical floor of this port: TLS 1.2 unless configured. */
+        SSL_CTX_set_min_proto_version(ctx,TLS1_2_VERSION);
+    }
+
+    if (server.tls_ciphers && server.tls_ciphers[0] &&
+        SSL_CTX_set_cipher_list(ctx,server.tls_ciphers) != 1)
+    {
+        tlsSetConfigError("Invalid tls-ciphers value",server.tls_ciphers);
+        return C_ERR;
+    }
+    if (server.tls_ciphersuites && server.tls_ciphersuites[0] &&
+        SSL_CTX_set_ciphersuites(ctx,server.tls_ciphersuites) != 1)
+    {
+        tlsSetConfigError("Invalid tls-ciphersuites value",
+                          server.tls_ciphersuites);
         return C_ERR;
     }
 
+    if (is_server && server.tls_prefer_server_ciphers)
+        SSL_CTX_set_options(ctx,SSL_OP_CIPHER_SERVER_PREFERENCE);
+    else
+        SSL_CTX_clear_options(ctx,SSL_OP_CIPHER_SERVER_PREFERENCE);
+
+    SSL_CTX_set_session_cache_mode(ctx,server.tls_session_caching ?
+        (is_server ? SSL_SESS_CACHE_SERVER : SSL_SESS_CACHE_CLIENT) :
+        SSL_SESS_CACHE_OFF);
+    SSL_CTX_set_mode(ctx,
+        SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    return C_OK;
+}
+
+static SSL_CTX *tlsBuildServerCtx(void) {
+    SSL_CTX *ctx;
+
+    if (server.tls_cert_file == NULL || server.tls_key_file == NULL) {
+        tlsSetConfigError("tls-cert-file and tls-key-file are required",NULL);
+        return NULL;
+    }
+    ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) {
+        tlsLogError("SSL_CTX_new");
+        tlsSetConfigError("Cannot create TLS context",NULL);
+        return NULL;
+    }
+    if (tlsApplySettings(ctx,1) == C_ERR) {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    if (SSL_CTX_use_certificate_chain_file(ctx,server.tls_cert_file) != 1) {
+        tlsLogError("SSL_CTX_use_certificate_chain_file");
+        tlsSetConfigError("Cannot load tls-cert-file",server.tls_cert_file);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    if (SSL_CTX_use_PrivateKey_file(ctx,server.tls_key_file,
+                                    SSL_FILETYPE_PEM) != 1) {
+        tlsLogError("SSL_CTX_use_PrivateKey_file");
+        tlsSetConfigError("Cannot load tls-key-file",server.tls_key_file);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    if (SSL_CTX_check_private_key(ctx) != 1) {
+        tlsLogError("SSL_CTX_check_private_key");
+        tlsSetConfigError("tls-key-file does not match tls-cert-file",NULL);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    if (server.tls_auth_clients != TLS_CLIENT_AUTH_NO &&
+        !(server.tls_ca_cert_file || server.tls_ca_cert_dir))
+    {
+        tlsSetConfigError(
+            "tls-auth-clients yes or optional requires "
+            "tls-ca-cert-file or tls-ca-cert-dir",NULL);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    if (server.tls_ca_cert_file || server.tls_ca_cert_dir) {
+        if (SSL_CTX_load_verify_locations(ctx,server.tls_ca_cert_file,
+                server.tls_ca_cert_dir) != 1)
+        {
+            tlsLogError("SSL_CTX_load_verify_locations");
+            tlsSetConfigError("Cannot load TLS CA certificate",NULL);
+            SSL_CTX_free(ctx);
+            return NULL;
+        }
+    }
+    if (server.tls_auth_clients == TLS_CLIENT_AUTH_YES) {
+        /* Every client must present a certificate signed by our CA. */
+        SSL_CTX_set_verify(ctx,
+            SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,NULL);
+    } else if (server.tls_auth_clients == TLS_CLIENT_AUTH_OPTIONAL) {
+        /* Request a certificate: a bad one fails the handshake, while a client
+         * without a certificate is still accepted. */
+        SSL_CTX_set_verify(ctx,SSL_VERIFY_PEER,NULL);
+    } else {
+        SSL_CTX_set_verify(ctx,SSL_VERIFY_NONE,NULL);
+    }
+    return ctx;
+}
+
+int tlsInit(void) {
+    if (tls_ctx) return C_OK;
+    tls_ctx = tlsBuildServerCtx();
+    if (!tls_ctx) {
+        serverLog(LL_WARNING,"TLS configuration failed: %s",
+                  tlsLastConfigError());
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+/* Rebuild the contexts after CONFIG SET changed a TLS option. Existing SSL
+ * objects hold their own reference to the old context, so live connections
+ * keep working and only new ones pick up the new settings. */
+int tlsApplyConfig(void) {
+    SSL_CTX *new_ctx = NULL;
+
+    tls_config_error[0] = '\0';
+    if (tls_ctx) {
+        new_ctx = tlsBuildServerCtx();
+        if (!new_ctx) return C_ERR;
+    } else {
+        /* TLS is not listening: still validate the values on a throwaway
+         * context so a typo is reported now and not at the next restart. */
+        SSL_CTX *probe = SSL_CTX_new(TLS_server_method());
+        int ok = probe != NULL && tlsApplySettings(probe,1) == C_OK;
+
+        SSL_CTX_free(probe);
+        if (!ok) {
+            if (tls_config_error[0] == '\0')
+                tlsSetConfigError("Cannot create TLS context",NULL);
+            return C_ERR;
+        }
+    }
+    if (new_ctx) {
+        SSL_CTX *old = tls_ctx;
+        tls_ctx = new_ctx;
+        SSL_CTX_free(old);
+    }
+    if (tls_client_ctx) {
+        SSL_CTX *old = tls_client_ctx;
+        tls_client_ctx = NULL;   /* Rebuilt lazily with the new settings. */
+        SSL_CTX_free(old);
+    }
+    if (tls_cluster_ctx) {
+        SSL_CTX *old = tls_cluster_ctx;
+        tls_cluster_ctx = NULL;  /* Rebuilt lazily with the new settings. */
+        SSL_CTX_free(old);
+    }
     return C_OK;
 }
 
@@ -97,6 +235,10 @@ void tlsCleanup(void) {
     if (tls_client_ctx) {
         SSL_CTX_free(tls_client_ctx);
         tls_client_ctx = NULL;
+    }
+    if (tls_cluster_ctx) {
+        SSL_CTX_free(tls_cluster_ctx);
+        tls_cluster_ctx = NULL;
     }
 }
 
@@ -471,9 +613,12 @@ static SSL_CTX *tlsGetClientCtx(void) {
         tlsLogError("SSL_CTX_new client");
         return NULL;
     }
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_mode(ctx,
-        SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    if (tlsApplySettings(ctx,0) == C_ERR) {
+        serverLog(LL_WARNING,"TLS client configuration failed: %s",
+                  tlsLastConfigError());
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
 
     if (server.tls_cert_file || server.tls_key_file) {
         if (!server.tls_cert_file || !server.tls_key_file) {
@@ -717,4 +862,291 @@ void tlsReplCleanup(void) {
         repl_outbuf = NULL;
     }
     repl_fd = -1;
+}
+
+/* -----------------------------------------------------------------------------
+ * Cluster bus TLS (tls-cluster yes)
+ *
+ * Cluster links live in the event loop, so unlike the client and replication
+ * paths every operation here is non-blocking. Ciphertext produced by OpenSSL
+ * is queued in st->outbuf and flushed with write(); the cluster code registers
+ * a writable event when the socket is not ready.
+ * -------------------------------------------------------------------------- */
+
+static void tlsClusterAppendOut(tlsLinkState *st, const char *buf, int len) {
+    if (len <= 0) return;
+    if (st->outbuf == NULL) st->outbuf = sdsempty();
+    st->outbuf = sdscatlen(st->outbuf, buf, len);
+}
+
+static int tlsClusterDrainWbio(tlsLinkState *st) {
+    char buf[16384];
+
+    while (BIO_ctrl_pending((BIO*)st->wbio) > 0) {
+        int n = BIO_read((BIO*)st->wbio, buf, sizeof(buf));
+        if (n <= 0) break;
+        tlsClusterAppendOut(st, buf, n);
+    }
+    return C_OK;
+}
+
+/* Every cluster node must present a certificate signed by the shared CA, so
+ * the cluster bus uses its own server context regardless of tls-auth-clients:
+ * that option describes regular clients, not other cluster nodes. */
+static SSL_CTX *tlsGetClusterServerCtx(void) {
+    SSL_CTX *ctx;
+
+    if (tls_cluster_ctx) return tls_cluster_ctx;
+    if (!server.tls_cert_file || !server.tls_key_file) {
+        serverLog(LL_WARNING,
+            "tls-cluster requires tls-cert-file and tls-key-file");
+        return NULL;
+    }
+    if (!server.tls_ca_cert_file && !server.tls_ca_cert_dir) {
+        serverLog(LL_WARNING,
+            "tls-cluster requires tls-ca-cert-file or tls-ca-cert-dir");
+        return NULL;
+    }
+    ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) {
+        tlsLogError("SSL_CTX_new cluster");
+        return NULL;
+    }
+    if (tlsApplySettings(ctx,1) == C_ERR ||
+        SSL_CTX_use_certificate_chain_file(ctx,server.tls_cert_file) != 1 ||
+        SSL_CTX_use_PrivateKey_file(ctx,server.tls_key_file,
+                                    SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_check_private_key(ctx) != 1 ||
+        SSL_CTX_load_verify_locations(ctx,server.tls_ca_cert_file,
+                                      server.tls_ca_cert_dir) != 1)
+    {
+        tlsLogError("TLS cluster context");
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    SSL_CTX_set_verify(ctx,SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT,NULL);
+    tls_cluster_ctx = ctx;
+    return ctx;
+}
+
+int tlsClusterLinkInit(tlsLinkState *st, int is_server) {
+    SSL_CTX *ctx = is_server ? tlsGetClusterServerCtx() : tlsGetClientCtx();
+    SSL *ssl;
+    BIO *rbio, *wbio;
+
+    memset(st, 0, sizeof(*st));
+    if (!ctx) return C_ERR;
+    ssl = SSL_new(ctx);
+    if (!ssl) {
+        tlsLogError("SSL_new cluster link");
+        return C_ERR;
+    }
+    rbio = BIO_new(BIO_s_mem());
+    wbio = BIO_new(BIO_s_mem());
+    if (!rbio || !wbio) {
+        BIO_free(rbio);
+        BIO_free(wbio);
+        SSL_free(ssl);
+        tlsLogError("BIO_new cluster link");
+        return C_ERR;
+    }
+    BIO_set_mem_eof_return(rbio, -1);
+    SSL_set_bio(ssl, rbio, wbio);
+    if (is_server)
+        SSL_set_accept_state(ssl);
+    else
+        SSL_set_connect_state(ssl);
+    st->ssl = ssl;
+    st->rbio = rbio;
+    st->wbio = wbio;
+    st->handshaking = 1;
+    return C_OK;
+}
+
+void tlsClusterLinkFree(tlsLinkState *st) {
+    if (st->ssl) {
+        SSL_free((SSL*)st->ssl);  /* Frees both memory BIOs. */
+        st->ssl = NULL;
+    }
+    if (st->outbuf) {
+        sdsfree(st->outbuf);
+        st->outbuf = NULL;
+    }
+    st->rbio = st->wbio = NULL;
+    st->handshaking = 0;
+}
+
+int tlsClusterPendingOut(tlsLinkState *st) {
+    if (st->outbuf == NULL) return 0;
+    return (int)sdslen(st->outbuf);
+}
+
+/* Write queued ciphertext. Returns 1 when everything reached the socket, 0
+ * when the socket would block (a writable event must be registered) and -1 on
+ * a fatal error. */
+int tlsClusterFlush(tlsLinkState *st, int fd) {
+    while (st->outbuf && sdslen(st->outbuf) > 0) {
+        int n = (int)write(fd, st->outbuf, sdslen(st->outbuf));
+        if (n > 0) {
+            sdsrange(st->outbuf, n, -1);
+            if (sdslen(st->outbuf) == 0) {
+                sdsfree(st->outbuf);
+                st->outbuf = NULL;
+            }
+            continue;
+        }
+        if (n == -1 && (errno == EAGAIN || errno == WSAEWOULDBLOCK)) return 0;
+        return -1;
+    }
+    return 1;
+}
+
+/* Feed encrypted bytes from the socket into the read BIO.
+ * Returns 1 for data, 0 for EOF, 2 for "would block" and -1 on error. */
+static int tlsClusterReadRaw(tlsLinkState *st, int fd) {
+    char buf[16384];
+    int n = (int)read(fd, buf, sizeof(buf));
+
+    if (n > 0) {
+        if (BIO_write((BIO*)st->rbio, buf, n) != n) {
+            errno = ECONNRESET;
+            return -1;
+        }
+        return 1;
+    }
+    if (n == 0) return 0;
+    if (errno == EAGAIN || errno == WSAEWOULDBLOCK) return 2;
+    return -1;
+}
+
+/* Drive the handshake. Returns 1 when complete, 0 when more I/O is needed
+ * (check tlsClusterPendingOut() and register a writable event if non-zero),
+ * and -1 on a fatal error. */
+int tlsClusterHandshake(tlsLinkState *st, int fd) {
+    SSL *ssl = (SSL*)st->ssl;
+    int ret, err;
+
+    if (!ssl) return -1;
+    if (!st->handshaking) return 1;
+    for (;;) {
+        ERR_clear_error();
+        ret = SSL_do_handshake(ssl);
+        tlsClusterDrainWbio(st);
+        if (tlsClusterFlush(st, fd) < 0) return -1;
+        if (ret == 1) {
+            st->handshaking = 0;
+            return 1;
+        }
+        err = SSL_get_error(ssl, ret);
+        if (err == SSL_ERROR_WANT_READ) {
+            int raw = tlsClusterReadRaw(st, fd);
+            if (raw == 1) continue;
+            if (raw == 2) return 0;
+            return -1;
+        }
+        if (err == SSL_ERROR_WANT_WRITE) {
+            if (tlsClusterFlush(st, fd) == 0) return 0;
+            continue;
+        }
+        tlsLogError("TLS cluster handshake");
+        return -1;
+    }
+}
+
+/* Encrypt and write plaintext. Returns the number of plaintext bytes consumed
+ * (which may be less than len, or zero when the socket is not writable yet) or
+ * -1 on a fatal error. */
+int tlsClusterWrite(tlsLinkState *st, int fd, const void *buf, size_t len) {
+    SSL *ssl = (SSL*)st->ssl;
+    int ret, err;
+
+    if (!ssl) {
+        errno = ECONNRESET;
+        return -1;
+    }
+    if (st->handshaking) {
+        int hs = tlsClusterHandshake(st, fd);
+        if (hs < 0) return -1;
+        if (hs == 0) return 0;
+    }
+    if (tlsClusterPendingOut(st) && tlsClusterFlush(st, fd) != 1)
+        return (errno == EAGAIN || errno == WSAEWOULDBLOCK) ? 0 : -1;
+    if (len == 0) return 0;
+
+    for (;;) {
+        ERR_clear_error();
+        ret = SSL_write(ssl, buf, len);
+        tlsClusterDrainWbio(st);
+        if (tlsClusterFlush(st, fd) < 0) return -1;
+        if (ret > 0) return ret;
+        err = SSL_get_error(ssl, ret);
+        if (err == SSL_ERROR_WANT_WRITE) return 0;
+        if (err == SSL_ERROR_WANT_READ) {
+            int raw = tlsClusterReadRaw(st, fd);
+            if (raw == 1) continue;
+            if (raw == 2) return 0;
+        }
+        tlsLogError("SSL_write cluster link");
+        return -1;
+    }
+}
+
+/* Read plaintext. Returns bytes read, 0 on EOF, or -1 with errno set to
+ * EAGAIN when no complete plaintext is available yet. */
+ssize_t tlsClusterRead(tlsLinkState *st, int fd, void *buf, size_t len) {
+    SSL *ssl = (SSL*)st->ssl;
+    int ret, err, raw = 0;
+
+    if (!ssl) {
+        errno = ECONNRESET;
+        return -1;
+    }
+    if (st->handshaking) {
+        int hs = tlsClusterHandshake(st, fd);
+        if (hs < 0) {
+            errno = ECONNRESET;
+            return -1;
+        }
+        if (hs == 0) {
+            errno = EAGAIN;
+            return -1;
+        }
+    }
+    if (len == 0) return 0;
+
+    for (;;) {
+        ERR_clear_error();
+        ret = SSL_read(ssl, buf, len);
+        tlsClusterDrainWbio(st);
+        if (tlsClusterFlush(st, fd) < 0) {
+            errno = ECONNRESET;
+            return -1;
+        }
+        if (ret > 0) return ret;
+        err = SSL_get_error(ssl, ret);
+        if (err == SSL_ERROR_WANT_READ) {
+            if (raw) {
+                errno = EAGAIN;
+                return -1;
+            }
+            raw = tlsClusterReadRaw(st, fd);
+            if (raw == 1) continue;
+            if (raw == 2) {
+                errno = EAGAIN;
+                return -1;
+            }
+            return 0; /* Orderly shutdown. */
+        }
+        if (err == SSL_ERROR_WANT_WRITE) {
+            if (tlsClusterFlush(st, fd) == 0) {
+                errno = EAGAIN;
+                return -1;
+            }
+            continue;
+        }
+        if (err == SSL_ERROR_ZERO_RETURN) return 0;
+        tlsLogError("SSL_read cluster link");
+        errno = ECONNRESET;
+        return -1;
+    }
 }

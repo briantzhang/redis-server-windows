@@ -136,6 +136,8 @@ client *createClient(int fd) {
     c->multibulklen = 0;
     c->bulklen = -1;
     c->sentlen = 0;
+    c->net_in_bytes = 0;
+    c->net_out_bytes = 0;
     c->flags = 0;
     c->tls_ssl = NULL;
     c->tls_handshaking = 0;
@@ -147,6 +149,8 @@ client *createClient(int fd) {
     c->user = server.requirepass ? NULL : ACLDefaultUser();
     c->replstate = REPL_STATE_NONE;
     c->repl_put_online_on_ack = 0;
+    c->repldbfd = -1;
+    c->repl_chunk = NULL;
     c->reploff = 0;
     c->read_reploff = 0;
     c->repl_ack_off = 0;
@@ -492,12 +496,16 @@ void *addDeferredMultiBulkLength(client *c) {
     return listLast(c->reply);
 }
 
-/* Populate the length object and try gluing it to the next chunk. */
-void setDeferredMultiBulkLength(client *c, void *node, PORT_LONG length) {
+/* Populate a deferred aggregate length object and try gluing it to the next
+ * chunk. `prefix` is '*' for an array or '%' for a RESP3 map; the caller is
+ * responsible for passing the element count appropriate to the protocol. */
+static void setDeferredAggregateLen(client *c, void *node, PORT_LONG length,
+                                    char prefix)
+{
     listNode *ln = (listNode*)node;
     clientReplyBlock *next;
     char lenstr[128];
-    size_t lenstr_len = sprintf(lenstr, "*%ld\r\n", length);
+    size_t lenstr_len = sprintf(lenstr, "%c%ld\r\n", prefix, length);
 
     /* Abort when *node is NULL: when the client should not accept writes
      * we return NULL in addDeferredMultiBulkLength() */
@@ -532,6 +540,20 @@ void setDeferredMultiBulkLength(client *c, void *node, PORT_LONG length) {
         c->reply_bytes += buf->size;
     }
     asyncCloseClientOnOutputBufferLimitReached(c);
+}
+
+void setDeferredMultiBulkLength(client *c, void *node, PORT_LONG length) {
+    setDeferredAggregateLen(c,node,length,'*');
+}
+
+/* Deferred map length: RESP3 gets '%<pairs>' while RESP2 keeps the flat
+ * array of 2*pairs elements. Use it when the number of fields is not known
+ * until after they have been emitted. */
+void setDeferredMapLength(client *c, void *node, PORT_LONG length) {
+    if (c->resp == 3)
+        setDeferredAggregateLen(c,node,length,'%');
+    else
+        setDeferredAggregateLen(c,node,length*2,'*');
 }
 
 /* Add a double as a bulk reply */
@@ -1109,15 +1131,29 @@ void freeClient(client *c) {
     /* Master/slave cleanup Case 1:
      * we lost the connection with a slave. */
     if (c->flags & CLIENT_SLAVE) {
-        if (c->replstate == SLAVE_STATE_SEND_BULK) {
+        /* A diskless TLS transfer keeps its relay socket open while the slave
+         * may already be WAIT_BGSAVE_END or ONLINE, so the descriptor itself
+         * is the reliable sign that there is something to release. */
+        if (c->replstate == SLAVE_STATE_SEND_BULK || c->repldbfd != -1) {
 #ifdef _WIN32
-            if (c->repldbfd != -1) {
+            if (c->repldbfd != -1 && c->replstate == SLAVE_STATE_SEND_BULK) {
                 DeleteFileA(c->replFileCopy);
                 memset(c->replFileCopy, 0, MAX_PATH);
             }
 #endif
-            if (c->repldbfd != -1) close(c->repldbfd);
-            if (c->replpreamble) sdsfree(c->replpreamble);
+            if (c->repldbfd != -1) {
+                aeDeleteFileEvent(server.el,c->repldbfd,AE_READABLE);
+                close(c->repldbfd);
+                c->repldbfd = -1;
+            }
+            if (c->replpreamble) {
+                sdsfree(c->replpreamble);
+                c->replpreamble = NULL;
+            }
+        }
+        if (c->repl_chunk) {
+            sdsfree(c->repl_chunk);
+            c->repl_chunk = NULL;
         }
         list *l = (c->flags & CLIENT_MONITOR) ? server.monitors : server.slaves;
         ln = listSearchKey(l,c);
@@ -1311,6 +1347,7 @@ int writeToClient(int fd, client *c, int handler_installed) {
             !(c->flags & CLIENT_SLAVE)) break;
     }
     server.stat_net_output_bytes += totwritten;
+    c->net_out_bytes += totwritten;
     if (nwritten == -1) {
         if (errno == EAGAIN) {
             nwritten = 0;
@@ -1923,6 +1960,7 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     c->lastinteraction = server.unixtime;
     if (c->flags & CLIENT_MASTER) c->read_reploff += nread;
     server.stat_net_input_bytes += nread;
+    c->net_in_bytes += nread;
     if (sdslen(c->querybuf) > server.client_max_querybuf_len) {
         sds ci = catClientInfoString(sdsempty(),c), bytes = sdsempty();
 
@@ -2039,7 +2077,7 @@ sds catClientInfoString(sds s, client *client) {
     if (emask & AE_WRITABLE) *p++ = 'w';
     *p = '\0';
     return sdscatfmt(s,
-        "id=%U addr=%s laddr=%s fd=%i name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i ssub=%i multi=%i qbuf=%U qbuf-free=%U obl=%U oll=%U omem=%U events=%s cmd=%s user=%s lib-name=%s lib-ver=%s",
+        "id=%U addr=%s laddr=%s fd=%i name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i ssub=%i multi=%i qbuf=%U qbuf-free=%U obl=%U oll=%U omem=%U events=%s cmd=%s user=%s lib-name=%s lib-ver=%s tot-net-in=%U tot-net-out=%U",
         (PORT_ULONGLONG) client->id,
         getClientPeerId(client),
         laddr,
@@ -2062,7 +2100,9 @@ sds catClientInfoString(sds s, client *client) {
         client->lastcmd ? client->lastcmd->name : "NULL",
         client->user ? ACLUserName(client->user) : "",
         client->lib_name ? client->lib_name : "",
-        client->lib_ver ? client->lib_ver : "");
+        client->lib_ver ? client->lib_ver : "",
+        client->net_in_bytes,
+        client->net_out_bytes);
 }
 
 sds getAllClientsInfoString(int type) {

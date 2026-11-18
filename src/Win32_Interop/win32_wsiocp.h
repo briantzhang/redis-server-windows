@@ -80,6 +80,7 @@ void           WSIOCP_Init(HANDLE iocp);
 void           WSIOCP_Cleanup();
 iocpSockState* WSIOCP_GetExistingSocketState(int fd);
 iocpSockState* WSIOCP_GetSocketState(int fd);
+int            WSIOCP_SocketAttach(int fd, iocpSockState *socketState);
 BOOL           WSIOCP_CloseSocketState(iocpSockState* pSocketState);
 BOOL           WSIOCP_CloseSocketStateRFD(int rfd);
 

@@ -30,6 +30,7 @@
 
 #include "server.h"
 #include "cluster.h"
+#include "tls.h"
 #include "endianconv.h"
 
 #include <sys/types.h>
@@ -56,6 +57,7 @@ clusterNode *createClusterNode(char *nodename, int flags);
 int clusterAddNode(clusterNode *node);
 void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void clusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+void clusterWriteHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void clusterSendPing(clusterLink *link, int type);
 void clusterSendFail(char *nodename);
 void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request);
@@ -459,8 +461,18 @@ void clusterUpdateMyselfFlags(void) {
     int oldflags = myself->flags;
     int nofailover = server.cluster_slave_no_failover ?
                      CLUSTER_NODE_NOFAILOVER : 0;
-    myself->flags &= ~CLUSTER_NODE_NOFAILOVER;
-    myself->flags |= nofailover;
+    int noannounce = (nodeIsSlave(myself) && !server.replica_announced) ?
+                     CLUSTER_NODE_NOANNOUNCE : 0;
+
+    myself->flags &= ~(CLUSTER_NODE_NOFAILOVER|CLUSTER_NODE_NOANNOUNCE);
+    myself->flags |= nofailover|noannounce;
+
+    /* Keep our own hostname in sync with cluster-announce-hostname. */
+    memset(myself->hostname,0,sizeof(myself->hostname));
+    if (server.cluster_announce_hostname) {
+        strncpy(myself->hostname,server.cluster_announce_hostname,
+                sizeof(myself->hostname)-1);
+    }
     if (myself->flags != oldflags) {
         clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
                              CLUSTER_TODO_UPDATE_STATE);
@@ -479,6 +491,7 @@ void clusterInit(void) {
     server.cluster->nodes = dictCreate(&clusterNodesDictType,NULL);
     server.cluster->nodes_black_list =
         dictCreate(&clusterNodesBlackListDictType,NULL);
+    server.cluster->links = listCreate();
     server.cluster->failover_auth_time = 0;
     server.cluster->failover_auth_count = 0;
     server.cluster->failover_auth_rank = 0;
@@ -637,6 +650,13 @@ clusterLink *createClusterLink(clusterNode *node) {
     link->rcvbuf = sdsempty();
     link->node = node;
     link->fd = -1;
+    link->tls = NULL;
+    link->inbound = node == NULL;
+    link->peer_name_set = node != NULL;
+    memset(link->peer_name,0,sizeof(link->peer_name));
+    if (node) memcpy(link->peer_name,node->name,sizeof(link->peer_name));
+    listAddNodeTail(server.cluster->links,link);
+    link->link_ref = server.cluster->links->tail;
     return link;
 }
 
@@ -649,8 +669,17 @@ void freeClusterLink(clusterLink *link) {
     }
     sdsfree(link->sndbuf);
     sdsfree(link->rcvbuf);
-    if (link->node)
+    if (link->tls) {
+        tlsClusterLinkFree(link->tls);
+        zfree(link->tls);
+        link->tls = NULL;
+    }
+    if (link->node && link->node->link == link)
         link->node->link = NULL;
+    if (link->link_ref) {
+        listDelNode(server.cluster->links,link->link_ref);
+        link->link_ref = NULL;
+    }
     close(link->fd);
     zfree(link);
 }
@@ -702,6 +731,15 @@ void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
          * node identity. */
         link = createClusterLink(NULL);
         link->fd = cfd;
+        if (server.tls_cluster) {
+            link->tls = zmalloc(sizeof(*link->tls));
+            if (tlsClusterLinkInit(link->tls,1) == C_ERR) {
+                serverLog(LL_WARNING,
+                    "Cannot create TLS state for cluster link");
+                freeClusterLink(link);
+                continue;
+            }
+        }
         aeCreateFileEvent(server.el,cfd,AE_READABLE,clusterReadHandler,link);
     }
 }
@@ -768,6 +806,7 @@ clusterNode *createClusterNode(char *nodename, int flags) {
     node->fail_time = 0;
     node->link = NULL;
     memset(node->ip,0,sizeof(node->ip));
+    memset(node->hostname,0,sizeof(node->hostname));
     node->port = 0;
     node->cport = 0;
     node->fail_reports = listCreate();
@@ -1766,12 +1805,27 @@ int clusterProcessPacket(clusterLink *link) {
 
     /* Check if the sender is a known node. */
     sender = clusterLookupNode(hdr->sender);
+    memcpy(link->peer_name,hdr->sender,sizeof(link->peer_name));
+    link->peer_name_set = 1;
 
     /* Update the last time we saw any data from this node. We
      * use this in order to avoid detecting a timeout from a node that
      * is just sending a lot of data in the cluster bus, for instance
      * because of Pub/Sub. */
     if (sender) sender->data_received = now;
+
+    /* Learn the hostname the sender announces. The field lives in bytes that
+     * were reserved in the original header, so older nodes simply send
+     * zeroes here. */
+    if (sender) {
+        char hostname[CLUSTER_HOSTNAME_LEN];
+
+        memcpy(hostname,hdr->hostname,sizeof(hostname));
+        hostname[sizeof(hostname)-1] = '\0';
+        if (strcmp(sender->hostname,hostname)) {
+            memcpy(sender->hostname,hostname,sizeof(sender->hostname));
+        }
+    }
 
     if (sender && !nodeInHandshake(sender)) {
         /* Update our curretEpoch if we see a newer epoch in the cluster. */
@@ -1921,8 +1975,9 @@ int clusterProcessPacket(clusterLink *link) {
          * what are the instances really competing. */
         if (sender) {
             int nofailover = flags & CLUSTER_NODE_NOFAILOVER;
-            sender->flags &= ~CLUSTER_NODE_NOFAILOVER;
-            sender->flags |= nofailover;
+            int noannounce = flags & CLUSTER_NODE_NOANNOUNCE;
+            sender->flags &= ~(CLUSTER_NODE_NOFAILOVER|CLUSTER_NODE_NOANNOUNCE);
+            sender->flags |= nofailover|noannounce;
         }
 
         /* Update the node address if it changed. */
@@ -2189,6 +2244,45 @@ void handleLinkIOError(clusterLink *link) {
     freeClusterLink(link);
 }
 
+/* -----------------------------------------------------------------------------
+ * Cluster bus TLS helpers
+ *
+ * Cluster links use the memory BIO state machine from tls.c. These helpers
+ * keep the event loop handlers below readable; a link with link->tls set is
+ * encrypted, otherwise the original plaintext paths run unchanged.
+ * -------------------------------------------------------------------------- */
+
+static void clusterTlsWantWrite(clusterLink *link) {
+    if (aeCreateFileEvent(server.el,link->fd,AE_WRITABLE|AE_BARRIER,
+                          clusterWriteHandler,link) == AE_ERR)
+        handleLinkIOError(link);
+}
+
+/* Advance the handshake and flush ciphertext. C_ERR means drop the link. */
+static int clusterTlsDrive(clusterLink *link) {
+    if (tlsClusterHandshake(link->tls,link->fd) < 0) return C_ERR;
+    if (tlsClusterFlush(link->tls,link->fd) < 0) return C_ERR;
+    return C_OK;
+}
+
+/* Write as much of sndbuf as the TLS socket accepts. C_ERR means drop. */
+static int clusterTlsWritePending(clusterLink *link) {
+    while (sdslen(link->sndbuf) > 0) {
+        int n = tlsClusterWrite(link->tls,link->fd,
+                                link->sndbuf,sdslen(link->sndbuf));
+        if (n < 0) return C_ERR;
+        if (n == 0) return C_OK; /* Wait for the writable event. */
+        sdsrange(link->sndbuf,n,-1);
+    }
+    return C_OK;
+}
+
+static int clusterTlsIdle(clusterLink *link) {
+    return !link->tls->handshaking &&
+           sdslen(link->sndbuf) == 0 &&
+           tlsClusterPendingOut(link->tls) == 0;
+}
+
 #ifdef _WIN32
 void clusterWriteDone(aeEventLoop *el, int fd, void *privdata, int written) {
     WSIOCP_Request *req = (WSIOCP_Request *) privdata;
@@ -2207,6 +2301,19 @@ void clusterWriteHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     clusterLink *link = (clusterLink*) privdata;
     UNUSED(el);
     UNUSED(mask);
+
+    if (link->tls) {
+        if (clusterTlsDrive(link) == C_ERR ||
+            clusterTlsWritePending(link) == C_ERR)
+        {
+            serverLog(LL_DEBUG, "TLS error writing to cluster fd %d", link->fd);
+            handleLinkIOError(link);
+            return;
+        }
+        if (clusterTlsIdle(link))
+            aeDeleteFileEvent(server.el, link->fd, AE_WRITABLE);
+        return;
+    }
 
     int result = WSIOCP_SocketSend(fd,
         (char*) link->sndbuf,
@@ -2234,6 +2341,18 @@ void clusterWriteHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
     UNUSED(mask);
 
+    if (link->tls) {
+        if (clusterTlsDrive(link) == C_ERR ||
+            clusterTlsWritePending(link) == C_ERR)
+        {
+            handleLinkIOError(link);
+            return;
+        }
+        if (clusterTlsIdle(link))
+            aeDeleteFileEvent(server.el, link->fd, AE_WRITABLE);
+        return;
+    }
+
     nwritten = write(fd, link->sndbuf, sdslen(link->sndbuf));
     if (nwritten <= 0) {
         serverLog(LL_DEBUG,"I/O error writing to node link: %s",
@@ -2258,6 +2377,22 @@ void clusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     unsigned int readlen, rcvbuflen;
     UNUSED(el);
     UNUSED(mask);
+
+    /* Complete the TLS handshake before any cluster message can be parsed. */
+    if (link->tls && link->tls->handshaking) {
+        int hs = tlsClusterHandshake(link->tls, fd);
+        if (hs < 0) {
+            serverLog(LL_DEBUG, "TLS handshake failed on cluster fd %d", fd);
+            handleLinkIOError(link);
+            return;
+        }
+        if (hs == 0) {
+            if (tlsClusterPendingOut(link->tls)) clusterTlsWantWrite(link);
+            WIN32_ONLY(WSIOCP_QueueNextRead(fd);)
+            return;
+        }
+        if (tlsClusterPendingOut(link->tls)) clusterTlsWantWrite(link);
+    }
 
     while(1) { /* Read as long as there is data to read. */
         rcvbuflen = (unsigned int) sdslen(link->rcvbuf);                         WIN_PORT_FIX /* cast (unsigned int) */
@@ -2285,8 +2420,17 @@ void clusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
             if (readlen > sizeof(buf)) readlen = sizeof(buf);
         }
 
-        nread = read(fd,buf,readlen);
-        if (nread == -1 && errno == EAGAIN) { WIN32_ONLY(WSIOCP_QueueNextRead(fd);) return; } /* No more data ready. */
+        if (link->tls) {
+            nread = tlsClusterRead(link->tls,fd,buf,readlen);
+            if (nread == -1 && (errno == EAGAIN || errno == WSAEWOULDBLOCK)) {
+                if (tlsClusterPendingOut(link->tls)) clusterTlsWantWrite(link);
+                WIN32_ONLY(WSIOCP_QueueNextRead(fd);)
+                return; /* No complete plaintext available yet. */
+            }
+        } else {
+            nread = read(fd,buf,readlen);
+            if (nread == -1 && errno == EAGAIN) { WIN32_ONLY(WSIOCP_QueueNextRead(fd);) return; } /* No more data ready. */
+        }
 
         if (nread <= 0) {
             /* I/O error... */
@@ -2325,6 +2469,15 @@ void clusterSendMessage(clusterLink *link, unsigned char *msg, size_t msglen) {
                     clusterWriteHandler,link);
 
     link->sndbuf = sdscatlen(link->sndbuf, msg, msglen);
+
+    /* Try to make progress immediately. Errors are handled by the writable
+     * handler or the cluster cron, because this function must not invalidate
+     * the link. */
+    if (link->tls && !link->tls->handshaking) {
+        clusterTlsWritePending(link);
+        if (clusterTlsIdle(link))
+            aeDeleteFileEvent(server.el, link->fd, AE_WRITABLE);
+    }
 
     /* Populate sent messages stats. */
     clusterMsg *hdr = (clusterMsg*) msg;
@@ -2385,6 +2538,11 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
     if (server.cluster_announce_ip) {
         strncpy(hdr->myip,server.cluster_announce_ip,NET_IP_STR_LEN);
         hdr->myip[NET_IP_STR_LEN-1] = '\0';
+    }
+    memset(hdr->hostname,0,sizeof(hdr->hostname));
+    if (server.cluster_announce_hostname) {
+        strncpy(hdr->hostname,server.cluster_announce_hostname,
+                sizeof(hdr->hostname)-1);
     }
 
     /* Handle cluster-announce-port as well. */
@@ -3516,6 +3674,23 @@ void clusterCron(void) {
             link = createClusterLink(node);
             link->fd = fd;
             node->link = link;
+            if (server.tls_cluster) {
+                link->tls = zmalloc(sizeof(*link->tls));
+                if (tlsClusterLinkInit(link->tls,0) == C_ERR) {
+                    serverLog(LL_WARNING,
+                        "Cannot start TLS on cluster bus link");
+                    freeClusterLink(link);
+                    continue;
+                }
+                /* Send the ClientHello now; if the socket is still
+                 * connecting the writable event flushes it later. */
+                if (tlsClusterHandshake(link->tls,fd) < 0) {
+                    freeClusterLink(link);
+                    continue;
+                }
+                if (tlsClusterPendingOut(link->tls))
+                    clusterTlsWantWrite(link);
+            }
             aeCreateFileEvent(server.el,link->fd,AE_READABLE,
                     clusterReadHandler,link);
             /* Queue a PING in the new connection ASAP: this is crucial
@@ -3700,6 +3875,28 @@ void clusterCron(void) {
          * slaves. */
         if (orphaned_masters && max_slaves >= 2 && this_slaves == max_slaves)
             clusterHandleSlaveMigration(max_slaves);
+    }
+
+    /* TLS cluster links may need the handshake or queued ciphertext flushed
+     * when no writable event arrives, notably right after connect on
+     * Windows. Drive every encrypted link from the cron as a safety net. */
+    if (server.tls_cluster) {
+        listNode *ln = listFirst(server.cluster->links);
+        while (ln) {
+            listNode *next = listNextNode(ln);
+            clusterLink *link = listNodeValue(ln);
+
+            if (link->tls) {
+                if (clusterTlsDrive(link) == C_ERR ||
+                    clusterTlsWritePending(link) == C_ERR)
+                {
+                    handleLinkIOError(link);
+                } else if (clusterTlsIdle(link)) {
+                    aeDeleteFileEvent(server.el, link->fd, AE_WRITABLE);
+                }
+            }
+            ln = next;
+        }
     }
 
     if (update_state || server.cluster->state == CLUSTER_FAIL)
@@ -4110,12 +4307,15 @@ sds clusterGenNodeDescription(clusterNode *node) {
     int j, start;
     sds ci;
 
-    /* Node coordinates */
-    ci = sdscatprintf(sdsempty(),"%.40s %s:%d@%d ",
+    /* Node coordinates, with the announced hostname when there is one. */
+    ci = sdscatprintf(sdsempty(),"%.40s %s:%d@%d",
         node->name,
         node->ip,
         node->port,
         node->cport);
+    if (node->hostname[0])
+        ci = sdscatprintf(ci,",%s",node->hostname);
+    ci = sdscatlen(ci," ",1);
 
     /* Flags */
     ci = representClusterNodeFlags(ci, node->flags);
@@ -4234,6 +4434,167 @@ int getSlotOrReply(client *c, robj *o) {
     return (int) slot;
 }
 
+/* Return the endpoint clients should use for this node: its announced
+ * hostname when cluster-preferred-endpoint is "hostname" and one is known,
+ * otherwise its IP address (written into ipbuf). */
+static const char *clusterNodeIp(clusterNode *node, char *buf, size_t len) {
+    if (node->ip[0]) {
+        snprintf(buf,len,"%s",node->ip);
+    } else if (node == server.cluster->myself && server.cluster_announce_ip) {
+        snprintf(buf,len,"%s",server.cluster_announce_ip);
+    } else if (node == server.cluster->myself) {
+        snprintf(buf,len,"127.0.0.1");
+    } else {
+        snprintf(buf,len,"?");
+    }
+    return buf;
+}
+
+static const char *clusterNodeEndpoint(clusterNode *node, const char *ip) {
+    if (server.cluster_preferred_endpoint == CLUSTER_ENDPOINT_HOSTNAME &&
+        node->hostname[0])
+        return node->hostname;
+    return ip;
+}
+
+/* CLUSTER SHARDS reports one map per shard. Each map has a flat array of
+ * inclusive slot ranges and an array of node maps. The reply uses the same
+ * field names as Redis 7. addReplyMapLen() emits a RESP3 map and a flat RESP2
+ * array automatically. */
+static void clusterReplyShardNode(client *c, clusterNode *node) {
+    int fields = 8; /* id, endpoint, ip, port, hostname, role,
+                     * replication-offset, health */
+    int health_failed = nodeFailed(node);
+    int health_loading = (node == server.cluster->myself && server.loading);
+    char ip[NET_IP_STR_LEN];
+
+    if (server.tls_port != 0) fields++;
+    clusterNodeIp(node,ip,sizeof(ip));
+
+    addReplyMapLen(c,fields);
+    addReplyBulkCString(c,"id");
+    addReplyBulkCBuffer(c,node->name,CLUSTER_NAMELEN);
+    addReplyBulkCString(c,"endpoint");
+    addReplyBulkCString(c,clusterNodeEndpoint(node,ip));
+    addReplyBulkCString(c,"ip");
+    addReplyBulkCString(c,ip);
+    addReplyBulkCString(c,"port");
+    addReplyLongLong(c,node->port);
+    if (server.tls_port != 0) {
+        addReplyBulkCString(c,"tls-port");
+        addReplyLongLong(c,server.tls_port);
+    }
+    addReplyBulkCString(c,"hostname");
+    addReplyBulkCString(c,node->hostname);
+    addReplyBulkCString(c,"role");
+    addReplyBulkCString(c,nodeIsSlave(node) ? "replica" : "master");
+    addReplyBulkCString(c,"replication-offset");
+    addReplyLongLong(c,node == myself ? server.master_repl_offset :
+                                        node->repl_offset);
+    addReplyBulkCString(c,"health");
+    addReplyBulkCString(c,health_failed ? "failed" :
+                          (health_loading ? "loading" : "online"));
+}
+
+static void clusterReplyShards(client *c) {
+    int num_masters = 0;
+    void *replylen = addDeferredMultiBulkLength(c);
+    dictIterator *di = dictGetSafeIterator(server.cluster->nodes);
+    dictEntry *de;
+
+    while ((de = dictNext(di)) != NULL) {
+        clusterNode *node = dictGetVal(de);
+        int start = -1, j, i, healthy_slaves = 0;
+
+        if (!nodeIsMaster(node) || node->numslots == 0) continue;
+        for (i = 0; i < node->numslaves; i++)
+            if (!nodeFailed(node->slaves[i]) &&
+                !(node->slaves[i]->flags & CLUSTER_NODE_NOANNOUNCE))
+                healthy_slaves++;
+
+        addReplyMapLen(c,2);
+        addReplyBulkCString(c,"slots");
+        {
+            /* A node with sparse slots needs one start/end pair per range. */
+            int ranges = 0;
+            for (j = 0; j < CLUSTER_SLOTS; j++) {
+                int bit = clusterNodeGetSlotBit(node,j);
+                if (bit && start == -1) start = j;
+                if (start != -1 && (!bit || j == CLUSTER_SLOTS-1)) ranges++;
+                if (!bit) start = -1;
+            }
+            addReplyArrayLen(c,ranges*2);
+            start = -1;
+            for (j = 0; j < CLUSTER_SLOTS; j++) {
+                int bit = clusterNodeGetSlotBit(node,j);
+                if (bit && start == -1) start = j;
+                if (start != -1 && (!bit || j == CLUSTER_SLOTS-1)) {
+                    int end = (bit && j == CLUSTER_SLOTS-1) ? j : j-1;
+                    addReplyLongLong(c,start);
+                    addReplyLongLong(c,end);
+                    start = -1;
+                }
+            }
+        }
+        addReplyBulkCString(c,"nodes");
+        addReplyArrayLen(c,1+healthy_slaves);
+        clusterReplyShardNode(c,node);
+        for (i = 0; i < node->numslaves; i++) {
+            if (nodeFailed(node->slaves[i])) continue;
+            if (node->slaves[i]->flags & CLUSTER_NODE_NOANNOUNCE) continue;
+            clusterReplyShardNode(c,node->slaves[i]);
+        }
+        num_masters++;
+    }
+    dictReleaseIterator(di);
+    setDeferredMultiBulkLength(c,replylen,num_masters);
+}
+
+/* CLUSTER LINKS exposes both directions of every live cluster bus TCP link.
+ * Both directions may queue packets (inbound links reply with PONG), so the
+ * send buffer is reported from the link itself. */
+static void clusterReplyLinks(client *c) {
+    listIter li;
+    listNode *ln;
+    int count = 0;
+    void *replylen = addDeferredMultiBulkLength(c);
+
+    listRewind(server.cluster->links,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        clusterLink *link = listNodeValue(ln);
+        clusterNode *peer = link->node;
+        const char *nodeid = link->peer_name_set ? link->peer_name :
+                             (peer ? peer->name : NULL);
+        int mask = link->fd != -1 ? aeGetFileEvents(server.el,link->fd) : 0;
+        char events[3];
+        int eventlen = 0;
+        size_t allocated, used;
+
+        if (!nodeid) continue;
+        if (mask & AE_READABLE) events[eventlen++] = 'r';
+        if (mask & AE_WRITABLE) events[eventlen++] = 'w';
+        events[eventlen] = '\0';
+        allocated = sdsalloc(link->sndbuf);
+        used = sdslen(link->sndbuf);
+
+        addReplyMapLen(c,6);
+        addReplyBulkCString(c,"direction");
+        addReplyBulkCString(c,link->inbound ? "from" : "to");
+        addReplyBulkCString(c,"node");
+        addReplyBulkCBuffer(c,nodeid,CLUSTER_NAMELEN);
+        addReplyBulkCString(c,"create-time");
+        addReplyLongLong(c,link->ctime);
+        addReplyBulkCString(c,"events");
+        addReplyBulkCString(c,events);
+        addReplyBulkCString(c,"send-buffer-allocated");
+        addReplyLongLong(c,(PORT_LONGLONG)allocated);
+        addReplyBulkCString(c,"send-buffer-used");
+        addReplyLongLong(c,(PORT_LONGLONG)used);
+        count++;
+    }
+    setDeferredMultiBulkLength(c,replylen,count);
+}
+
 void clusterReplyMultiBulkSlots(client *c) {
     /* Format: 1) 1) start slot
      *            2) end slot
@@ -4262,6 +4623,7 @@ void clusterReplyMultiBulkSlots(client *c) {
 
         for(i = 0; i < node->numslaves; i++) {
             if (nodeFailed(node->slaves[i])) continue;
+            if (node->slaves[i]->flags & CLUSTER_NODE_NOANNOUNCE) continue;
             nested_elements++;
         }
 
@@ -4288,20 +4650,30 @@ void clusterReplyMultiBulkSlots(client *c) {
                 start = -1;
 
                 /* First node reply position is always the master */
-                addReplyMultiBulkLen(c, 3);
-                addReplyBulkCString(c, node->ip);
+                char endpoint[NET_IP_STR_LEN];
+
+                addReplyMultiBulkLen(c, 4);
+                clusterNodeIp(node,endpoint,sizeof(endpoint));
+                addReplyBulkCString(c, clusterNodeEndpoint(node,endpoint));
                 addReplyLongLong(c, node->port);
                 addReplyBulkCBuffer(c, node->name, CLUSTER_NAMELEN);
+                addReplyBulkCString(c, node->hostname);
 
                 /* Remaining nodes in reply are replicas for slot range */
                 for (i = 0; i < node->numslaves; i++) {
                     /* This loop is copy/pasted from clusterGenNodeDescription()
                      * with modifications for per-slot node aggregation */
                     if (nodeFailed(node->slaves[i])) continue;
-                    addReplyMultiBulkLen(c, 3);
-                    addReplyBulkCString(c, node->slaves[i]->ip);
+                    if (node->slaves[i]->flags & CLUSTER_NODE_NOANNOUNCE)
+                        continue;
+                    addReplyMultiBulkLen(c, 4);
+                    clusterNodeIp(node->slaves[i],endpoint,sizeof(endpoint));
+                    addReplyBulkCString(c,
+                        clusterNodeEndpoint(node->slaves[i],endpoint));
                     addReplyLongLong(c, node->slaves[i]->port);
-                    addReplyBulkCBuffer(c, node->slaves[i]->name, CLUSTER_NAMELEN);
+                    addReplyBulkCBuffer(c, node->slaves[i]->name,
+                                        CLUSTER_NAMELEN);
+                    addReplyBulkCString(c, node->slaves[i]->hostname);
                 }
                 num_masters++;
             }
@@ -4320,16 +4692,19 @@ void clusterCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
         const char *help[] = {
 "ADDSLOTS <slot> [slot ...] -- Assign slots to current node.",
+"ADDSLOTSRANGE <start slot> <end slot> [<start slot> <end slot> ...] -- Assign slots to current node.",
 "BUMPEPOCH -- Advance the cluster config epoch.",
 "COUNT-failure-reports <node-id> -- Return number of failure reports for <node-id>.",
 "COUNTKEYSINSLOT <slot> - Return the number of keys in <slot>.",
 "DELSLOTS <slot> [slot ...] -- Delete slots information from current node.",
+"DELSLOTSRANGE <start slot> <end slot> [<start slot> <end slot> ...] -- Delete slots information from current node.",
 "FAILOVER [force|takeover] -- Promote current replica node to being a master.",
 "FORGET <node-id> -- Remove a node from the cluster.",
 "GETKEYSINSLOT <slot> <count> -- Return key names stored by current node in a slot.",
 "FLUSHSLOTS -- Delete current node own slots information.",
 "INFO - Return onformation about the cluster.",
 "KEYSLOT <key> -- Return the hash slot for <key>.",
+"LINKS -- Return information about the cluster bus links.",
 "MEET <ip> <port> [bus-port] -- Connect nodes into a working cluster.",
 "MYID -- Return the node id.",
 "NODES -- Return cluster configuration seen by node. Output format:",
@@ -4338,6 +4713,7 @@ void clusterCommand(client *c) {
 "RESET [hard|soft] -- Reset current node (default: soft).",
 "SET-config-epoch <epoch> - Set config epoch of current node.",
 "SETSLOT <slot> (importing|migrating|stable|node <node-id>) -- Set slot state.",
+"SHARDS -- Return information about slot ranges and their shard nodes.",
 "REPLICAS <node-id> -- Return <node-id> replicas.",
 "SLOTS -- Return information about slots range mappings. Each range is made of:",
 "    start, end, master and replicas IP addresses, ports and ids",
@@ -4386,6 +4762,12 @@ NULL
     } else if (!strcasecmp(c->argv[1]->ptr,"slots") && c->argc == 2) {
         /* CLUSTER SLOTS */
         clusterReplyMultiBulkSlots(c);
+    } else if (!strcasecmp(c->argv[1]->ptr,"shards") && c->argc == 2) {
+        /* CLUSTER SHARDS */
+        clusterReplyShards(c);
+    } else if (!strcasecmp(c->argv[1]->ptr,"links") && c->argc == 2) {
+        /* CLUSTER LINKS */
+        clusterReplyLinks(c);
     } else if (!strcasecmp(c->argv[1]->ptr,"flushslots") && c->argc == 2) {
         /* CLUSTER FLUSHSLOTS */
         if (dictSize(server.db[0].dict) != 0) {
@@ -4426,6 +4808,75 @@ NULL
                     (int)slot);
                 zfree(slots);
                 return;
+            }
+        }
+        for (j = 0; j < CLUSTER_SLOTS; j++) {
+            if (slots[j]) {
+                int retval;
+
+                /* If this slot was set as importing we can clear this
+                 * state as now we are the real owner of the slot. */
+                if (server.cluster->importing_slots_from[j])
+                    server.cluster->importing_slots_from[j] = NULL;
+
+                retval = del ? clusterDelSlot(j) :
+                               clusterAddSlot(myself,j);
+                serverAssertWithInfo(c,NULL,retval == C_OK);
+            }
+        }
+        zfree(slots);
+        clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE|CLUSTER_TODO_SAVE_CONFIG);
+        addReply(c,shared.ok);
+    } else if ((!strcasecmp(c->argv[1]->ptr,"addslotsrange") ||
+                !strcasecmp(c->argv[1]->ptr,"delslotsrange")) && c->argc >= 4)
+    {
+        /* CLUSTER ADDSLOTSRANGE <start slot> <end slot> [<start slot> <end slot> ...] */
+        /* CLUSTER DELSLOTSRANGE <start slot> <end slot> [<start slot> <end slot> ...] */
+        int j, startslot, endslot, slot;
+        unsigned char *slots = zmalloc(CLUSTER_SLOTS);
+        int del = !strcasecmp(c->argv[1]->ptr,"delslotsrange");
+
+        if (c->argc % 2 == 1) {
+            addReplyError(c,"wrong number of arguments for CLUSTER "
+                            "ADDSLOTSRANGE/DELSLOTSRANGE");
+            zfree(slots);
+            return;
+        }
+
+        memset(slots,0,CLUSTER_SLOTS);
+        /* Check that all the arguments are parseable and that all the
+         * slots are not already busy. */
+        for (j = 2; j < c->argc; j += 2) {
+            if ((startslot = getSlotOrReply(c,c->argv[j])) == -1) {
+                zfree(slots);
+                return;
+            }
+            if ((endslot = getSlotOrReply(c,c->argv[j+1])) == -1) {
+                zfree(slots);
+                return;
+            }
+            if (startslot > endslot) {
+                addReplyErrorFormat(c,"start slot number %d is greater than "
+                                      "end slot number %d", startslot, endslot);
+                zfree(slots);
+                return;
+            }
+            for (slot = startslot; slot <= endslot; slot++) {
+                if (del && server.cluster->slots[slot] == NULL) {
+                    addReplyErrorFormat(c,"Slot %d is already unassigned", slot);
+                    zfree(slots);
+                    return;
+                } else if (!del && server.cluster->slots[slot]) {
+                    addReplyErrorFormat(c,"Slot %d is already busy", slot);
+                    zfree(slots);
+                    return;
+                }
+                if (slots[slot]++ == 1) {
+                    addReplyErrorFormat(c,"Slot %d specified multiple times",
+                        slot);
+                    zfree(slots);
+                    return;
+                }
             }
         }
         for (j = 0; j < CLUSTER_SLOTS; j++) {
@@ -5034,6 +5485,19 @@ void restoreCommand(client *c) {
     if (verifyDumpPayload(c->argv[3]->ptr,sdslen(c->argv[3]->ptr)) == C_ERR)
     {
         addReplyError(c,"DUMP payload version or checksum are wrong");
+        return;
+    }
+
+    /* Optionally deep-validate the serialized value before loading it, so
+     * that a malformed encoding can never enter the dataset. */
+    if ((server.sanitize_dump_payload == SANITIZE_DUMP_PAYLOAD_YES ||
+         (server.sanitize_dump_payload == SANITIZE_DUMP_PAYLOAD_CLIENTS &&
+          !(c->flags & CLIENT_MASTER))) &&
+        rdbSanitizeDumpPayload((unsigned char*)c->argv[3]->ptr,
+                               sdslen(c->argv[3]->ptr))
+        == C_ERR)
+    {
+        addReplyError(c,"Bad data format");
         return;
     }
 

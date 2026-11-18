@@ -3141,7 +3141,7 @@ static void xinfoReplyWithStreamInfo(client *c, stream *s) {
         first_id.seq = 0;
     }
 
-    addReplyMultiBulkLen(c,(full ? 9 : 10)*2);
+    addReplyMapLen(c,full ? 9 : 10);
     addReplyBulkCString(c,"length");
     addReplyLongLong(c,s->length);
     addReplyBulkCString(c,"radix-tree-keys");
@@ -3199,7 +3199,7 @@ static void xinfoReplyWithStreamInfo(client *c, stream *s) {
 
         long long lag = (long long)s->entries_added - cg->entries_read;
         if (lag < 0) lag = 0;
-        addReplyMultiBulkLen(c,7*2);
+        addReplyMapLen(c,7);
         addReplyBulkCString(c,"name");
         addReplyBulkCBuffer(c,ri.key,ri.key_len);
         addReplyBulkCString(c,"last-delivered-id");
@@ -3223,11 +3223,15 @@ static void xinfoReplyWithStreamInfo(client *c, stream *s) {
                 streamID id;
                 streamDecodeID(pi.key,&id);
 
-                addReplyMultiBulkLen(c,4);
+                addReplyMapLen(c,4);
+                addReplyBulkCString(c,"id");
                 addReplyStreamID(c,&id);
+                addReplyBulkCString(c,"consumer");
                 addReplyBulkCBuffer(c,nack->consumer->name,
                                     sdslen(nack->consumer->name));
+                addReplyBulkCString(c,"delivery-time");
                 addReplyLongLong(c,nack->delivery_time);
+                addReplyBulkCString(c,"delivery-count");
                 addReplyLongLong(c,nack->delivery_count);
                 arraylen++;
             }
@@ -3244,7 +3248,7 @@ static void xinfoReplyWithStreamInfo(client *c, stream *s) {
             while (raxNext(&ci)) {
                 streamConsumer *consumer = ci.data;
 
-                addReplyMultiBulkLen(c,5*2);
+                addReplyMapLen(c,5);
                 addReplyBulkCString(c,"name");
                 addReplyBulkCBuffer(c,consumer->name,sdslen(consumer->name));
                 addReplyBulkCString(c,"seen-time");
@@ -3266,9 +3270,12 @@ static void xinfoReplyWithStreamInfo(client *c, stream *s) {
                         streamID id;
                         streamDecodeID(pi.key,&id);
 
-                        addReplyMultiBulkLen(c,3);
+                        addReplyMapLen(c,3);
+                        addReplyBulkCString(c,"id");
                         addReplyStreamID(c,&id);
+                        addReplyBulkCString(c,"delivery-time");
                         addReplyLongLong(c,nack->delivery_time);
+                        addReplyBulkCString(c,"delivery-count");
                         addReplyLongLong(c,nack->delivery_count);
                         arraylen++;
                     }
@@ -3346,7 +3353,7 @@ NULL
                 if (inactive < 0) inactive = 0;
             }
 
-            addReplyMultiBulkLen(c,8);
+            addReplyMapLen(c,4);
             addReplyBulkCString(c,"name");
             addReplyBulkCBuffer(c,consumer->name,sdslen(consumer->name));
             addReplyBulkCString(c,"pending");
@@ -3372,7 +3379,7 @@ NULL
             streamCG *cg = ri.data;
             long long lag = (long long)s->entries_added - cg->entries_read;
             if (lag < 0) lag = 0;
-            addReplyMultiBulkLen(c,12);
+            addReplyMapLen(c,6);
             addReplyBulkCString(c,"name");
             addReplyBulkCBuffer(c,ri.key,ri.key_len);
             addReplyBulkCString(c,"consumers");

@@ -143,6 +143,7 @@ int rdbSave(char *filename, rdbSaveInfo *rsi);
 ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key);
 size_t rdbSavedObjectLen(robj *o);
 robj *rdbLoadObject(int type, rio *rdb, robj *key);
+int rdbSanitizeDumpPayload(const unsigned char *payload, size_t len);
 void backgroundSaveDoneHandler(int exitcode, int bysignal);
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, PORT_LONGLONG expiretime);
 ssize_t rdbSaveSingleModuleAux(rio *rdb, int when, moduleType *mt);

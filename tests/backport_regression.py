@@ -26,12 +26,14 @@ import atexit
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import fnmatch
+import os
 from pathlib import Path
 import select
 import shutil
 import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -215,7 +217,8 @@ def make_tls_certificates(directory):
          "-subj", "/CN=localhost"])
     server_ext = root / "tls-server.ext"
     server_ext.write_text(
-        "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n",
+        "subjectAltName=DNS:localhost,IP:127.0.0.1\n"
+        "extendedKeyUsage=serverAuth,clientAuth\n",
         encoding="ascii")
     run(["x509", "-req", "-in", root / "tls-server.csr",
          "-CA", paths["ca"], "-CAkey", paths["ca_key"], "-CAcreateserial",
@@ -228,13 +231,42 @@ def make_tls_certificates(directory):
     run(["x509", "-req", "-in", root / "tls-client.csr",
          "-CA", paths["ca"], "-CAkey", paths["ca_key"], "-CAcreateserial",
          "-out", paths["client_cert"], "-days", "2", "-extfile", client_ext])
+    # A self-signed client certificate that does not chain to our test CA.
+    paths["bad_cert"] = root / "tls-bad-client.crt"
+    paths["bad_key"] = root / "tls-bad-client.key"
+    run(["req", "-x509", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", paths["bad_key"], "-out", paths["bad_cert"],
+         "-days", "2", "-subj", "/CN=redis-backport-untrusted-client",
+         "-addext", "extendedKeyUsage=clientAuth"])
     return paths
+
+
+def crc64(data):
+    """CRC64-Jones as used by RDB files and DUMP payload footers."""
+    poly = 0x95AC9329AC4BC9B5  # bit-reversed 0xad93d23594c935a9
+    table = []
+    for byte in range(256):
+        crc = byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ (poly if crc & 1 else 0)
+        table.append(crc)
+    crc = 0
+    for byte in data:
+        crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return crc
+
+
+def dump_payload(body, rdb_version=9):
+    """Append the DUMP footer (little-endian version and CRC64) to a body."""
+    blob = body + struct.pack("<H", rdb_version)
+    return blob + struct.pack("<Q", crc64(blob))
 
 
 class ManagedServer:
     def __init__(self, executable, directory, timeout, startup_timeout, aof=False,
                  requirepass=None, aclfile=False, cluster=False, tls=None,
-                 tls_auth_clients="no", tls_replication=False, replicaof=None):
+                 tls_auth_clients="no", tls_replication=False, replicaof=None,
+                 extra_config=""):
         self.executable = executable
         self.directory = Path(directory)
         self.timeout = timeout
@@ -247,6 +279,7 @@ class ManagedServer:
         self.tls_auth_clients = tls_auth_clients
         self.tls_replication = tls_replication
         self.replicaof = replicaof
+        self.extra_config = extra_config
         self.port = reserve_cluster_port() if cluster else reserve_port()
         self.tls_port = None
         if tls:
@@ -314,7 +347,7 @@ class ManagedServer:
                 "cluster-node-timeout 5000\ncluster-require-full-coverage yes\n"
                 if self.cluster else "",
                 tls_line,
-                replicaof_line),
+                replicaof_line + self.extra_config),
             encoding="ascii",
         )
         self.output = (self.directory / "stdout.log").open("ab", buffering=0)
@@ -423,7 +456,7 @@ class BackportRegression(unittest.TestCase):
     def connect(self):
         return RESP2(self.host, self.port, OPTIONS.timeout, self.password)
 
-    def tls_connect(self, client_cert=False):
+    def tls_connect(self, client_cert=False, bad_cert=False):
         if self.server is None or self.server.tls_port is None:
             self.skipTest("TLS tests require a managed --server instance")
         context = ssl.create_default_context(cafile=str(self.server.tls["ca"]))
@@ -431,6 +464,11 @@ class BackportRegression(unittest.TestCase):
             context.load_cert_chain(
                 str(self.server.tls["client_cert"]),
                 str(self.server.tls["client_key"]),
+            )
+        elif bad_cert:
+            context.load_cert_chain(
+                str(self.server.tls["bad_cert"]),
+                str(self.server.tls["bad_key"]),
             )
         raw = socket.create_connection(
             ("127.0.0.1", self.server.tls_port), OPTIONS.timeout)
@@ -510,6 +548,30 @@ class BackportRegression(unittest.TestCase):
         if reply and isinstance(reply[0], tuple):
             return dict(reply)
         return {reply[i]: reply[i + 1] for i in range(0, len(reply), 2)}
+
+    def info_fields(self, section):
+        """Parse one INFO section into a dict of strings."""
+        reply = self.cmd("INFO", section)
+        if isinstance(reply, bytes):
+            reply = reply.decode("utf-8", "replace")
+        fields = {}
+        for line in reply.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            name, _, value = line.partition(":")
+            fields[name] = value
+        return fields
+
+    def wait_info_field(self, section, field, expected, timeout=60.0):
+        """Poll INFO until field equals expected; fail with the last state."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            fields = self.info_fields(section)
+            if fields.get(field) == expected:
+                return
+            time.sleep(0.05)
+        self.fail("timed out waiting for %s:%s=%s, last state %r" %
+                  (section, field, expected, self.info_fields(section)))
 
     def race(self, commands):
         barrier = threading.Barrier(len(commands))
@@ -1062,6 +1124,240 @@ class BackportRegression(unittest.TestCase):
 
     def test_aof_restart(self):
         self.persistence_roundtrip(aof=True)
+
+    def test_windows_aof_bgsave_under_write_load(self):
+        """Windows QFork children finish BGSAVE/BGREWRITEAOF while clients keep
+        writing; the dataset then survives DEBUG RELOAD and a restart."""
+        if self.server is None:
+            self.skipTest("Persistence tests require --server")
+        self.assertEqual(self.info_fields("persistence")["aof_enabled"], "1")
+        values = {}
+
+        def make_value(index):
+            return (b"%06d:" % index) + bytes([65 + index % 26]) * (180 + index % 11)
+
+        def fill(start, count):
+            batch = []
+            for index in range(start, start + count):
+                values[index] = make_value(index)
+                batch.append(("SET", self.key("load:%d" % index), values[index]))
+            with self.connect() as client:
+                replies = client.pipeline(batch)
+            self.assertEqual(replies, [b"OK"] * count, "pipeline failed to fill")
+
+        fill(0, 800)
+
+        # Keep writing from another connection while both persistence children
+        # run, so the fork cannot rely on a quiet dataset.
+        stop = threading.Event()
+        errors = []
+
+        def background_writer():
+            index = 800
+            try:
+                with self.connect() as client:
+                    while not stop.is_set() and index < 2000:
+                        batch = []
+                        for _ in range(25):
+                            values[index] = make_value(index)
+                            batch.append(("SET", self.key("load:%d" % index),
+                                          values[index]))
+                            index += 1
+                        client.pipeline(batch)
+                        time.sleep(0.005)
+            except BaseException as exc:  # reported on the test thread
+                errors.append(exc)
+
+        writer = threading.Thread(target=background_writer)
+        writer.start()
+        try:
+            self.assertEqual(self.cmd("BGSAVE"), b"Background saving started")
+            self.wait_info_field("persistence", "rdb_bgsave_in_progress", "0")
+            self.assertEqual(
+                self.info_fields("persistence")["rdb_last_bgsave_status"], "ok")
+            self.assertEqual(self.cmd("BGREWRITEAOF"),
+                             b"Background append only file rewriting started")
+            self.wait_info_field("persistence", "aof_rewrite_in_progress", "0")
+            self.assertEqual(
+                self.info_fields("persistence")["aof_last_bgrewrite_status"], "ok")
+        finally:
+            writer.join(timeout=OPTIONS.timeout)
+            stop.set()
+        self.assertFalse(writer.is_alive(), "background writer did not stop")
+        self.assertEqual(errors, [])
+        self.assertEqual(len(values), 2000)
+
+        def verify_all(label):
+            ordered = [values[index] for index in sorted(values)]
+            keys = [self.key("load:%d" % index) for index in sorted(values)]
+            for start in range(0, len(ordered), 400):
+                chunk = ordered[start:start + 400]
+                self.assertEqual(
+                    self.cmd("MGET", *keys[start:start + 400]), chunk,
+                    "%s lost or corrupted %d keys" % (label, len(chunk)))
+
+        verify_all("live dataset")
+
+        # A save taken after the last write must round-trip through DEBUG RELOAD.
+        self.assertEqual(self.cmd("BGSAVE"), b"Background saving started")
+        self.wait_info_field("persistence", "rdb_bgsave_in_progress", "0")
+        self.assertEqual(self.cmd("DEBUG", "RELOAD"), b"OK")
+        verify_all("DEBUG RELOAD")
+
+        self.restart()
+        self.assertEqual(self.info_fields("persistence")["aof_enabled"], "1")
+        verify_all("restart")
+
+    def test_windows_socket_churn_and_split_writes(self):
+        """Commands split across many small writes, multi-megabyte values and
+        abrupt disconnects leave a Windows server responsive and consistent."""
+        seed_key = self.key("churn:seed")
+        self.assertEqual(self.cmd("SET", seed_key, "seed"), b"OK")
+        baseline = int(self.info_fields("clients")["connected_clients"])
+
+        def read_reply(sock, limit=64):
+            data = b""
+            while not data.endswith(b"\r\n") and len(data) < limit:
+                chunk = sock.recv(limit - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            return data
+
+        # One command delivered three bytes at a time.
+        chunked_key = self.key("churn:chunked")
+        request = RESP2.encode(("SET", chunked_key, b"x" * 5000))
+        with socket.create_connection((self.host, self.port), OPTIONS.timeout) as sock:
+            sock.settimeout(OPTIONS.timeout)
+            for offset in range(0, len(request), 3):
+                sock.sendall(request[offset:offset + 3])
+            self.assertEqual(read_reply(sock), b"+OK\r\n")
+        self.assertEqual(self.cmd("STRLEN", chunked_key), 5000)
+
+        # A 1 MiB value split into 4 KiB writes.
+        big_key = self.key("churn:big")
+        payload = bytes(range(256)) * 4096
+        request = RESP2.encode(("SET", big_key, payload))
+        with socket.create_connection((self.host, self.port), OPTIONS.timeout) as sock:
+            sock.settimeout(OPTIONS.timeout)
+            for offset in range(0, len(request), 4096):
+                sock.sendall(request[offset:offset + 4096])
+            self.assertEqual(read_reply(sock), b"+OK\r\n")
+        self.assertEqual(self.cmd("GET", big_key), payload)
+
+        # A long pipeline written in a single call must keep its framing.
+        pipe_key = self.key("churn:pipe")
+        count = 1500
+        with self.connect() as client:
+            replies = client.pipeline([("INCR", pipe_key)] * count)
+        self.assertEqual(replies, list(range(1, count + 1)))
+
+        # Abrupt disconnects: half a command, a command whose reply is never
+        # read, and a pipeline abandoned mid-flight.
+        churn_key = self.key("churn:pipeline")
+        for index in range(150):
+            sock = socket.create_connection((self.host, self.port), OPTIONS.timeout)
+            if index % 3 == 0:
+                partial = RESP2.encode(
+                    ("SET", self.key("churn:partial:%d" % index), b"p" * 4000))
+                sock.sendall(partial[:200])
+            elif index % 3 == 1:
+                sock.sendall(RESP2.encode(("PING",)))
+            else:
+                sock.sendall(b"".join(
+                    RESP2.encode(("INCR", churn_key)) for _ in range(50)))
+            sock.close()
+
+        # The server must reap those sockets and settle back to the baseline.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if int(self.info_fields("clients")["connected_clients"]) <= baseline + 2:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("clients leaked: %r" % self.info_fields("clients"))
+        self.assertEqual(self.cmd("PING"), b"PONG")
+        self.assertEqual(self.cmd("GET", seed_key), b"seed")
+        self.assertEqual(self.cmd("GET", big_key), payload)
+        self.assertEqual(self.cmd("STRLEN", chunked_key), 5000)
+        counter = int(self.cmd("GET", churn_key))
+        self.assertGreaterEqual(counter, 0)
+        self.assertLessEqual(counter, 50 * 50)
+        self.assertEqual(self.cmd("INCR", churn_key), counter + 1)
+        for index in range(0, 150, 3):
+            value = self.cmd("GET", self.key("churn:partial:%d" % index))
+            self.assertIn(value, (None, b"p" * 4000),
+                          "partial command was executed")
+        if self.server is not None:
+            self.assertIsNone(self.server.process.poll(), "server exited")
+
+        # Server side idle timeouts must close the socket through IOCP.
+        if self.server is not None:
+            self.assertEqual(self.cmd("CONFIG", "SET", "timeout", "1"), b"OK")
+            try:
+                idle = socket.create_connection((self.host, self.port),
+                                                OPTIONS.timeout)
+                idle.settimeout(OPTIONS.timeout)
+                try:
+                    # A graceful FIN and a Windows reset both mean "closed".
+                    try:
+                        closed = idle.recv(16) == b""
+                    except ConnectionResetError:
+                        closed = True
+                    self.assertTrue(
+                        closed, "idle client was not closed by the server timeout")
+                finally:
+                    idle.close()
+            finally:
+                # The client issuing the config change can be idle-killed too.
+                try:
+                    self.client.close()
+                except OSError:
+                    pass
+                self.client = self.connect()
+                self.addCleanup(self.client.close)
+                self.assertEqual(self.cmd("CONFIG", "SET", "timeout", "0"), b"OK")
+            self.assertEqual(self.cmd("GET", seed_key), b"seed")
+
+    def test_windows_persistence_toggles(self):
+        """AOF can be enabled at runtime, survives a restart, and a rewrite
+        started after AOF is turned off still completes on Windows."""
+        if self.server is None:
+            self.skipTest("Persistence tests require --server")
+        key = self.key("toggle:value")
+        self.assertEqual(self.cmd("SET", key, "before-aof"), b"OK")
+        self.assertEqual(self.cmd("CONFIG", "SET", "appendonly", "yes"), b"OK")
+        self.wait_info_field("persistence", "aof_rewrite_in_progress", "0")
+        self.wait_info_field("persistence", "aof_enabled", "1")
+        self.assertEqual(
+            self.info_fields("persistence")["aof_last_bgrewrite_status"], "ok")
+        self.assertEqual(self.cmd("SET", key, "after-aof"), b"OK")
+        self.assertEqual(self.cmd("BGREWRITEAOF"),
+                         b"Background append only file rewriting started")
+        self.wait_info_field("persistence", "aof_rewrite_in_progress", "0")
+        self.assertEqual(
+            self.info_fields("persistence")["aof_last_bgrewrite_status"], "ok")
+        aof_path = self.server.directory / "appendonly.aof"
+        self.assertTrue(aof_path.exists(), "rewrite produced no appendonly.aof")
+        self.assertIn(b"after-aof", aof_path.read_bytes())
+
+        # With AOF off the rewrite child still has to run and be reaped.
+        self.assertEqual(self.cmd("CONFIG", "SET", "appendonly", "no"), b"OK")
+        self.assertEqual(self.info_fields("persistence")["aof_enabled"], "0")
+        self.assertEqual(self.cmd("BGREWRITEAOF"),
+                         b"Background append only file rewriting started")
+        self.wait_info_field("persistence", "aof_rewrite_in_progress", "0")
+        self.assertEqual(
+            self.info_fields("persistence")["aof_last_bgrewrite_status"], "ok")
+        self.assertEqual(self.info_fields("persistence")["aof_enabled"], "0")
+        leftovers = [path.name for path in self.server.directory.iterdir()
+                     if "rewriteaof" in path.name.lower()]
+        self.assertEqual(leftovers, [], "temporary rewrite file left behind")
+
+        # A synchronous save still round-trips through a restart.
+        self.assertEqual(self.cmd("SAVE"), b"OK")
+        self.restart()
+        self.assertEqual(self.cmd("GET", key), b"after-aof")
 
     def test_zunion_zinter_zdiff(self):
         self.cmd("DEL", "za", "zb", "out")
@@ -1951,7 +2247,7 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(group[b"pel-count"], 3)
         # COUNT also caps the pending entries lists (1-1 is still pending
         # even though its stream entry was deleted).
-        self.assertEqual([row[0] for row in group[b"pending"]],
+        self.assertEqual([self.flat_map(row)[b"id"] for row in group[b"pending"]],
                          [b"1-1", b"2-1"])
         consumers = [self.flat_map(consumer) for consumer in group[b"consumers"]]
         self.assertEqual([c[b"name"] for c in consumers], [b"c1"])
@@ -2015,6 +2311,50 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(info[b"entries-added"], 42)
         self.assertEqual(info[b"max-deleted-entry-id"], b"1-1")
 
+
+    def test_aof_timestamp_annotations(self):
+        """aof-timestamp-enabled writes #TS annotations that reload cleanly."""
+        if self.server is None:
+            self.skipTest("AOF timestamp test requires --server")
+        aof = self.server.directory / "appendonly.aof"
+        self.assertEqual(self.cmd("CONFIG", "GET", "aof-timestamp-enabled"),
+                         [b"aof-timestamp-enabled", b"no"])
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "aof-timestamp-enabled", "yes"), b"OK")
+
+        key = self.key("aof:timestamp")
+        self.assertEqual(self.cmd("SET", key, b"value"), b"OK")
+        data = aof.read_bytes()
+        stamps = [int(line[4:]) for line in data.splitlines()
+                  if line.startswith(b"#TS:")]
+        self.assertTrue(stamps, data[:80])
+        self.assertLessEqual(abs(stamps[-1] - int(time.time())), 120)
+
+        # A rewrite starts the new file with an annotation.
+        self.assertEqual(self.cmd("BGREWRITEAOF"),
+                         b"Background append only file rewriting started")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            info = self.cmd("INFO", "persistence")
+            if (b"aof_rewrite_in_progress:0" in info and
+                    b"aof_rewrite_scheduled:0" in info):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("AOF rewrite did not finish")
+        data = aof.read_bytes()
+        self.assertTrue(data.startswith(b"#TS:"), data[:80])
+
+        # Comments are skipped when the file is loaded back.
+        self.restart()
+        self.assertEqual(self.cmd("GET", key), b"value")
+
+        # Turning the option off stops new annotations.
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "aof-timestamp-enabled", "no"), b"OK")
+        self.assertEqual(self.cmd("SET", self.key("aof:no-timestamp"),
+                                  b"value"), b"OK")
+        self.assertEqual(aof.read_bytes().count(b"#TS:"), 1)
 
     def test_bitcount_bitpos_bit_ranges(self):
         key = self.key("bits")
@@ -2293,6 +2633,492 @@ class BackportRegression(unittest.TestCase):
             with self.assertRaises(RedisError) as ctx:
                 clients[owner_index].command("GET", key)
             self.assertIn("CLUSTERDOWN", str(ctx.exception))
+        finally:
+            for client in clients:
+                client.close()
+            for node in nodes:
+                node.close()
+
+    def test_cluster_addslotsrange_and_delslotsrange(self):
+        if self.server is None:
+            self.skipTest("cluster tests require --server")
+        directory = Path(self.temp.name) / "cluster-range"
+        directory.mkdir()
+        node = ManagedServer(
+            OPTIONS.server, str(directory), OPTIONS.timeout,
+            OPTIONS.startup_timeout, cluster=True,
+        )
+        try:
+            node.start()
+            client = RESP2("127.0.0.1", node.port, OPTIONS.timeout)
+            try:
+                def own_slots():
+                    for line in client.command("CLUSTER", "NODES").splitlines():
+                        if b"myself" in line:
+                            return line.split(b"connected", 1)[1].split()
+                    return []
+
+                def wait_state(state):
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        if state in client.command("CLUSTER", "INFO"):
+                            return True
+                        time.sleep(0.1)
+                    return False
+
+                # Several ranges in one command, gaps preserved.
+                self.assertEqual(
+                    client.command(
+                        "CLUSTER", "ADDSLOTSRANGE", "0", "5", "10", "12"
+                    ),
+                    b"OK",
+                )
+                self.assertEqual(own_slots(), [b"0-5", b"10-12"])
+
+                # Every rejected form must leave the assignment untouched.
+                with self.assertRaises(RedisError) as ctx:
+                    client.command("CLUSTER", "ADDSLOTSRANGE", "20", "30", "40")
+                self.assertIn("wrong number of arguments", str(ctx.exception))
+                with self.assertRaises(RedisError) as ctx:
+                    client.command("CLUSTER", "ADDSLOTSRANGE", "20", "15")
+                self.assertIn("greater", str(ctx.exception))
+                with self.assertRaises(RedisError) as ctx:
+                    client.command("CLUSTER", "ADDSLOTSRANGE", "3", "8")
+                self.assertIn("already busy", str(ctx.exception))
+                with self.assertRaises(RedisError) as ctx:
+                    client.command(
+                        "CLUSTER", "ADDSLOTSRANGE", "20", "30", "25", "35"
+                    )
+                self.assertIn("multiple times", str(ctx.exception))
+                with self.assertRaises(RedisError) as ctx:
+                    client.command("CLUSTER", "ADDSLOTSRANGE", "16390", "16400")
+                self.assertIn("out of range", str(ctx.exception))
+                self.assertEqual(own_slots(), [b"0-5", b"10-12"])
+
+                # Deleting part of a range splits it without touching the rest.
+                self.assertEqual(
+                    client.command("CLUSTER", "DELSLOTSRANGE", "2", "4"), b"OK"
+                )
+                self.assertEqual(own_slots(), [b"0-1", b"5", b"10-12"])
+                with self.assertRaises(RedisError) as ctx:
+                    client.command("CLUSTER", "DELSLOTSRANGE", "100", "120")
+                self.assertIn("already unassigned", str(ctx.exception))
+                with self.assertRaises(RedisError) as ctx:
+                    client.command("CLUSTER", "DELSLOTSRANGE", "0", "1", "0", "1")
+                self.assertIn("multiple times", str(ctx.exception))
+
+                # Assigning every slot through ranges makes the cluster usable.
+                self.assertEqual(
+                    client.command(
+                        "CLUSTER", "DELSLOTSRANGE",
+                        "0", "1", "5", "5", "10", "12",
+                    ),
+                    b"OK",
+                )
+                self.assertEqual(own_slots(), [])
+                self.assertEqual(
+                    client.command("CLUSTER", "ADDSLOTSRANGE", "0", "16383"),
+                    b"OK",
+                )
+                self.assertTrue(wait_state(b"cluster_state:ok"))
+                slots = client.command("CLUSTER", "SLOTS")
+                self.assertEqual(len(slots), 1)
+                self.assertEqual((slots[0][0], slots[0][1]), (0, 16383))
+
+                key = self.prefix + b"slotrange-key"
+                self.assertEqual(client.command("SET", key, b"value"), b"OK")
+                slot = client.command("CLUSTER", "KEYSLOT", key)
+                self.assertEqual(client.command("GET", key), b"value")
+
+                # Freeing a range that owns data takes the cluster down, and
+                # assigning it back restores both the state and the key.
+                self.assertEqual(
+                    client.command("CLUSTER", "DELSLOTSRANGE", slot, slot),
+                    b"OK",
+                )
+                self.assertTrue(wait_state(b"cluster_state:fail"))
+                with self.assertRaises(RedisError) as ctx:
+                    client.command("GET", key)
+                self.assertIn("CLUSTERDOWN", str(ctx.exception))
+                self.assertEqual(
+                    client.command("CLUSTER", "ADDSLOTSRANGE", slot, slot),
+                    b"OK",
+                )
+                self.assertTrue(wait_state(b"cluster_state:ok"))
+                self.assertEqual(client.command("GET", key), b"value")
+            finally:
+                client.close()
+        finally:
+            node.close()
+
+    def test_cluster_shards_and_links(self):
+        if self.server is None:
+            self.skipTest("cluster tests require --server")
+        nodes = []
+        clients = []
+        try:
+            directory = Path(self.temp.name) / "cluster-shards"
+            directory.mkdir()
+            node = ManagedServer(
+                OPTIONS.server, str(directory), OPTIONS.timeout,
+                OPTIONS.startup_timeout, cluster=True,
+            )
+            node.start()
+            nodes.append(node)
+            clients.append(RESP2("127.0.0.1", node.port, OPTIONS.timeout))
+
+            self.assertEqual(
+                clients[0].command("CLUSTER", "ADDSLOTSRANGE", "0", "16383"),
+                b"OK",
+            )
+            shards = clients[0].command("CLUSTER", "SHARDS")
+            self.assertEqual(len(shards), 1)
+            shard = self.flat_map(shards[0])
+            self.assertEqual(shard[b"slots"], [0, 16383])
+            self.assertEqual(len(shard[b"nodes"]), 1)
+            node_map = self.flat_map(shard[b"nodes"][0])
+            self.assertEqual(len(node_map[b"id"]), 40)
+            self.assertEqual(node_map[b"endpoint"], b"127.0.0.1")
+            self.assertEqual(node_map[b"ip"], b"127.0.0.1")
+            self.assertEqual(node_map[b"port"], node.port)
+            self.assertEqual(node_map[b"role"], b"master")
+            self.assertEqual(node_map[b"health"], b"online")
+            self.assertIn(b"replication-offset", node_map)
+
+            links = clients[0].command("CLUSTER", "LINKS")
+            self.assertEqual(links, [])
+            help_text = b"\n".join(clients[0].command("CLUSTER", "HELP"))
+            self.assertIn(b"SHARDS", help_text)
+            self.assertIn(b"LINKS", help_text)
+
+            # A second node yields two shards and both bus link directions.
+            directory = Path(self.temp.name) / "cluster-links"
+            directory.mkdir()
+            peer = ManagedServer(
+                OPTIONS.server, str(directory), OPTIONS.timeout,
+                OPTIONS.startup_timeout, cluster=True,
+            )
+            peer.start()
+            nodes.append(peer)
+            clients.append(RESP2("127.0.0.1", peer.port, OPTIONS.timeout))
+            self.assertEqual(
+                clients[0].command("CLUSTER", "MEET", "127.0.0.1", peer.port),
+                b"OK",
+            )
+            self.assertEqual(
+                clients[1].command(
+                    "CLUSTER", "ADDSLOTSRANGE", "16383", "16383"
+                ),
+                b"OK",
+            )
+
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                links = clients[0].command("CLUSTER", "LINKS")
+                shards = clients[0].command("CLUSTER", "SHARDS")
+                directions = {
+                    self.flat_map(item)[b"direction"] for item in links
+                }
+                if directions == {b"to", b"from"} and len(shards) >= 1:
+                    break
+                time.sleep(0.2)
+            self.assertEqual(directions, {b"to", b"from"})
+            for item in links:
+                info = self.flat_map(item)
+                self.assertEqual(len(info[b"node"]), 40)
+                self.assertIn(info[b"direction"], (b"to", b"from"))
+                self.assertIn(info[b"events"], (b"r", b"rw", b"w", b""))
+                self.assertIn(b"create-time", info)
+                self.assertIn(b"send-buffer-allocated", info)
+                self.assertIn(b"send-buffer-used", info)
+
+            hello3 = clients[0].command("HELLO", "3")
+            self.assertEqual(self.flat_map(hello3)[b"proto"], 3)
+            resp3_shards = clients[0].command("CLUSTER", "SHARDS")
+            resp3_shard = self.flat_map(resp3_shards[0])
+            self.assertEqual(resp3_shard[b"slots"], [0, 16383])
+            self.assertEqual(
+                self.flat_map(resp3_shard[b"nodes"][0])[b"role"], b"master"
+            )
+            for item in clients[0].command("CLUSTER", "LINKS"):
+                self.assertEqual(len(self.flat_map(item)), 6)
+        finally:
+            for client in clients:
+                client.close()
+            for node in nodes:
+                node.close()
+
+    def test_cluster_tls_bus(self):
+        if self.server is None:
+            self.skipTest("cluster tests require --server")
+        certs = self.server.tls
+        nodes = []
+        clients = []
+        try:
+            for index in range(2):
+                directory = Path(self.temp.name) / ("cluster-tls-%d" % index)
+                directory.mkdir()
+                node = ManagedServer(
+                    OPTIONS.server, str(directory), OPTIONS.timeout,
+                    OPTIONS.startup_timeout, cluster=True, tls=certs,
+                    extra_config="tls-cluster yes\n",
+                )
+                node.start()
+                nodes.append(node)
+                clients.append(RESP2("127.0.0.1", node.port, OPTIONS.timeout))
+
+            for client in clients:
+                config = self.flat_map(
+                    client.command("CONFIG", "GET", "tls-cluster"))
+                self.assertEqual(config[b"tls-cluster"], b"yes")
+
+            self.assertEqual(
+                clients[0].command("CLUSTER", "MEET", "127.0.0.1", nodes[1].port),
+                b"OK",
+            )
+            ranges = ((0, 8191), (8192, 16383))
+            for client, (low, high) in zip(clients, ranges):
+                self.assertEqual(
+                    client.command(
+                        "CLUSTER", "ADDSLOTS",
+                        *[str(slot) for slot in range(low, high + 1)]
+                    ),
+                    b"OK",
+                )
+
+            deadline = time.monotonic() + 15
+            infos = []
+            while time.monotonic() < deadline:
+                infos = [client.command("CLUSTER", "INFO") for client in clients]
+                if all(
+                    b"cluster_state:ok" in info
+                    and b"cluster_known_nodes:2" in info
+                    for info in infos
+                ):
+                    break
+                time.sleep(0.2)
+            self.assertTrue(
+                all(b"cluster_state:ok" in info for info in infos), infos)
+
+            # Every peer must be reachable over the encrypted bus.
+            lines = clients[0].command("CLUSTER", "NODES").splitlines()
+            self.assertEqual(len(lines), 2)
+            for line in lines:
+                self.assertNotIn(b"disconnected", line)
+                self.assertIn(b"connected", line)
+
+            # The bus port now speaks TLS: a plaintext cluster message gets
+            # no plaintext answer, only a TLS alert or a closed connection.
+            with socket.create_connection(
+                    ("127.0.0.1", nodes[0].port + 10000), timeout=3) as raw:
+                raw.settimeout(2)
+                raw.sendall(b"RCmb" + b"\x00\x00\x00\x08")
+                try:
+                    answer = raw.recv(4)
+                except OSError:
+                    answer = b""
+                self.assertFalse(answer.startswith(b"RCmb"))
+        finally:
+            for client in clients:
+                client.close()
+            for node in nodes:
+                node.close()
+
+    def test_ops_config_and_client_traffic(self):
+        def config(name):
+            return self.flat_map(self.cmd("CONFIG", "GET", name))[name.encode()]
+
+        self.assertEqual(config("shutdown-timeout"), b"10")
+        self.assertEqual(config("repl-diskless-sync-max-replicas"), b"0")
+        self.assertEqual(config("replica-announced"), b"yes")
+        self.assertEqual(config("cluster-preferred-endpoint"), b"ip")
+        self.assertEqual(config("cluster-announce-hostname"), b"")
+
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "shutdown-timeout", "3"), b"OK")
+        self.assertEqual(config("shutdown-timeout"), b"3")
+        with self.assertRaises(RedisError):
+            self.cmd("CONFIG", "SET", "shutdown-timeout", "-1")
+        self.assertEqual(config("shutdown-timeout"), b"3")
+
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "repl-diskless-sync-max-replicas", "4"),
+            b"OK")
+        self.assertEqual(config("repl-diskless-sync-max-replicas"), b"4")
+        with self.assertRaises(RedisError):
+            self.cmd("CONFIG", "SET", "repl-diskless-sync-max-replicas", "-2")
+        self.assertEqual(config("repl-diskless-sync-max-replicas"), b"4")
+
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "replica-announced", "no"), b"OK")
+        self.assertEqual(config("replica-announced"), b"no")
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "replica-announced", "yes"), b"OK")
+
+        with self.assertRaises(RedisError):
+            self.cmd("CONFIG", "SET", "cluster-preferred-endpoint", "address")
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "cluster-preferred-endpoint", "hostname"),
+            b"OK")
+        self.assertEqual(config("cluster-preferred-endpoint"), b"hostname")
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "cluster-announce-hostname", "unit-host"),
+            b"OK")
+        self.assertEqual(config("cluster-announce-hostname"), b"unit-host")
+        with self.assertRaises(RedisError):
+            self.cmd("CONFIG", "SET", "cluster-announce-hostname", "h" * 40)
+        self.assertEqual(config("cluster-announce-hostname"), b"unit-host")
+
+        replication_info = self.cmd("INFO", "replication").decode()
+        self.assertIn("master_failover_state:no-failover", replication_info)
+
+        def traffic():
+            line = self.cmd("CLIENT", "INFO").decode()
+            fields = dict(part.split("=", 1) for part in line.split())
+            return int(fields["tot-net-in"]), int(fields["tot-net-out"])
+
+        first_in, first_out = traffic()
+        self.cmd("PING")
+        self.cmd("SET", self.key("traffic"), b"x" * 100)
+        second_in, second_out = traffic()
+        self.assertGreater(second_in, first_in)
+        self.assertGreater(second_out, first_out)
+
+    def test_cluster_hostname_and_replica_announced(self):
+        if self.server is None:
+            self.skipTest("cluster tests require --server")
+        nodes = []
+        clients = []
+        try:
+            directory = Path(self.temp.name) / "cluster-announce-0"
+            directory.mkdir()
+            master_node = ManagedServer(
+                OPTIONS.server, str(directory), OPTIONS.timeout,
+                OPTIONS.startup_timeout, cluster=True,
+                extra_config=(
+                    "cluster-announce-hostname node-alpha\n"
+                    "cluster-preferred-endpoint hostname\n"
+                ),
+            )
+            master_node.start()
+            nodes.append(master_node)
+            master = RESP2("127.0.0.1", master_node.port, OPTIONS.timeout)
+            clients.append(master)
+
+            directory = Path(self.temp.name) / "cluster-announce-1"
+            directory.mkdir()
+            replica_node = ManagedServer(
+                OPTIONS.server, str(directory), OPTIONS.timeout,
+                OPTIONS.startup_timeout, cluster=True,
+            )
+            replica_node.start()
+            nodes.append(replica_node)
+            replica = RESP2("127.0.0.1", replica_node.port, OPTIONS.timeout)
+            clients.append(replica)
+
+            def wait_for(predicate, timeout=20):
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    if predicate():
+                        return True
+                    time.sleep(0.1)
+                return False
+
+            self.assertEqual(
+                master.command("CLUSTER", "MEET", "127.0.0.1",
+                               replica_node.port),
+                b"OK",
+            )
+            self.assertTrue(
+                wait_for(lambda: all(
+                    b"cluster_known_nodes:2" in client.command("CLUSTER", "INFO")
+                    for client in clients)),
+                "nodes did not discover each other",
+            )
+            self.assertEqual(
+                master.command(
+                    "CLUSTER", "ADDSLOTS",
+                    *[str(slot) for slot in range(16384)]),
+                b"OK",
+            )
+            master_id = master.command("CLUSTER", "MYID")
+            self.assertEqual(
+                replica.command("CLUSTER", "REPLICATE", master_id), b"OK")
+
+            def replica_online():
+                info = master.command("INFO", "replication").decode()
+                return ("connected_slaves:1" in info and
+                        "state=online" in info)
+
+            self.assertTrue(wait_for(replica_online),
+                            "replica did not reach the online state")
+            # The master's cluster view learns the replica association from the
+            # bus, which can trail the replication link by a moment.
+            self.assertTrue(
+                wait_for(lambda: len(master.command("CLUSTER", "SLOTS")[0]) == 4),
+                "replica did not appear in CLUSTER SLOTS",
+            )
+
+            nodes_description = master.command("CLUSTER", "NODES")
+            self.assertIn(b",node-alpha", nodes_description)
+            self.assertEqual(
+                self.flat_map(
+                    master.command("CONFIG", "GET",
+                                   "cluster-announce-hostname")
+                )[b"cluster-announce-hostname"],
+                b"node-alpha",
+            )
+
+            slots = master.command("CLUSTER", "SLOTS")
+            self.assertEqual(len(slots), 1)
+            self.assertEqual(len(slots[0]), 4)  # range, master, one replica
+            self.assertEqual(slots[0][2][0], b"node-alpha")
+            self.assertEqual(slots[0][2][1], master_node.port)
+            self.assertEqual(slots[0][2][2], master_id)
+            self.assertEqual(slots[0][2][3], b"node-alpha")
+            self.assertEqual(slots[0][3][0], b"127.0.0.1")
+            self.assertEqual(slots[0][3][1], replica_node.port)
+            self.assertEqual(slots[0][3][3], b"")
+
+            def shard_nodes():
+                shards = master.command("CLUSTER", "SHARDS")
+                self.assertEqual(len(shards), 1)
+                shard = self.flat_map(shards[0])
+                return [self.flat_map(node) for node in shard[b"nodes"]]
+
+            node_maps = shard_nodes()
+            self.assertEqual(len(node_maps), 2)
+            master_map = [n for n in node_maps if n[b"role"] == b"master"][0]
+            replica_map = [n for n in node_maps if n[b"role"] == b"replica"][0]
+            self.assertEqual(master_map[b"endpoint"], b"node-alpha")
+            self.assertEqual(master_map[b"hostname"], b"node-alpha")
+            self.assertEqual(master_map[b"ip"], b"127.0.0.1")
+            self.assertEqual(replica_map[b"endpoint"], b"127.0.0.1")
+            self.assertEqual(replica_map[b"hostname"], b"")
+
+            # Hiding the replica must remove it from the topology reported by
+            # its master, both in CLUSTER SLOTS and CLUSTER SHARDS.
+            self.assertEqual(
+                replica.command("CONFIG", "SET", "replica-announced", "no"),
+                b"OK",
+            )
+            self.assertTrue(
+                wait_for(lambda: len(master.command("CLUSTER", "SLOTS")[0]) == 3),
+                "hidden replica still present in CLUSTER SLOTS",
+            )
+            self.assertTrue(
+                wait_for(lambda: len(shard_nodes()) == 1),
+                "hidden replica still present in CLUSTER SHARDS",
+            )
+
+            self.assertEqual(
+                replica.command("CONFIG", "SET", "replica-announced", "yes"),
+                b"OK",
+            )
+            self.assertTrue(
+                wait_for(lambda: len(master.command("CLUSTER", "SLOTS")[0]) == 4),
+                "replica was not announced again",
+            )
         finally:
             for client in clients:
                 client.close()
@@ -2657,6 +3483,83 @@ class BackportRegression(unittest.TestCase):
         while time.monotonic() < deadline and extra.process.poll() is None:
             time.sleep(0.05)
         self.assertIsNotNone(extra.process.poll())
+
+    def test_shutdown_timeout_waits_for_replicas(self):
+        if self.server is None:
+            self.skipTest("SHUTDOWN tests require --server")
+        nodes = []
+        clients = []
+        try:
+            directory = Path(self.temp.name) / "shutdown-timeout-master"
+            directory.mkdir()
+            master = ManagedServer(
+                self.server.executable, directory, OPTIONS.timeout,
+                OPTIONS.startup_timeout, extra_config="shutdown-timeout 2\n",
+            )
+            master.start()
+            nodes.append(master)
+
+            directory = Path(self.temp.name) / "shutdown-timeout-replica"
+            directory.mkdir()
+            replica = ManagedServer(
+                self.server.executable, directory, OPTIONS.timeout,
+                OPTIONS.startup_timeout,
+                replicaof=("127.0.0.1", master.port),
+            )
+            replica.start()
+            nodes.append(replica)
+
+            master_client = RESP2("127.0.0.1", master.port, OPTIONS.timeout)
+            clients.append(master_client)
+            replica_client = RESP2("127.0.0.1", replica.port, OPTIONS.timeout)
+            clients.append(replica_client)
+
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                info = master_client.command("INFO", "replication").decode()
+                if "connected_slaves:1" in info and "state=online" in info:
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("replica did not reach the online state")
+
+            # Stop the replica from acknowledging offsets while the master
+            # keeps generating new ones, so the shutdown handler has to wait.
+            def block_replica():
+                try:
+                    replica_client.command("DEBUG", "SLEEP", "5")
+                except (OSError, EOFError, RedisError):
+                    pass  # The reply may arrive after the socket timeout.
+
+            sleeper = threading.Thread(target=block_replica)
+            sleeper.start()
+            time.sleep(0.2)
+            master_client.command(
+                "SET", self.prefix + b"shutdown-timeout", b"value")
+
+            started = time.monotonic()
+            try:
+                master_client.command("SHUTDOWN", "NOSAVE")
+            except (OSError, EOFError, RedisError):
+                pass
+            elapsed = time.monotonic() - started
+            self.assertGreaterEqual(
+                elapsed, 1.5, "SHUTDOWN did not wait for lagging replicas")
+            self.assertLess(
+                elapsed, 4.5, "SHUTDOWN waited beyond shutdown-timeout")
+
+            deadline = time.monotonic() + 10
+            while (time.monotonic() < deadline and
+                   master.process.poll() is None):
+                time.sleep(0.05)
+            self.assertIsNotNone(master.process.poll())
+            sleeper.join(timeout=10)
+            self.assertFalse(sleeper.is_alive())
+        finally:
+            for client in clients:
+                client.close()
+            for node in nodes:
+                node.close()
 
     def test_acl_log_and_acl_list(self):
         self.assertEqual(self.cmd("ACL", "SETUSER", "bp9limited", "on", ">pw",
@@ -3238,6 +4141,78 @@ class BackportRegression(unittest.TestCase):
         self.assertIsNone(self.cmd("ZSCORE", key, "missing"))
         self.assertIsNone(self.cmd("GET", self.key("resp3:absent")))
 
+    def test_resp3_map_replies(self):
+        # RESP2 keeps the historical flat field/value arrays.
+        config = self.cmd("CONFIG", "GET", "maxmemory", "appendonly")
+        self.assertFalse(any(isinstance(item, tuple) for item in config))
+        stats = self.cmd("MEMORY", "STATS")
+        self.assertFalse(any(isinstance(item, tuple) for item in stats))
+
+        self.cmd("HELLO", "3")
+        self.addCleanup(lambda: self.cmd("HELLO", "2"))
+
+        config = self.cmd("CONFIG", "GET", "maxmemory", "appendonly")
+        self.assertTrue(config)
+        self.assertTrue(all(isinstance(item, tuple) for item in config))
+        config = dict(config)
+        self.assertIn(b"maxmemory", config)
+        self.assertIn(b"appendonly", config)
+
+        key = self.key("resp3:stream")
+        self.cmd("DEL", key)
+        self.cmd("XADD", key, "1-1", "f", "1")
+        self.cmd("XADD", key, "2-1", "f", "2")
+        self.cmd("XGROUP", "CREATE", key, "g", "0")
+        self.cmd("XREADGROUP", "GROUP", "g", "c1", "COUNT", "2",
+                 "STREAMS", key, ">")
+
+        stats = self.cmd("MEMORY", "STATS")
+        self.assertTrue(all(isinstance(item, tuple) for item in stats))
+        stats = dict(stats)
+        self.assertIsInstance(stats[b"db.0"], list)
+        self.assertTrue(stats[b"db.0"])
+        self.assertTrue(all(isinstance(item, tuple) for item in stats[b"db.0"]))
+        self.assertIn(b"overhead.hashtable.main", dict(stats[b"db.0"]))
+
+        info = self.cmd("XINFO", "STREAM", key)
+        self.assertTrue(all(isinstance(item, tuple) for item in info))
+        info = dict(info)
+        self.assertEqual(info[b"length"], 2)
+
+        groups = self.cmd("XINFO", "GROUPS", key)
+        self.assertTrue(all(isinstance(item, tuple) for item in groups[0]))
+        group = dict(groups[0])
+        self.assertEqual(group[b"name"], b"g")
+
+        consumers = self.cmd("XINFO", "CONSUMERS", key, "g")
+        self.assertTrue(all(isinstance(item, tuple) for item in consumers[0]))
+        consumer = dict(consumers[0])
+        self.assertEqual(consumer[b"name"], b"c1")
+
+        full = dict(self.cmd("XINFO", "STREAM", key, "FULL"))
+        group = dict(full[b"groups"][0])
+        pending = dict(group[b"pending"][0])
+        self.assertEqual(pending[b"id"], b"1-1")
+        self.assertEqual(pending[b"consumer"], b"c1")
+        self.assertIn(b"delivery-time", pending)
+        self.assertIn(b"delivery-count", pending)
+        consumer = dict(group[b"consumers"][0])
+        pending = dict(consumer[b"pending"][0])
+        self.assertEqual(pending[b"id"], b"1-1")
+        self.assertIn(b"delivery-time", pending)
+        self.assertIn(b"delivery-count", pending)
+
+        for _ in range(3):
+            self.cmd("GET", "resp3:latency:missing")
+        histogram = self.cmd("LATENCY", "HISTOGRAM", "get")
+        self.assertTrue(all(isinstance(item, tuple) for item in histogram))
+        entry = dict(dict(histogram)[b"get"])
+        self.assertGreaterEqual(entry[b"calls"], 3)
+        buckets = entry[b"histogram_usec"]
+        self.assertTrue(buckets)
+        self.assertTrue(all(isinstance(item, tuple) for item in buckets))
+        self.assertEqual(list(dict(buckets).values())[-1], entry[b"calls"])
+
     def test_xinfo_consumers_inactive(self):
         key = self.key("xinfo:inactive")
         self.cmd("DEL", key)
@@ -3484,6 +4459,74 @@ class BackportRegression(unittest.TestCase):
         msg = bcast._read()
         self.assertEqual(msg, [b"invalidate", None])
 
+    def test_resp3_subscribed_connection_runs_commands(self):
+        """A RESP3 subscriber may run any command; RESP2 stays restricted."""
+        channel = "resp3-subscribed"
+        sub = self.connect()
+        self.addCleanup(sub.close)
+        self.assertEqual(self.flat_map(sub.command("HELLO", "3"))[b"proto"], 3)
+        self.assertEqual(sub.command("SUBSCRIBE", channel),
+                         [b"subscribe", b"resp3-subscribed", 1])
+
+        key = self.key("resp3-sub")
+        self.assertEqual(sub.command("SET", key, b"value"), b"OK")
+        self.assertEqual(sub.command("GET", key), b"value")
+        self.assertEqual(sub.command("INCR", self.key("resp3-counter")), 1)
+        self.assertEqual(sub.command("PING"), b"PONG")
+
+        # Deliveries still arrive as push frames on the same connection.
+        self.assertEqual(self.cmd("PUBLISH", channel, b"payload"), 1)
+        self.assertEqual(sub.reader.readline(), b">3\r\n")
+        self.assertEqual([sub._read() for _ in range(3)],
+                         [b"message", b"resp3-subscribed", b"payload"])
+
+        # Commands keep working after a delivery, and subscriptions still close.
+        self.assertEqual(sub.command("DEL", key), 1)
+        self.assertEqual(sub.command("UNSUBSCRIBE", channel),
+                         [b"unsubscribe", b"resp3-subscribed", 0])
+        self.assertEqual(sub.command("GET", self.key("resp3-missing")), None)
+
+        # RESP2 keeps the old gate and the Pub/Sub PING array form.
+        plain = self.connect()
+        self.addCleanup(plain.close)
+        self.assertEqual(plain.command("SUBSCRIBE", "resp2-plain"),
+                         [b"subscribe", b"resp2-plain", 1])
+        with self.assertRaises(RedisError):
+            plain.command("GET", key)
+        self.assertEqual(plain.command("PING"), [b"pong", b""])
+
+    def test_keyspace_notifications_new_and_keymiss(self):
+        """n reports new keys, m reports reads of missing keys; A excludes both."""
+        sub = self.connect()
+        self.addCleanup(sub.close)
+        self.assertEqual(sub.command("PSUBSCRIBE", "__keyevent@0__:*"),
+                         [b"psubscribe", b"__keyevent@0__:*", 1])
+
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "notify-keyspace-events", "KEA"), b"OK")
+        self.assertEqual(self.cmd("CONFIG", "GET", "notify-keyspace-events"),
+                         [b"notify-keyspace-events", b"AKE"])
+
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "notify-keyspace-events", "KEnm"), b"OK")
+        configured = self.cmd("CONFIG", "GET", "notify-keyspace-events")
+        self.assertEqual(configured[0], b"notify-keyspace-events")
+        self.assertEqual(set(configured[1]) - set(b"KE"), set(b"nm"))
+
+        key = self.key("notify-new")
+        self.assertEqual(self.cmd("SET", key, b"value"), b"OK")
+        self.assertEqual(sub._read(),
+                         [b"pmessage", b"__keyevent@0__:*",
+                          b"__keyevent@0__:new", key])
+
+        # A hit is silent, a miss reports "keymiss".
+        self.assertEqual(self.cmd("GET", key), b"value")
+        missing = self.key("notify-missing")
+        self.assertIsNone(self.cmd("GET", missing))
+        self.assertEqual(sub._read(),
+                         [b"pmessage", b"__keyevent@0__:*",
+                          b"__keyevent@0__:keymiss", missing])
+
     def test_quit_script_help_and_command_info(self):
         # QUIT is a registered command (COMMAND INFO / COUNT see it).
         info = self.cmd("COMMAND", "INFO", "quit", "ping")
@@ -3603,6 +4646,290 @@ class BackportRegression(unittest.TestCase):
         with self.assertRaises(RedisError):
             self.cmd("RESTORE", self.key("dump:badfreq"), "0", dump,
                      "FREQ", "999")
+
+    def test_sanitize_dump_payload(self):
+        if self.server is None:
+            self.skipTest("sanitize-dump-payload tests require --server")
+
+        # Reference vector for the CRC64 variant used by DUMP footers.
+        self.assertEqual(crc64(b"123456789"), 0xE9C6D914C4B8D9CA)
+
+        def get_option():
+            return self.cmd("CONFIG", "GET", "sanitize-dump-payload")
+
+        self.assertEqual(get_option(), [b"sanitize-dump-payload", b"no"])
+        with self.assertRaises(RedisError):
+            self.cmd("CONFIG", "SET", "sanitize-dump-payload", "sometimes")
+        self.assertEqual(get_option(), [b"sanitize-dump-payload", b"no"])
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "sanitize-dump-payload", "yes"), b"OK")
+        self.assertEqual(get_option(), [b"sanitize-dump-payload", b"yes"])
+
+        def roundtrip(name, build, read):
+            src = self.key("san:" + name)
+            dst = self.key("san:" + name + ":copy")
+            self.cmd("DEL", src, dst)
+            build(src)
+            payload = self.cmd("DUMP", src)
+            self.assertEqual(
+                self.cmd("RESTORE", dst, "0", payload), b"OK",
+                "%s rejected by sanitize-dump-payload" % name)
+            self.assertEqual(read(dst), read(src), name)
+            return payload
+
+        def hgetall(key):
+            flat = self.cmd("HGETALL", key)
+            return sorted(zip(flat[0::2], flat[1::2]))
+
+        def zrange(key):
+            return self.cmd("ZRANGE", key, "0", "-1", "WITHSCORES")
+
+        roundtrip("string", lambda k: self.cmd("SET", k, b"plain value"),
+                  lambda k: self.cmd("GET", k))
+        roundtrip("int-string", lambda k: self.cmd("SET", k, b"1234567890"),
+                  lambda k: self.cmd("GET", k))
+        roundtrip("lzf-string",
+                  lambda k: self.cmd("SET", k, b"compress-me-" * 500),
+                  lambda k: self.cmd("GET", k))
+        roundtrip("ziplist-list",
+                  lambda k: self.cmd("RPUSH", k, b"a", b"b", b"c", b"d"),
+                  lambda k: self.cmd("LRANGE", k, "0", "-1"))
+        roundtrip("quicklist",
+                  lambda k: self.cmd("RPUSH", k,
+                                     *[b"%04d-" % i + b"x" * 200
+                                       for i in range(400)]),
+                  lambda k: self.cmd("LRANGE", k, "0", "-1"))
+        roundtrip("intset",
+                  lambda k: self.cmd("SADD", k, *[str(i) for i in range(50)]),
+                  lambda k: sorted(self.cmd("SMEMBERS", k)))
+        roundtrip("hashtable-set",
+                  lambda k: self.cmd("SADD", k,
+                                     *[b"member-%d" % i for i in range(600)]),
+                  lambda k: sorted(self.cmd("SMEMBERS", k)))
+        roundtrip("ziplist-hash",
+                  lambda k: self.cmd("HSET", k, "f1", "v1", "f2", "v2"),
+                  hgetall)
+        roundtrip("hashtable-hash",
+                  lambda k: self.cmd(
+                      "HSET", k,
+                      *[item for i in range(600)
+                        for item in ("f%d" % i, "v%d" % i)]),
+                  hgetall)
+        roundtrip("ziplist-zset",
+                  lambda k: self.cmd("ZADD", k, "1", "a", "2", "b", "3", "c"),
+                  zrange)
+        roundtrip("skiplist-zset",
+                  lambda k: self.cmd(
+                      "ZADD", k,
+                      *[item for i in range(300)
+                        for item in (str(i), "m%d" % i)]),
+                  zrange)
+        def build_stream(key):
+            self.cmd("XADD", key, "1-0", "f", "v")
+            self.cmd("XADD", key, "2-0", "f", "w")
+
+        roundtrip("stream", build_stream,
+                  lambda k: self.cmd("XRANGE", k, "-", "+"))
+
+        def build_stream_group(key):
+            for i in range(1, 6):
+                self.cmd("XADD", key, "%d-0" % i, "f", "v%d" % i)
+            self.cmd("XGROUP", "CREATE", key, "grp", "0")
+            self.cmd("XREADGROUP", "GROUP", "grp", "alice", "COUNT", "2",
+                     "STREAMS", key, ">")
+
+        def read_stream_group(key):
+            # entries-read/lag are recomputed on load, so compare the entries,
+            # the pending summary and the per-consumer pending counts instead.
+            return (self.cmd("XLEN", key),
+                    self.cmd("XRANGE", key, "-", "+"),
+                    self.cmd("XPENDING", key, "grp"))
+
+        roundtrip("stream-group", build_stream_group, read_stream_group)
+
+        # A ziplist whose first entry has a non-zero prevlen, wrapped in a
+        # quicklist. The DUMP footer is valid, so only a structural walk can
+        # tell that the value is corrupt.
+        bad_ziplist = (struct.pack("<I", 13) + struct.pack("<I", 10) +
+                       struct.pack("<H", 1) + b"\x01\x00" + b"\xff")
+        self.assertEqual(len(bad_ziplist), 13)
+        bad_quicklist = dump_payload(b"\x0e\x01\x0d" + bad_ziplist)
+
+        # A quicklist that claims to contain no nodes at all.
+        empty_quicklist = dump_payload(b"\x0e\x00")
+
+        # A truncated copy of a valid hash-ziplist payload.
+        hash_payload = self.cmd("DUMP", self.key("san:ziplist-hash"))
+        truncated = dump_payload(hash_payload[:-11])
+
+        for name, payload in (("san:bad-quicklist", bad_quicklist),
+                              ("san:empty-quicklist", empty_quicklist),
+                              ("san:truncated", truncated)):
+            key = self.key(name)
+            self.cmd("DEL", key)
+            with self.assertRaises(RedisError):
+                self.cmd("RESTORE", key, "0", payload)
+            self.assertEqual(self.cmd("EXISTS", key), 0, name)
+            self.assertEqual(self.cmd("PING"), b"PONG")
+
+        # "clients" validates client connections but not master streams.
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "sanitize-dump-payload", "clients"),
+            b"OK")
+        clients_key = self.key("san:clients-bad")
+        with self.assertRaises(RedisError):
+            self.cmd("RESTORE", clients_key, "0", bad_quicklist)
+        self.assertEqual(self.cmd("EXISTS", clients_key), 0)
+        clients_src = self.key("san:clients-ok")
+        clients_dst = self.key("san:clients-ok:copy")
+        self.cmd("DEL", clients_src, clients_dst)
+        self.cmd("RPUSH", clients_src, "a", "b")
+        payload = self.cmd("DUMP", clients_src)
+        self.assertEqual(self.cmd("RESTORE", clients_dst, "0", payload), b"OK")
+
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "sanitize-dump-payload", "no"), b"OK")
+        self.assertEqual(get_option(), [b"sanitize-dump-payload", b"no"])
+
+        # The option must also be accepted from a configuration file and be
+        # preserved by CONFIG REWRITE.
+        conf_dir = Path(self.temp.name) / "sanitize-conf"
+        conf_dir.mkdir()
+        conf_server = ManagedServer(
+            OPTIONS.server, conf_dir, OPTIONS.timeout, OPTIONS.startup_timeout,
+            extra_config="sanitize-dump-payload clients\n")
+        self.addCleanup(conf_server.close)
+        conf_server.start()
+        with RESP2("127.0.0.1", conf_server.port, OPTIONS.timeout) as r:
+            self.assertEqual(r.command("CONFIG", "GET", "sanitize-dump-payload"),
+                             [b"sanitize-dump-payload", b"clients"])
+            with self.assertRaises(RedisError):
+                r.command("RESTORE", b"san:conf-bad", b"0", bad_quicklist)
+            self.assertEqual(r.command("SET", b"san:conf-ok", b"ok"), b"OK")
+            ok_payload = r.command("DUMP", b"san:conf-ok")
+            self.assertEqual(
+                r.command("RESTORE", b"san:conf-copy", b"0", ok_payload), b"OK")
+            self.assertEqual(r.command("CONFIG", "REWRITE"), b"OK")
+        self.assertIn(
+            "sanitize-dump-payload clients",
+            (conf_dir / "redis.conf").read_text(encoding="ascii"))
+
+    def test_failover_command(self):
+        if self.server is None:
+            self.skipTest("FAILOVER tests require --server")
+
+        master = self.server
+        replica_dir = Path(self.temp.name) / "failover-replica"
+        replica_dir.mkdir()
+        replica = ManagedServer(
+            OPTIONS.server, replica_dir, OPTIONS.timeout, OPTIONS.startup_timeout,
+            replicaof=("127.0.0.1", master.port))
+        self.addCleanup(replica.close)
+        replica.start()
+        replica_client = RESP2("127.0.0.1", replica.port, OPTIONS.timeout)
+        self.addCleanup(replica_client.close)
+
+        def wait_until(predicate, timeout=20):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    if predicate():
+                        return
+                except (OSError, EOFError, RedisError):
+                    pass
+                time.sleep(0.1)
+            self.fail("condition not met within %s seconds" % timeout)
+
+        wait_until(lambda: b"master_link_status:up" in
+                   replica_client.command("INFO", "replication"))
+
+        # Argument validation and role checks.
+        with self.assertRaises(RedisError):
+            self.cmd("FAILOVER", "ABORT")
+        with self.assertRaises(RedisError):
+            self.cmd("FAILOVER", "TO", "127.0.0.1", "1")
+        with self.assertRaises(RedisError):
+            self.cmd("FAILOVER", "FORCE")
+        with self.assertRaises(RedisError):
+            self.cmd("FAILOVER", "TO", "127.0.0.1", str(replica.port), "FORCE")
+        with self.assertRaises(RedisError):
+            replica_client.command("FAILOVER", "TO", "127.0.0.1",
+                                   str(master.port))
+
+        # While the target replica lags, the master waits for the
+        # acknowledgement and pauses writes; ABORT releases both.
+        def block_replica(seconds):
+            def sleeper():
+                try:
+                    replica_client.command("DEBUG", "SLEEP", str(seconds))
+                except (OSError, EOFError, RedisError):
+                    pass
+            thread = threading.Thread(target=sleeper)
+            thread.start()
+            time.sleep(0.3)
+            return thread
+
+        lagged = block_replica(4)
+        self.cmd("SET", self.key("failover:lag"), b"unacked")
+        self.assertEqual(
+            self.cmd("FAILOVER", "TO", "127.0.0.1", str(replica.port),
+                     "TIMEOUT", "30000"), b"OK")
+        wait_until(lambda: b"master_failover_state:waiting-for-sync" in
+                   self.cmd("INFO", "replication"))
+        self.assertEqual(self.cmd("FAILOVER", "ABORT"), b"OK")
+        self.assertIn(b"master_failover_state:no-failover",
+                      self.cmd("INFO", "replication"))
+        self.assertEqual(self.cmd("SET", self.key("failover:resumed"), b"1"),
+                         b"OK")
+        lagged.join(timeout=15)
+
+        # A failover that never finds the replica in sync times out and
+        # leaves the master writable again.
+        wait_until(lambda: b"master_link_status:up" in
+                   replica_client.command("INFO", "replication"))
+        lagged = block_replica(4)
+        self.cmd("SET", self.key("failover:lag2"), b"unacked")
+        self.assertEqual(
+            self.cmd("FAILOVER", "TO", "127.0.0.1", str(replica.port),
+                     "TIMEOUT", "1000"), b"OK")
+        wait_until(lambda: b"master_failover_state:no-failover" in
+                   self.cmd("INFO", "replication"), timeout=10)
+        self.assertEqual(self.cmd("SET", self.key("failover:resumed2"), b"1"),
+                         b"OK")
+        lagged.join(timeout=15)
+
+        self.assertEqual(
+            self.cmd("FAILOVER", "TO", "127.0.0.1", str(replica.port),
+                     "TIMEOUT", "10000"), b"OK")
+
+        # The replica promotes itself and the old master becomes its replica.
+        wait_until(lambda: b"role:master" in
+                   replica_client.command("INFO", "replication"))
+        promoted = ("master_port:%d" % replica.port).encode()
+        wait_until(lambda: b"role:slave" in self.cmd("INFO", "replication") and
+                   promoted in self.cmd("INFO", "replication"))
+
+        # Writes are served by the new master and reach the demoted node.
+        data = self.key("failover:data")
+        self.assertEqual(replica_client.command("SET", data, b"after-failover"),
+                         b"OK")
+        wait_until(lambda: self.cmd("GET", data) == b"after-failover")
+
+        # The failover state is cleared on both sides.
+        self.assertIn(b"master_failover_state:no-failover",
+                      replica_client.command("INFO", "replication"))
+        self.assertIn(b"master_failover_state:no-failover",
+                      self.cmd("INFO", "replication"))
+        with self.assertRaises(RedisError):
+            replica_client.command("FAILOVER", "ABORT")
+
+        # Without TO, an in-sync replica is chosen automatically.
+        self.assertEqual(replica_client.command("FAILOVER"), b"OK")
+        wait_until(lambda: b"role:slave" in
+                   replica_client.command("INFO", "replication"))
+        wait_until(lambda: b"role:master" in self.cmd("INFO", "replication"))
+        self.assertIn(b"master_failover_state:no-failover",
+                      self.cmd("INFO", "replication"))
 
     def test_client_reply_and_unblock(self):
         if self.server is None:
@@ -3773,6 +5100,136 @@ class BackportRegression(unittest.TestCase):
             self.assertEqual(tls.command("SET", key, b"mutual"), b"OK")
             self.assertEqual(tls.command("GET", key), b"mutual")
 
+    def test_tls_auth_clients_optional_mode(self):
+        """tls-auth-clients optional accepts anonymous clients but verifies
+        a certificate when one is presented."""
+        if self.server is None or self.server.tls_port is None:
+            self.skipTest("TLS tests require a managed --server instance")
+
+        def mode():
+            values = self.cmd("CONFIG", "GET", "tls-auth-clients")
+            return dict(zip(values[::2], values[1::2]))[b"tls-auth-clients"]
+
+        self.assertEqual(mode(), b"no")
+
+        # Unknown values are rejected and the current mode is kept.
+        for value in (b"maybe", b"yes please", b"option"):
+            with self.assertRaises(RedisError):
+                self.cmd("CONFIG", "SET", "tls-auth-clients", value)
+        self.assertEqual(mode(), b"no")
+
+        # optional: no certificate is requested, so anonymous clients work.
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "tls-auth-clients", "optional"), b"OK")
+        self.assertEqual(mode(), b"optional")
+        key = self.key("tls-optional")
+        with self.tls_connect() as tls:
+            self.assertEqual(tls.command("SET", key, b"anonymous"), b"OK")
+            self.assertEqual(tls.command("GET", key), b"anonymous")
+
+        # A certificate from our CA is verified and accepted.
+        with self.tls_connect(client_cert=True) as tls:
+            self.assertEqual(tls.command("PING"), b"PONG")
+
+        # A self-signed certificate is not trusted, so the connection fails.
+        with self.assertRaises((ssl.SSLError, OSError, EOFError, RedisError)):
+            with self.tls_connect(bad_cert=True) as tls:
+                tls.command("PING")
+
+        # CONFIG REWRITE keeps the three-state value readable.
+        self.assertEqual(self.cmd("CONFIG", "REWRITE"), b"OK")
+        conf = (self.server.directory / "redis.conf").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn("tls-auth-clients optional", conf)
+
+        # Switching to yes turns the same anonymous connection into an error.
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "tls-auth-clients", "yes"), b"OK")
+        self.assertEqual(mode(), b"yes")
+        with self.assertRaises((ssl.SSLError, OSError, EOFError, RedisError)):
+            with self.tls_connect() as tls:
+                tls.command("PING")
+        with self.tls_connect(client_cert=True) as tls:
+            self.assertEqual(tls.command("GET", key), b"anonymous")
+
+    def test_tls_protocol_and_cipher_options(self):
+        """TLS protocol, cipher and session options apply at runtime."""
+        if self.server is None or self.server.tls_port is None:
+            self.skipTest("TLS tests require a managed --server instance")
+
+        names = ("tls-protocols", "tls-ciphers", "tls-ciphersuites",
+                 "tls-prefer-server-ciphers", "tls-session-caching")
+
+        def config_map(*fields):
+            values = self.cmd("CONFIG", "GET", *fields)
+            return dict(zip(values[::2], values[1::2]))
+
+        defaults = config_map(*names)
+        self.assertEqual(defaults[b"tls-protocols"], b"")
+        self.assertEqual(defaults[b"tls-ciphers"], b"")
+        self.assertEqual(defaults[b"tls-ciphersuites"], b"")
+        self.assertEqual(defaults[b"tls-prefer-server-ciphers"], b"no")
+        self.assertEqual(defaults[b"tls-session-caching"], b"yes")
+
+        # A rejected value must leave the previous setting untouched.
+        for name, value in (("tls-protocols", "TLSv1.4"),
+                            ("tls-ciphers", "NOT-A-CIPHER"),
+                            ("tls-ciphersuites", "NOT-A-SUITE"),
+                            ("tls-prefer-server-ciphers", "maybe"),
+                            ("tls-session-caching", "maybe")):
+            with self.assertRaises(RedisError):
+                self.cmd("CONFIG", "SET", name, value)
+        unchanged = config_map(*names)
+        self.assertEqual(unchanged[b"tls-protocols"], b"")
+        self.assertEqual(unchanged[b"tls-ciphers"], b"")
+        self.assertEqual(unchanged[b"tls-prefer-server-ciphers"], b"no")
+        self.assertEqual(unchanged[b"tls-session-caching"], b"yes")
+
+        self.assertEqual(self.cmd("CONFIG", "SET", "tls-protocols",
+                                  "TLSv1.2 TLSv1.3"), b"OK")
+        self.assertEqual(self.cmd("CONFIG", "SET", "tls-ciphersuites",
+                                  "TLS_AES_256_GCM_SHA384"), b"OK")
+        self.assertEqual(self.cmd("CONFIG", "SET", "tls-prefer-server-ciphers",
+                                  "yes"), b"OK")
+        self.assertEqual(self.cmd("CONFIG", "SET", "tls-session-caching",
+                                  "no"), b"OK")
+        applied = config_map("tls-protocols", "tls-ciphersuites",
+                             "tls-prefer-server-ciphers",
+                             "tls-session-caching")
+        self.assertEqual(applied[b"tls-protocols"], b"TLSv1.2 TLSv1.3")
+        self.assertEqual(applied[b"tls-ciphersuites"],
+                         b"TLS_AES_256_GCM_SHA384")
+        self.assertEqual(applied[b"tls-prefer-server-ciphers"], b"yes")
+        self.assertEqual(applied[b"tls-session-caching"], b"no")
+
+        # Existing connections keep working after the context swap and new
+        # connections pick up the new settings.
+        key = self.key("tls-config")
+        self.assertEqual(self.cmd("SET", key, b"plain"), b"OK")
+        with self.tls_connect() as tls:
+            self.assertEqual(tls.command("GET", key), b"plain")
+
+        # Restricting to TLS 1.3 makes a TLS 1.2-only client fail.
+        self.assertEqual(self.cmd("CONFIG", "SET", "tls-protocols",
+                                  "TLSv1.3"), b"OK")
+        context = ssl.create_default_context(cafile=str(self.server.tls["ca"]))
+        context.maximum_version = ssl.TLSVersion.TLSv1_2
+        raw = socket.create_connection(("127.0.0.1", self.server.tls_port),
+                                       OPTIONS.timeout)
+        self.addCleanup(raw.close)
+        with self.assertRaises((ssl.SSLError, OSError)):
+            context.wrap_socket(raw, server_hostname="localhost")
+        with self.tls_connect() as tls:
+            self.assertEqual(tls.command("GET", key), b"plain")
+
+        # CONFIG REWRITE persists the runtime values.
+        self.assertEqual(self.cmd("CONFIG", "REWRITE"), b"OK")
+        text = (self.server.directory / "redis.conf").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn("tls-protocols", text)
+        self.assertIn("TLSv1.3", text)
+        self.assertIn("tls-session-caching no", text)
+
     def test_tls_replication_master_replica(self):
         """A replica with tls-replication syncs from the master's TLS port."""
         if self.server is None or self.server.tls_port is None:
@@ -3847,6 +5304,149 @@ class BackportRegression(unittest.TestCase):
                     break
                 time.sleep(0.05)
             self.assertEqual(value, b"after")
+
+    def test_tls_replication_diskless(self):
+        """A diskless master streams the RDB to a TLS replica and a plain one."""
+        if self.server is None or self.server.tls_port is None:
+            self.skipTest("TLS tests require a managed --server instance")
+
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "repl-diskless-sync", "yes"), b"OK")
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "repl-diskless-sync-delay", "0"), b"OK")
+
+        big = self.key("tls-diskless-big")
+        # Incompressible and larger than the socket buffers, so the relay
+        # has to wait for writable events instead of buffering it all.
+        payload = os.urandom(8000000)
+        self.assertEqual(self.cmd("SET", big, payload), b"OK")
+        for i in range(30):
+            self.cmd("SET", self.key("tls-diskless-%d" % i), i)
+
+        tls_dir = Path(self.temp.name) / "tls-replica"
+        tls_dir.mkdir()
+        tls_replica = ManagedServer(
+            OPTIONS.server, tls_dir, OPTIONS.timeout, OPTIONS.startup_timeout,
+            tls=self.server.tls, tls_replication=True,
+            replicaof=("127.0.0.1", self.server.tls_port))
+        self.addCleanup(tls_replica.close)
+        plain_dir = Path(self.temp.name) / "plain-replica"
+        plain_dir.mkdir()
+        plain_replica = ManagedServer(
+            OPTIONS.server, plain_dir, OPTIONS.timeout, OPTIONS.startup_timeout,
+            replicaof=("127.0.0.1", self.server.port))
+        self.addCleanup(plain_replica.close)
+
+        tls_replica.start()
+        plain_replica.start()
+
+        def wait_link_up(replica):
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                try:
+                    with RESP2("127.0.0.1", replica.port, OPTIONS.timeout) as r:
+                        info = r.command("INFO", "replication")
+                except (OSError, EOFError, RedisError):
+                    info = b""
+                if b"master_link_status:up" in info:
+                    return
+                time.sleep(0.1)
+            self.fail(replica.log_excerpt())
+
+        wait_link_up(tls_replica)
+        wait_link_up(plain_replica)
+
+        for replica in (tls_replica, plain_replica):
+            with RESP2("127.0.0.1", replica.port, OPTIONS.timeout) as r:
+                self.assertEqual(r.command("GET", big), payload)
+                self.assertEqual(
+                    r.command("GET", self.key("tls-diskless-9")), b"9")
+
+        # The streamed RDB never produced a snapshot file on the master.
+        self.assertFalse((self.server.directory / "dump.rdb").exists())
+
+        # Incremental data still follows the RDB on the relayed TLS session.
+        live = self.key("tls-diskless-live")
+        with RESP2("127.0.0.1", tls_replica.port, OPTIONS.timeout) as r:
+            self.assertEqual(self.cmd("SET", live, b"live"), b"OK")
+            deadline = time.time() + 5
+            value = None
+            while time.time() < deadline:
+                value = r.command("GET", live)
+                if value == b"live":
+                    break
+                time.sleep(0.05)
+            self.assertEqual(value, b"live")
+
+    def test_repl_diskless_load_modes(self):
+        """Streamed RDBs load directly with on-empty-db and swapdb."""
+        if self.server is None:
+            self.skipTest("replication test requires --server")
+
+        self.assertEqual(self.cmd("CONFIG", "GET", "repl-diskless-load"),
+                         [b"repl-diskless-load", b"disabled"])
+        with self.assertRaises(RedisError):
+            self.cmd("CONFIG", "SET", "repl-diskless-load", "bogus")
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "repl-diskless-sync", "yes"), b"OK")
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "repl-diskless-sync-delay", "0"), b"OK")
+
+        big = self.key("diskless-load:big")
+        payload = os.urandom(300000)
+        self.assertEqual(self.cmd("SET", big, payload), b"OK")
+        for i in range(20):
+            self.cmd("SET", self.key("diskless-load:%d" % i), i)
+
+        def wait_link_up(replica):
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                try:
+                    with RESP2("127.0.0.1", replica.port, OPTIONS.timeout) as r:
+                        info = r.command("INFO", "replication")
+                except (OSError, EOFError, RedisError):
+                    info = b""
+                if b"master_link_status:up" in info:
+                    return
+                time.sleep(0.1)
+            self.fail(replica.log_excerpt())
+
+        # on-empty-db: a fresh replica loads the streamed RDB directly.
+        empty_dir = Path(self.temp.name) / "diskless-empty"
+        empty_dir.mkdir()
+        empty_replica = ManagedServer(
+            OPTIONS.server, empty_dir, OPTIONS.timeout, OPTIONS.startup_timeout,
+            replicaof=("127.0.0.1", self.server.port),
+            extra_config="repl-diskless-load on-empty-db\n")
+        self.addCleanup(empty_replica.close)
+        empty_replica.start()
+        wait_link_up(empty_replica)
+        with RESP2("127.0.0.1", empty_replica.port, OPTIONS.timeout) as r:
+            self.assertEqual(r.command("GET", big), payload)
+            self.assertEqual(
+                r.command("CONFIG", "GET", "repl-diskless-load"),
+                [b"repl-diskless-load", b"on-empty-db"])
+
+        # swapdb: an already populated replica keeps serving its old data
+        # until the streamed RDB has been loaded, then swaps the databases.
+        swap_dir = Path(self.temp.name) / "diskless-swap"
+        swap_dir.mkdir()
+        swap_replica = ManagedServer(
+            OPTIONS.server, swap_dir, OPTIONS.timeout, OPTIONS.startup_timeout)
+        self.addCleanup(swap_replica.close)
+        swap_replica.start()
+        with RESP2("127.0.0.1", swap_replica.port, OPTIONS.timeout) as r:
+            self.assertEqual(r.command("SET", b"diskless-load:stale", b"old"),
+                             b"OK")
+            self.assertEqual(
+                r.command("CONFIG", "SET", "repl-diskless-load", "swapdb"),
+                b"OK")
+            self.assertEqual(
+                r.command("REPLICAOF", "127.0.0.1", self.server.port), b"OK")
+        wait_link_up(swap_replica)
+        with RESP2("127.0.0.1", swap_replica.port, OPTIONS.timeout) as r:
+            self.assertIsNone(r.command("GET", b"diskless-load:stale"))
+            self.assertEqual(r.command("GET", big), payload)
 
     def _sync_partial_ok(self):
         info = self.cmd("INFO", "stats")

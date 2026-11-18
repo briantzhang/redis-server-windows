@@ -43,6 +43,7 @@
 #ifdef _WIN32
 #include <stdio.h>
 #include "Win32_Interop/Win32_QFork.h"
+#include "Win32_Interop/win32_wsiocp.h"
 #include <direct.h>
 #define MAXPATHLEN 1024
 #else
@@ -2334,6 +2335,15 @@ void backgroundSaveDoneHandlerSocket(int exitcode, int bysignal) {
                                      : strerror(errorcode));
                 freeClient(slave);
             } else {
+#ifdef _WIN32
+                if (slave->flags & CLIENT_TLS) {
+                    /* The child only wrote into the relay socket. The parent
+                     * is still relaying the payload through the replica's TLS
+                     * session, and sendBulkToSlaveTlsPipe() puts the replica
+                     * online when the relay reports EOF. */
+                    continue;
+                }
+#endif
                 serverLog(LL_WARNING,
                 "Slave %s correctly received the streamed RDB file.",
                     replicationGetSlaveName(slave));
@@ -2363,12 +2373,61 @@ void backgroundSaveDoneHandler(int exitcode, int bysignal) {
     }
 }
 
+#ifdef _WIN32
+/* The child process that produces a diskless RDB has no TLS state, so it
+ * cannot write into a TLS replica socket. To keep diskless replication
+ * available for TLS replicas the child gets one end of a loopback socket pair
+ * instead and the parent relays the payload through the replica's TLS
+ * session. Returns C_OK and fills fds with [parent read end, child write
+ * end]. */
+static int createRelaySocketPair(int fds[2]) {
+    struct sockaddr_in sa;
+    socklen_t salen = sizeof(sa);
+    int listener = -1, client = -1, server = -1;
+
+    listener = socket(AF_INET,SOCK_STREAM,0);
+    if (listener == -1) return C_ERR;
+
+    memset(&sa,0,sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    if (bind(listener,(struct sockaddr*)&sa,salen) == -1) goto cleanup;
+    if (listen(listener,1) == -1) goto cleanup;
+    if (getsockname(listener,(struct sockaddr*)&sa,&salen) == -1) goto cleanup;
+
+    client = socket(AF_INET,SOCK_STREAM,0);
+    if (client == -1) goto cleanup;
+    if (connect(client,(struct sockaddr*)&sa,salen) == -1) goto cleanup;
+    server = accept(listener,(struct sockaddr*)&sa,&salen);
+    if (server == -1) goto cleanup;
+    /* Sockets accepted outside the event loop are not associated with the
+     * completion port yet; without this the readable event never fires. */
+    if (WSIOCP_SocketAttach(server,NULL) == -1) goto cleanup;
+
+    close(listener);
+    fds[0] = server;    /* Read by the parent and relayed over TLS. */
+    fds[1] = client;    /* Handed to the RDB child. */
+    return C_OK;
+
+cleanup:
+    if (server != -1) close(server);
+    if (client != -1) close(client);
+    if (listener != -1) close(listener);
+    return C_ERR;
+}
+#endif
+
 /* Spawn an RDB child that writes the RDB to the sockets of the slaves
  * that are currently in SLAVE_STATE_WAIT_BGSAVE_START state. */
 int rdbSaveToSlavesSockets(rdbSaveInfo *rsi) {
     int *fds;
     uint64_t *clientids;
+    int *relay_fds = NULL;
     int numfds;
+#ifdef _WIN32
+    int i;
+#endif
     listNode *ln;
     listIter li;
     pid_t childpid;
@@ -2391,6 +2450,10 @@ int rdbSaveToSlavesSockets(rdbSaveInfo *rsi) {
      * be useful for the child process in order to build the report
      * (sent via unix pipe) that will be sent to the parent. */
     clientids = zmalloc(sizeof(uint64_t)*listLength(server.slaves));
+#ifdef _WIN32
+    /* Child end of the relay pair of each fd, or -1 for a plain replica. */
+    relay_fds = zmalloc(sizeof(int)*listLength(server.slaves));
+#endif
     numfds = 0;
 
     listRewind(server.slaves,&li);
@@ -2398,23 +2461,106 @@ int rdbSaveToSlavesSockets(rdbSaveInfo *rsi) {
         client *slave = ln->value;
 
         if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) {
-            clientids[numfds] = slave->id;
-            fds[numfds++] = slave->fd;
-            replicationSetupSlaveForFullResync(slave,getPsyncInitialOffset());
+            int childfd = slave->fd;
+
+#ifdef _WIN32
+            relay_fds[numfds] = -1;
+            if (slave->flags & CLIENT_TLS) {
+                int pair[2];
+
+                if (createRelaySocketPair(pair) == C_ERR) {
+                    serverLog(LL_WARNING,
+                        "Can't create the relay socket for replica %s",
+                        replicationGetSlaveName(slave));
+                    goto relay_error;
+                }
+                anetNonBlock(NULL,pair[0]);
+                anetBlock(NULL,pair[1]);
+                anetSendTimeout(NULL,pair[1],
+                                (PORT_LONGLONG)server.repl_timeout*1000);
+                if (aeCreateFileEvent(server.el,pair[0],AE_READABLE,
+                                      sendBulkToSlave,slave) == AE_ERR)
+                {
+                    close(pair[0]);
+                    close(pair[1]);
+                    goto relay_error;
+                }
+                if (aeCreateFileEvent(server.el,slave->fd,AE_WRITABLE,
+                                      sendBulkToSlave,slave) == AE_ERR)
+                {
+                    aeDeleteFileEvent(server.el,pair[0],AE_READABLE);
+                    close(pair[0]);
+                    close(pair[1]);
+                    goto relay_error;
+                }
+                slave->repldbfd = pair[0];
+                slave->repldboff = 0;
+                /* Unknown size: sendBulkToSlave() reads this as "relay the
+                 * payload from the parent end until it reports EOF". */
+                slave->repldbsize = -1;
+                childfd = pair[1];
+                relay_fds[numfds] = pair[1];
+            } else {
+                anetBlock(NULL,slave->fd);
+                anetSendTimeout(NULL,slave->fd,(PORT_ULONG)server.repl_timeout*1000);  WIN_PORT_FIX /* cast (PORT_ULONG) */
+            }
+#else
             /* Put the socket in blocking mode to simplify RDB transfer.
              * We'll restore it when the children returns (since duped socket
              * will share the O_NONBLOCK attribute with the parent). */
             anetBlock(NULL,slave->fd);
             anetSendTimeout(NULL,slave->fd,(PORT_ULONG)server.repl_timeout*1000);  WIN_PORT_FIX /* cast (PORT_ULONG) */
+#endif
+            clientids[numfds] = slave->id;
+            fds[numfds++] = childfd;
+            replicationSetupSlaveForFullResync(slave,getPsyncInitialOffset());
         }
     }
 
+    goto relay_ready;
+
+#ifdef _WIN32
+relay_error:
+    /* Undo the preparation done so far. The replicas left in
+     * WAIT_BGSAVE_START state are freed by the caller. */
+    for (i = 0; i < numfds; i++) {
+        listRewind(server.slaves,&li);
+        while((ln = listNext(&li))) {
+            client *slave = ln->value;
+
+            if (slave->id != clientids[i]) continue;
+            if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_END)
+                slave->replstate = SLAVE_STATE_WAIT_BGSAVE_START;
+            if (slave->repldbsize == -1 && slave->repldbfd != -1) {
+                aeDeleteFileEvent(server.el,slave->repldbfd,AE_READABLE);
+                aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
+                close(slave->repldbfd);
+                slave->repldbfd = -1;
+                slave->repldbsize = 0;
+            }
+            break;
+        }
+        if (relay_fds[i] != -1) close(relay_fds[i]);
+    }
+    close(pipefds[0]);
+    close(pipefds[1]);
+    zfree(fds);
+    zfree(clientids);
+    zfree(relay_fds);
+    return C_ERR;
+#endif
+
+relay_ready:
     /* Create the child process. */
     openChildInfoPipe();
     start = ustime();
 
 #ifdef _WIN32
     childpid = BeginForkOperation_Socket(fds, numfds, clientids, pipefds[1], &server, sizeof(server), dictGetHashFunctionSeed(), modules);
+    /* The child has its own duplicated socket for every fd now. Closing our
+     * copy of the relay write end is what lets the parent see EOF. */
+    for (i = 0; i < numfds; i++)
+        if (relay_fds[i] != -1) close(relay_fds[i]);
 #else
     if ((childpid = fork()) == 0) {
         /* Child */
@@ -2503,6 +2649,19 @@ int rdbSaveToSlavesSockets(rdbSaveInfo *rsi) {
                 for (j = 0; j < numfds; j++) {
                     if (slave->id == clientids[j]) {
                         slave->replstate = SLAVE_STATE_WAIT_BGSAVE_START;
+#ifdef _WIN32
+                        /* Drop the relay socket of a TLS replica too: the
+                         * caller will not free these clients. */
+                        if (slave->repldbsize == -1 && slave->repldbfd != -1) {
+                            aeDeleteFileEvent(server.el,slave->repldbfd,
+                                              AE_READABLE);
+                            aeDeleteFileEvent(server.el,slave->fd,
+                                              AE_WRITABLE);
+                            close(slave->repldbfd);
+                            slave->repldbfd = -1;
+                            slave->repldbsize = 0;
+                        }
+#endif
                         break;
                     }
                 }
@@ -2531,6 +2690,9 @@ int rdbSaveToSlavesSockets(rdbSaveInfo *rsi) {
         }
         zfree(clientids);
         zfree(fds);
+#ifdef _WIN32
+        zfree(relay_fds);
+#endif
         return (childpid == -1) ? C_ERR : C_OK;
 #ifndef _WIN32
     }
@@ -2636,4 +2798,623 @@ rdbSaveInfo *rdbPopulateSaveInfo(rdbSaveInfo *rsi) {
         return rsi;
     }
     return NULL;
+}
+
+/* ----------------------------------------------------------------------------
+ * Deep validation of DUMP payloads for RESTORE (sanitize-dump-payload).
+ *
+ * The normal RESTORE path validates the payload checksum and then lets
+ * rdbLoadObject() build the value. Encoded values (ziplists, listpacks,
+ * intsets, zipmaps) are stored as opaque byte strings and are only walked
+ * when the key is accessed, so a payload with an inconsistent internal
+ * structure can enter the dataset and crash the server later. This code
+ * walks the serialized value without trusting any of its length fields and
+ * rejects such payloads before rdbLoadObject() sees them.
+ *
+ * The walk is read-only, uses the same wire formats as rdbLoadObject(), and
+ * returns C_ERR instead of terminating the server on malformed data.
+ * ------------------------------------------------------------------------- */
+
+typedef struct dumpCursor {
+    const unsigned char *p;
+    size_t len;
+    size_t pos;
+} dumpCursor;
+
+typedef struct dumpString {
+    const unsigned char *blob;  /* In-place payload bytes, or decompressed. */
+    size_t len;
+    unsigned char *alloc;       /* Owned decompression buffer, if any. */
+} dumpString;
+
+static uint32_t dumpReadU32LE(const unsigned char *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint32_t dumpReadU32BE(const unsigned char *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static uint64_t dumpReadU64BE(const unsigned char *p) {
+    uint64_t v = 0;
+    int i;
+    for (i = 0; i < 8; i++) v = (v << 8) | p[i];
+    return v;
+}
+
+static int dumpNeed(dumpCursor *c, size_t n) {
+    return (c->pos <= c->len && n <= c->len - c->pos) ? C_OK : C_ERR;
+}
+
+static int dumpSkip(dumpCursor *c, size_t n) {
+    if (dumpNeed(c, n) == C_ERR) return C_ERR;
+    c->pos += n;
+    return C_OK;
+}
+
+static int dumpByte(dumpCursor *c, unsigned char *b) {
+    if (dumpNeed(c, 1) == C_ERR) return C_ERR;
+    *b = c->p[c->pos++];
+    return C_OK;
+}
+
+/* Read an RDB length. String encodings are not valid here. */
+static int dumpLen(dumpCursor *c, uint64_t *len) {
+    unsigned char b;
+    if (dumpByte(c, &b) == C_ERR) return C_ERR;
+    switch (b >> 6) {
+    case RDB_6BITLEN:
+        *len = b & 0x3F;
+        return C_OK;
+    case RDB_14BITLEN: {
+        unsigned char b2;
+        if (dumpByte(c, &b2) == C_ERR) return C_ERR;
+        *len = ((uint64_t)(b & 0x3F) << 8) | b2;
+        return C_OK;
+    }
+    default:
+        if (b == RDB_32BITLEN) {
+            if (dumpNeed(c, 4) == C_ERR) return C_ERR;
+            *len = dumpReadU32BE(c->p + c->pos);
+            c->pos += 4;
+            return C_OK;
+        } else if (b == RDB_64BITLEN) {
+            if (dumpNeed(c, 8) == C_ERR) return C_ERR;
+            *len = dumpReadU64BE(c->p + c->pos);
+            c->pos += 8;
+            return C_OK;
+        }
+        return C_ERR;
+    }
+}
+
+static uint64_t dumpMaxStringLength(void) {
+    return server.proto_max_bulk_len > 0 ?
+           (uint64_t)server.proto_max_bulk_len : UINT64_MAX;
+}
+
+/* Read an RDB string. When keep is true the bytes are exposed to the caller;
+ * when false the string is only bounds-checked and skipped. */
+static int dumpReadString(dumpCursor *c, dumpString *s, int keep) {
+    unsigned char b;
+
+    s->blob = NULL;
+    s->len = 0;
+    s->alloc = NULL;
+    if (dumpNeed(c, 1) == C_ERR) return C_ERR;
+    b = c->p[c->pos];
+    if ((b & 0xC0) == (RDB_ENCVAL << 6)) {
+        int enc = b & 0x3F;
+        c->pos++;
+        if (enc == RDB_ENC_INT8) return dumpSkip(c, 1);
+        if (enc == RDB_ENC_INT16) return dumpSkip(c, 2);
+        if (enc == RDB_ENC_INT32) return dumpSkip(c, 4);
+        if (enc == RDB_ENC_LZF) {
+            uint64_t clen, ulen;
+            if (dumpLen(c, &clen) == C_ERR || dumpLen(c, &ulen) == C_ERR)
+                return C_ERR;
+            if (ulen == 0 || ulen > dumpMaxStringLength()) return C_ERR;
+            if (dumpNeed(c, (size_t)clen) == C_ERR) return C_ERR;
+            if (keep) {
+                unsigned char *out = zmalloc((size_t)ulen);
+                if (lzf_decompress(c->p + c->pos, (unsigned int)clen,
+                                   out, (unsigned int)ulen) != ulen)
+                {
+                    zfree(out);
+                    return C_ERR;
+                }
+                s->blob = out;
+                s->len = (size_t)ulen;
+                s->alloc = out;
+            }
+            return dumpSkip(c, (size_t)clen);
+        }
+        return C_ERR;
+    } else {
+        uint64_t len;
+        if (dumpLen(c, &len) == C_ERR) return C_ERR;
+        if (len > dumpMaxStringLength()) return C_ERR;
+        if (dumpNeed(c, (size_t)len) == C_ERR) return C_ERR;
+        if (keep) {
+            s->blob = c->p + c->pos;
+            s->len = (size_t)len;
+        }
+        return dumpSkip(c, (size_t)len);
+    }
+}
+
+static void dumpFreeString(dumpString *s) {
+    if (s->alloc) zfree(s->alloc);
+    s->alloc = NULL;
+    s->blob = NULL;
+    s->len = 0;
+}
+
+/* ---- Ziplist ------------------------------------------------------------ */
+
+#define DUMP_ZIP_STR_06B (0 << 6)
+#define DUMP_ZIP_STR_14B (1 << 6)
+#define DUMP_ZIP_STR_32B (2 << 6)
+#define DUMP_ZIP_INT_16B (0xc0)
+#define DUMP_ZIP_INT_32B (0xd0)
+#define DUMP_ZIP_INT_64B (0xe0)
+#define DUMP_ZIP_INT_24B (0xf0)
+#define DUMP_ZIP_INT_8B  (0xfe)
+
+/* Validate a serialized ziplist and return its entry count. When even is
+ * true the number of entries must be even (hash and sorted-set pairs). */
+static int dumpZiplistValidate(const unsigned char *zl, size_t len, int even,
+                               size_t *out_count)
+{
+    uint32_t bytes, tail;
+    uint16_t hdr_count;
+    size_t pos = 10, count = 0, last_start = 10;
+    size_t prev_entry_len = 0;
+
+    if (len < 11) return C_ERR;
+    bytes = dumpReadU32LE(zl);
+    tail = dumpReadU32LE(zl + 4);
+    hdr_count = (uint16_t)(zl[8] | (zl[9] << 8));
+    if (bytes != len) return C_ERR;
+    if (tail > len) return C_ERR;
+
+    while (1) {
+        unsigned char p;
+        size_t payload, hdr, slen = 0;
+        size_t entry_start = pos;
+
+        if (pos >= len) return C_ERR;
+        if (zl[pos] == 0xFF) {
+            if (pos != len - 1) return C_ERR;
+            break;
+        }
+
+        p = zl[pos];
+        if (p < 254) {
+            payload = p;
+            pos += 1;
+        } else {
+            if (pos + 5 > len) return C_ERR;
+            payload = dumpReadU32LE(zl + pos + 1);
+            pos += 5;
+        }
+
+        if (count == 0) {
+            if (payload != 0) return C_ERR;
+        } else if (payload != prev_entry_len) {
+            return C_ERR;
+        }
+
+        if (pos >= len) return C_ERR;
+        p = zl[pos];
+        if ((p & 0xC0) == DUMP_ZIP_STR_06B) {
+            hdr = 1;
+            slen = p & 0x3F;
+        } else if ((p & 0xC0) == DUMP_ZIP_STR_14B) {
+            if (pos + 1 >= len) return C_ERR;
+            hdr = 2;
+            slen = ((size_t)(p & 0x3F) << 8) | zl[pos + 1];
+        } else if ((p & 0xC0) == DUMP_ZIP_STR_32B) {
+            if (pos + 4 >= len) return C_ERR;
+            hdr = 5;
+            slen = dumpReadU32BE(zl + pos + 1);
+        } else {
+            hdr = 1;
+            if (p == DUMP_ZIP_INT_16B) hdr += 2;
+            else if (p == DUMP_ZIP_INT_32B) hdr += 4;
+            else if (p == DUMP_ZIP_INT_64B) hdr += 8;
+            else if (p == DUMP_ZIP_INT_24B) hdr += 3;
+            else if (p == DUMP_ZIP_INT_8B) hdr += 0;
+            else if (p >= 0xF1 && p <= 0xFD) hdr += 0;
+            else return C_ERR;
+        }
+        if (hdr > len - pos || slen > len - pos - hdr) return C_ERR;
+        pos += hdr + slen;
+
+        prev_entry_len = pos - entry_start;
+        last_start = entry_start;
+        count++;
+    }
+
+    if (count == 0) {
+        if (tail != 10) return C_ERR;
+    } else if (tail != (uint32_t)last_start) {
+        return C_ERR;
+    }
+    if (count < UINT16_MAX) {
+        if (hdr_count != count) return C_ERR;
+    } else if (hdr_count != UINT16_MAX) {
+        return C_ERR;
+    }
+    if (even && (count & 1)) return C_ERR;
+    if (out_count) *out_count = count;
+    return C_OK;
+}
+
+/* ---- Listpack ----------------------------------------------------------- */
+
+#define DUMP_LP_HDR_SIZE 6
+#define DUMP_LP_EOF 0xFF
+
+static size_t dumpLpBacklenSize(uint64_t l) {
+    if (l <= 127) return 1;
+    if (l < 16383) return 2;
+    if (l < 2097151) return 3;
+    if (l < 268435455) return 4;
+    return 5;
+}
+
+static void dumpLpBacklenBytes(uint64_t l, unsigned char *buf) {
+    if (l <= 127) {
+        buf[0] = (unsigned char)l;
+    } else if (l < 16383) {
+        buf[0] = (unsigned char)(l >> 7);
+        buf[1] = (unsigned char)((l & 127) | 128);
+    } else if (l < 2097151) {
+        buf[0] = (unsigned char)(l >> 14);
+        buf[1] = (unsigned char)(((l >> 7) & 127) | 128);
+        buf[2] = (unsigned char)((l & 127) | 128);
+    } else if (l < 268435455) {
+        buf[0] = (unsigned char)(l >> 21);
+        buf[1] = (unsigned char)(((l >> 14) & 127) | 128);
+        buf[2] = (unsigned char)(((l >> 7) & 127) | 128);
+        buf[3] = (unsigned char)((l & 127) | 128);
+    } else {
+        buf[0] = (unsigned char)(l >> 28);
+        buf[1] = (unsigned char)(((l >> 21) & 127) | 128);
+        buf[2] = (unsigned char)(((l >> 14) & 127) | 128);
+        buf[3] = (unsigned char)(((l >> 7) & 127) | 128);
+        buf[4] = (unsigned char)((l & 127) | 128);
+    }
+}
+
+/* Validate a serialized listpack and return its element count. */
+static int dumpListpackValidate(const unsigned char *lp, size_t len,
+                                size_t *out_count)
+{
+    uint32_t bytes;
+    uint16_t hdr_count;
+    size_t pos = DUMP_LP_HDR_SIZE, count = 0;
+
+    if (len < DUMP_LP_HDR_SIZE + 1) return C_ERR;
+    bytes = dumpReadU32LE(lp);
+    hdr_count = (uint16_t)(lp[4] | (lp[5] << 8));
+    if (bytes != len) return C_ERR;
+
+    while (1) {
+        unsigned char b;
+        size_t entrylen, backlen_size;
+        unsigned char expected[5];
+
+        if (pos >= len) return C_ERR;
+        b = lp[pos];
+        if (b == DUMP_LP_EOF) {
+            if (pos != len - 1) return C_ERR;
+            break;
+        }
+        if ((b & 0x80) == 0x00) {
+            entrylen = 1;                                  /* 7 bit uint */
+        } else if ((b & 0xC0) == 0x80) {
+            entrylen = 1 + (b & 0x3F);                     /* 6 bit string */
+        } else if ((b & 0xE0) == 0xC0) {
+            entrylen = 2;                                  /* 13 bit int */
+        } else if ((b & 0xF0) == 0xE0) {
+            if (pos + 1 >= len) return C_ERR;
+            entrylen = 2 + ((((size_t)b & 0x0F) << 8) | lp[pos + 1]);
+        } else if (b == 0xF0) {
+            if (pos + 4 >= len) return C_ERR;
+            entrylen = 5 + dumpReadU32LE(lp + pos + 1);
+        } else if (b == 0xF1) {
+            entrylen = 3;
+        } else if (b == 0xF2) {
+            entrylen = 4;
+        } else if (b == 0xF3) {
+            entrylen = 5;
+        } else if (b == 0xF4) {
+            entrylen = 9;
+        } else {
+            return C_ERR;                                  /* reserved */
+        }
+        if (entrylen > len - pos) return C_ERR;
+        backlen_size = dumpLpBacklenSize(entrylen);
+        if (backlen_size > len - pos - entrylen) return C_ERR;
+        dumpLpBacklenBytes(entrylen, expected);
+        if (memcmp(lp + pos + entrylen, expected, backlen_size) != 0)
+            return C_ERR;
+        pos += entrylen + backlen_size;
+        count++;
+    }
+
+    if (count < UINT16_MAX) {
+        if (hdr_count != count) return C_ERR;
+    } else if (hdr_count != UINT16_MAX) {
+        return C_ERR;
+    }
+    if (out_count) *out_count = count;
+    return C_OK;
+}
+
+/* ---- Intset ------------------------------------------------------------- */
+
+static int dumpIntsetValidate(const unsigned char *is, size_t len) {
+    uint32_t encoding, count, i;
+    PORT_LONGLONG prev = 0;
+    int have_prev = 0;
+
+    if (len < 8) return C_ERR;
+    encoding = dumpReadU32LE(is);
+    count = dumpReadU32LE(is + 4);
+    if (encoding != 2 && encoding != 4 && encoding != 8) return C_ERR;
+    if ((uint64_t)count * encoding != len - 8) return C_ERR;
+    for (i = 0; i < count; i++) {
+        const unsigned char *p = is + 8 + (size_t)i * encoding;
+        PORT_LONGLONG v;
+        if (encoding == 2) {
+            v = (PORT_LONGLONG)(int16_t)(uint16_t)(p[0] | (p[1] << 8));
+        } else if (encoding == 4) {
+            v = (PORT_LONGLONG)(int32_t)dumpReadU32LE(p);
+        } else {
+            uint64_t raw = dumpReadU32LE(p) |
+                           ((uint64_t)dumpReadU32LE(p + 4) << 32);
+            v = (PORT_LONGLONG)raw;
+        }
+        if (have_prev && v <= prev) return C_ERR;
+        prev = v;
+        have_prev = 1;
+    }
+    return C_OK;
+}
+
+/* ---- Zipmap ------------------------------------------------------------- */
+
+/* Decode a zipmap length at *pos. Returns (size_t)-1 on error or terminator. */
+static size_t dumpZipmapLength(const unsigned char *zm, size_t len,
+                               size_t *pos)
+{
+    unsigned char b;
+    if (*pos >= len) return (size_t)-1;
+    b = zm[(*pos)++];
+    if (b < 254) return b;
+    if (b == 254) {
+        unsigned int v;
+        if (len - *pos < sizeof(v)) return (size_t)-1;
+        memcpy(&v, zm + *pos, sizeof(v));
+        *pos += sizeof(v);
+        return v;
+    }
+    return (size_t)-1;
+}
+
+static int dumpZipmapValidate(const unsigned char *zm, size_t len) {
+    size_t pos = 1, count = 0;
+    unsigned char zmlen;
+
+    if (len < 2) return C_ERR;
+    zmlen = zm[0];
+    while (pos < len) {
+        size_t kl, vl;
+        if (zm[pos] == 0xFF) {
+            if (pos != len - 1) return C_ERR;
+            break;
+        }
+        kl = dumpZipmapLength(zm, len, &pos);
+        if (kl == (size_t)-1 || kl > len - pos) return C_ERR;
+        pos += kl;
+        vl = dumpZipmapLength(zm, len, &pos);
+        if (vl == (size_t)-1 || vl > len - pos) return C_ERR;
+        pos += vl;
+        if (pos >= len || zm[pos] != 0xFF) return C_ERR;
+        pos++;
+        count++;
+    }
+    if (zmlen != 254 && zmlen != count) return C_ERR;
+    return C_OK;
+}
+
+/* ---- Module values ------------------------------------------------------ */
+
+/* Walks the opaque opcode stream of a module value. Only modules that are
+ * currently loaded can produce a loadable value, so an unknown module ID is
+ * rejected here (rdbLoadObject would otherwise abort the server). */
+static int dumpModuleValidate(dumpCursor *c) {
+    uint64_t moduleid, opcode;
+    dumpString s;
+
+    if (dumpLen(c, &moduleid) == C_ERR) return C_ERR;
+    if (moduleTypeLookupModuleByID(moduleid) == NULL) return C_ERR;
+    while (1) {
+        if (dumpLen(c, &opcode) == C_ERR) return C_ERR;
+        if (opcode == RDB_MODULE_OPCODE_EOF) break;
+        if (opcode == RDB_MODULE_OPCODE_SINT ||
+            opcode == RDB_MODULE_OPCODE_UINT)
+        {
+            uint64_t v;
+            if (dumpLen(c, &v) == C_ERR) return C_ERR;
+        } else if (opcode == RDB_MODULE_OPCODE_FLOAT) {
+            if (dumpSkip(c, 4) == C_ERR) return C_ERR;
+        } else if (opcode == RDB_MODULE_OPCODE_DOUBLE) {
+            if (dumpSkip(c, 8) == C_ERR) return C_ERR;
+        } else if (opcode == RDB_MODULE_OPCODE_STRING) {
+            if (dumpReadString(c, &s, 0) == C_ERR) return C_ERR;
+        } else {
+            return C_ERR;
+        }
+    }
+    return C_OK;
+}
+
+/* ---- Object payloads ---------------------------------------------------- */
+
+static int dumpValidateBlob(int rdbtype, const dumpString *s) {
+    size_t count = 0;
+
+    switch (rdbtype) {
+    case RDB_TYPE_HASH_ZIPMAP:
+        return dumpZipmapValidate(s->blob, s->len);
+    case RDB_TYPE_LIST_ZIPLIST:
+        return dumpZiplistValidate(s->blob, s->len, 0, &count);
+    case RDB_TYPE_SET_INTSET:
+        return dumpIntsetValidate(s->blob, s->len);
+    case RDB_TYPE_ZSET_ZIPLIST:
+    case RDB_TYPE_HASH_ZIPLIST:
+        return dumpZiplistValidate(s->blob, s->len, 1, &count);
+    default:
+        return C_ERR;
+    }
+}
+
+static int dumpValidateObject(dumpCursor *c, int rdbtype) {
+    uint64_t len, i;
+    dumpString s;
+
+    switch (rdbtype) {
+    case RDB_TYPE_STRING:
+        return dumpReadString(c, &s, 0);
+    case RDB_TYPE_LIST:
+    case RDB_TYPE_SET:
+        if (dumpLen(c, &len) == C_ERR) return C_ERR;
+        for (i = 0; i < len; i++)
+            if (dumpReadString(c, &s, 0) == C_ERR) return C_ERR;
+        return C_OK;
+    case RDB_TYPE_ZSET:
+    case RDB_TYPE_ZSET_2:
+        if (dumpLen(c, &len) == C_ERR) return C_ERR;
+        for (i = 0; i < len; i++) {
+            unsigned char dlen;
+            if (dumpReadString(c, &s, 0) == C_ERR) return C_ERR;
+            if (rdbtype == RDB_TYPE_ZSET_2) {
+                if (dumpSkip(c, 8) == C_ERR) return C_ERR;
+            } else {
+                if (dumpByte(c, &dlen) == C_ERR) return C_ERR;
+                if (dlen < 253 && dumpSkip(c, dlen) == C_ERR) return C_ERR;
+            }
+        }
+        return C_OK;
+    case RDB_TYPE_HASH:
+        if (dumpLen(c, &len) == C_ERR) return C_ERR;
+        for (i = 0; i < len; i++) {
+            if (dumpReadString(c, &s, 0) == C_ERR) return C_ERR;
+            if (dumpReadString(c, &s, 0) == C_ERR) return C_ERR;
+        }
+        return C_OK;
+    case RDB_TYPE_HASH_ZIPMAP:
+    case RDB_TYPE_LIST_ZIPLIST:
+    case RDB_TYPE_SET_INTSET:
+    case RDB_TYPE_ZSET_ZIPLIST:
+    case RDB_TYPE_HASH_ZIPLIST: {
+        int ret;
+        if (dumpReadString(c, &s, 1) == C_ERR) return C_ERR;
+        ret = dumpValidateBlob(rdbtype, &s);
+        dumpFreeString(&s);
+        return ret;
+    }
+    case RDB_TYPE_LIST_QUICKLIST:
+        if (dumpLen(c, &len) == C_ERR) return C_ERR;
+        if (len == 0) return C_ERR;
+        for (i = 0; i < len; i++) {
+            size_t count;
+            int ok;
+            if (dumpReadString(c, &s, 1) == C_ERR) return C_ERR;
+            ok = (dumpZiplistValidate(s.blob, s.len, 0, &count) == C_OK &&
+                  count > 0);
+            dumpFreeString(&s);
+            if (!ok) return C_ERR;
+        }
+        return C_OK;
+    case RDB_TYPE_STREAM_LISTPACKS: {
+        uint64_t listpacks, length, last_ms, last_seq, cgroups;
+        uint64_t j;
+        if (dumpLen(c, &listpacks) == C_ERR) return C_ERR;
+        for (i = 0; i < listpacks; i++) {
+            size_t count;
+            int ok;
+            if (dumpReadString(c, &s, 1) == C_ERR) return C_ERR;
+            ok = (s.len == sizeof(streamID));
+            dumpFreeString(&s);
+            if (!ok) return C_ERR;
+            if (dumpReadString(c, &s, 1) == C_ERR) return C_ERR;
+            ok = (dumpListpackValidate(s.blob, s.len, &count) == C_OK &&
+                  count > 0);
+            dumpFreeString(&s);
+            if (!ok) return C_ERR;
+        }
+        if (dumpLen(c, &length) == C_ERR) return C_ERR;
+        if (dumpLen(c, &last_ms) == C_ERR) return C_ERR;
+        if (dumpLen(c, &last_seq) == C_ERR) return C_ERR;
+        if (dumpLen(c, &cgroups) == C_ERR) return C_ERR;
+        for (i = 0; i < cgroups; i++) {
+            uint64_t ms, seq, pel, consumers;
+            if (dumpReadString(c, &s, 0) == C_ERR) return C_ERR;
+            if (dumpLen(c, &ms) == C_ERR) return C_ERR;
+            if (dumpLen(c, &seq) == C_ERR) return C_ERR;
+            if (dumpLen(c, &pel) == C_ERR) return C_ERR;
+            if (pel > (uint64_t)c->len) return C_ERR;
+            for (j = 0; j < pel; j++) {
+                uint64_t delivery_count;
+                if (dumpSkip(c, sizeof(streamID) + 8) == C_ERR) return C_ERR;
+                if (dumpLen(c, &delivery_count) == C_ERR) return C_ERR;
+            }
+            if (dumpLen(c, &consumers) == C_ERR) return C_ERR;
+            if (consumers > (uint64_t)c->len) return C_ERR;
+            for (j = 0; j < consumers; j++) {
+                uint64_t pel_size;
+                if (dumpReadString(c, &s, 0) == C_ERR) return C_ERR;
+                if (dumpSkip(c, 8) == C_ERR) return C_ERR;
+                if (dumpLen(c, &pel_size) == C_ERR) return C_ERR;
+                if (pel_size > (uint64_t)c->len) return C_ERR;
+                if (dumpSkip(c, (size_t)pel_size * sizeof(streamID)) == C_ERR)
+                    return C_ERR;
+            }
+        }
+        return C_OK;
+    }
+    case RDB_TYPE_MODULE:
+        return C_ERR; /* Pre-module-v2 values cannot be parsed. */
+    case RDB_TYPE_MODULE_2:
+        return dumpModuleValidate(c);
+    default:
+        return C_ERR;
+    }
+}
+
+/* Deep-validate the value of a RESTORE payload. The payload layout is
+ * <type> <value> <rdbver:2> <crc64:8>; the footer is excluded here because
+ * verifyDumpPayload() has already checked it. Returns C_OK when the value is
+ * safe to load, C_ERR when it is malformed. */
+int rdbSanitizeDumpPayload(const unsigned char *payload, size_t len) {
+    dumpCursor c;
+    unsigned char type;
+
+    if (len < 10) return C_ERR;
+    c.p = payload;
+    c.len = len - 10;
+    c.pos = 0;
+
+    if (dumpByte(&c, &type) == C_ERR) return C_ERR;
+    if (!rdbIsObjectType(type)) return C_ERR;
+    if (dumpValidateObject(&c, type) == C_ERR) return C_ERR;
+    if (c.pos != c.len) return C_ERR;
+    return C_OK;
 }

@@ -8,7 +8,7 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '5.0.14.1-bp28'
+VERSION = '5.0.14.1-bp44'
 NAME = 'Redis-x64-' + VERSION
 DIST = ROOT / 'dist'
 PKG = DIST / NAME
@@ -71,7 +71,7 @@ port 6379
 # tls-cert-file certs/server.crt
 # tls-key-file certs/server.key
 # tls-ca-cert-file certs/ca.crt
-# tls-auth-clients no
+# tls-auth-clients no   # no | yes | optional
 tcp-backlog 511
 timeout 0
 tcp-keepalive 300
@@ -105,7 +105,7 @@ if not exist data mkdir data
 "%~dp0redis-server.exe" "%~dp0redis.windows.conf" --dir "%~dp0data"
 popd
 ''', encoding='ascii', newline='\r\n')
-    (PKG/'README.md').write_text('''# Redis Windows 5.0.14.1-bp28
+    (PKG/'README.md').write_text('''# Redis Windows 5.0.14.1-bp44
 
 Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；关闭窗口或 Ctrl+C 停止。
 默认监听 127.0.0.1:6379，AOF 每秒同步，数据保存在同目录 data/。
@@ -118,7 +118,11 @@ TLS：按 redis.windows.conf 的注释配置 tls-port 和证书后重启；必�
       libssl-3-x64.dll 与 libcrypto-3-x64.dll。随包 redis-cli 不支持 TLS，
       请用支持 TLS 的客户端连接，许可证见 licenses/openssl-LICENSE.txt。
       主从复制加密：从库设置 tls-replication yes，并用 replicaof 指向主库
-      tls-port；主库要求客户端证书时从库也要配置证书和私钥。
+      tls-port；主库要求客户端证书时从库也要配置证书和私钥。主库开
+      repl-diskless-sync yes 时 TLS 从库同样无盘同步。
+      协议、套件、会话缓存和证书校验模式可用 CONFIG SET 调整
+      tls-protocols、tls-ciphers、tls-ciphersuites、tls-prefer-server-ciphers、
+      tls-session-caching、tls-auth-clients（no/yes/optional）。
 新命令示例：
   redis-cli.exe SET demo value KEEPTTL
   redis-cli.exe ZUNION 2 z1 z2 WITHSCORES

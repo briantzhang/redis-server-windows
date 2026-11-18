@@ -661,12 +661,27 @@ pid_t BeginForkOperation_Aof(int aof_pipe_write_ack_to_parent,
 }
 
 void BeginForkOperation_Socket_Duplicate(DWORD dwProcessId) {
-    WSAPROTOCOL_INFO* protocolInfo = (WSAPROTOCOL_INFO*) je_malloc(sizeof(WSAPROTOCOL_INFO) * g_pQForkControl->globalData.numfds);
+    WSAPROTOCOL_INFO* protocolInfo;
+
+    /* The control block is reused by every diskless sync. Release the socket
+     * duplication records of the previous child before replacing them, and
+     * fail the fork (instead of handing the child garbage) if a socket cannot
+     * be duplicated. */
+    if (g_pQForkControl->globalData.protocolInfo != NULL) {
+        je_free(g_pQForkControl->globalData.protocolInfo);
+        g_pQForkControl->globalData.protocolInfo = NULL;
+    }
+    protocolInfo = (WSAPROTOCOL_INFO*) je_malloc(sizeof(WSAPROTOCOL_INFO) * g_pQForkControl->globalData.numfds);
     g_pQForkControl->globalData.protocolInfo = protocolInfo;
     for (int i = 0; i < g_pQForkControl->globalData.numfds; i++) {
-        FDAPI_WSADuplicateSocket(g_pQForkControl->globalData.fds[i],
+        if (FDAPI_WSADuplicateSocket(g_pQForkControl->globalData.fds[i],
             dwProcessId,
-            &protocolInfo[i]);
+            &protocolInfo[i]) != 0)
+        {
+            je_free(protocolInfo);
+            g_pQForkControl->globalData.protocolInfo = NULL;
+            throw runtime_error("WSADuplicateSocket failed.");
+        }
     }
 }
 

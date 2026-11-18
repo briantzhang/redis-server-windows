@@ -53,6 +53,8 @@ void replicationResurrectCachedMaster(int newfd);
 void replicationSendAck(void);
 void putSlaveOnline(client *slave);
 int cancelReplicationHandshake(void);
+void clearFailoverState(void);
+void updateFailoverStatus(void);
 
 /* --------------------------- Utility functions ---------------------------- */
 
@@ -603,9 +605,11 @@ int startBgsaveForReplication(int mincapa) {
     listIter li;
     listNode *ln;
 
+#ifndef _WIN32
     /* The diskless path streams the RDB through the raw socket from the
-     * child process, which cannot drive a TLS session. Fall back to disk
-     * when a replica waiting for a full resync uses TLS. */
+     * child process, which cannot drive a TLS session. On Windows the parent
+     * relays TLS replicas through a loopback socket pair (see rdb.c), so the
+     * fallback is only needed where that relay does not exist. */
     if (socket_target) {
         listRewind(server.slaves,&li);
         while((ln = listNext(&li))) {
@@ -618,6 +622,7 @@ int startBgsaveForReplication(int mincapa) {
             }
         }
     }
+#endif
 
     serverLog(LL_NOTICE,"Starting BGSAVE for SYNC with target: %s",
         socket_target ? "replicas sockets" : "disk");
@@ -681,6 +686,29 @@ int startBgsaveForReplication(int mincapa) {
 void syncCommand(client *c) {
     /* ignore SYNC if already slave or in monitor mode */
     if (c->flags & CLIENT_SLAVE) return;
+
+    /* A master hands its dataset over with "PSYNC <replid> <offset> FAILOVER"
+     * when a coordinated failover reaches this node. The replication ID must
+     * match: it proves the requester is the master this replica was following,
+     * so promoting ourselves cannot split the dataset. */
+    if (c->argc > 3 && !strcasecmp(c->argv[0]->ptr,"psync") &&
+        !strcasecmp(c->argv[3]->ptr,"failover"))
+    {
+        if (!server.masterhost) {
+            addReplyError(c,"PSYNC FAILOVER can't be sent to a master.");
+            return;
+        }
+        if (strcasecmp(c->argv[1]->ptr,server.replid) != 0) {
+            addReplyError(c,"PSYNC FAILOVER replid must match my replid.");
+            return;
+        }
+        serverLog(LL_WARNING,
+            "MASTER MODE enabled (failover request from '%s')",
+            replicationGetSlaveName(c));
+        replicationUnsetMaster();
+        /* Fall through: now that we are a master, serve the full
+         * resynchronization the old master is asking for. */
+    }
 
     /* Refuse SYNC requests if we are a slave but the link with our master
      * is not ok... */
@@ -952,6 +980,68 @@ void sendBulkToSlaveDataDone(aeEventLoop *el, int fd, void *privdata, int nwritt
     }
 }
 
+/* Diskless RDB transfer to a replica connected over TLS. The RDB child has no
+ * TLS state, so it writes the payload into one end of a loopback socket pair
+ * created by rdbSaveToSlavesSockets() and the parent relays the bytes through
+ * the replica's TLS session. The relay socket reports EOF once the child
+ * closed its end, which marks the end of the payload. */
+static void sendBulkToSlaveTlsPipe(client *slave) {
+    char buf[PROTO_IOBUF_LEN];
+    ssize_t buflen;
+    int nwritten;
+
+    while (1) {
+        if (slave->repl_chunk == NULL) {
+            buflen = read(slave->repldbfd,buf,sizeof(buf));
+            /* The relay socket is attached to the completion port, so the
+             * read notification has to be queued again after every read. */
+            WSIOCP_QueueNextRead(slave->repldbfd);
+            if (buflen == 0) {
+                /* The child exited after handing over the whole payload. */
+                aeDeleteFileEvent(server.el,slave->repldbfd,AE_READABLE);
+                close(slave->repldbfd);
+                slave->repldbfd = -1;
+                slave->repldbsize = 0;
+                aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
+                if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_END)
+                    putSlaveOnline(slave);
+                return;
+            }
+            if (buflen < 0) {
+                if (errno == EAGAIN || errno == WSAEWOULDBLOCK) return;
+                serverLog(LL_WARNING,
+                    "Read error relaying DB to replica %s: %s",
+                    replicationGetSlaveName(slave),wsa_strerror(errno));
+                freeClient(slave);
+                return;
+            }
+            slave->repl_chunk = sdsnewlen(buf,(size_t)buflen);
+        }
+
+        nwritten = tlsWrite(slave,slave->repl_chunk,
+                            (int)sdslen(slave->repl_chunk));
+        if (nwritten < 0) {
+            if (errno == EAGAIN || errno == WSAEWOULDBLOCK) {
+                /* Ciphertext is still queued: keep our writable handler so
+                 * the next drain wakes this function and not the reply
+                 * writer installed by tlsWrite(). */
+                aeCreateFileEvent(server.el,slave->fd,AE_WRITABLE,
+                                  sendBulkToSlave,slave);
+                return;
+            }
+            freeClient(slave);
+            return;
+        }
+        if ((size_t)nwritten == sdslen(slave->repl_chunk)) {
+            sdsfree(slave->repl_chunk);
+            slave->repl_chunk = NULL;
+        } else {
+            /* Partial plaintext write: keep the rest for the next round. */
+            sdsrange(slave->repl_chunk,nwritten,-1);
+        }
+    }
+}
+
 /* Disk based RDB transfer to a replica connected over TLS. The IOCP send
  * used for plain replicas writes to the socket directly, which would corrupt
  * the TLS stream, so the RDB is pushed through the TLS session instead and
@@ -960,6 +1050,11 @@ void sendBulkToSlaveTls(client *slave) {
     char buf[PROTO_IOBUF_LEN];
     ssize_t buflen;
     int nwritten;
+
+    if (slave->repldbsize == -1) {
+        sendBulkToSlaveTlsPipe(slave);
+        return;
+    }
 
     if (slave->replpreamble) {
         nwritten = tlsWrite(slave,slave->replpreamble,
@@ -1343,7 +1438,89 @@ void restartAOFAfterSYNC() {
 
 /* Asynchronously read the SYNC payload we receive from a master */
 #define REPL_MAX_WRITTEN_BEFORE_FSYNC (1024*1024*8) /* 8 MB */
-void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
+
+/* Return true if the RDB streamed with an EOF mark should be loaded directly
+ * from memory instead of first being written to a temporary file. */
+static int replUseDisklessLoad(void) {
+    if (server.repl_diskless_load == REPL_DISKLESS_LOAD_DISABLED) return 0;
+    if (server.repl_diskless_load == REPL_DISKLESS_LOAD_SWAPDB) return 1;
+
+    /* on-empty-db: only take the diskless path when there is nothing to
+     * preserve in any database. */
+    for (int j = 0; j < server.dbnum; j++) {
+        if (dictSize(server.db[j].dict) != 0) return 0;
+    }
+    return 1;
+}
+
+/* Point every client at the new server.db array after a swapdb load. */
+static void rebindClientsToCurrentDb(void) {
+    listIter li;
+    listNode *ln;
+    listRewind(server.clients,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        client *c = listNodeValue(ln);
+        c->db = &server.db[c->db->id];
+    }
+    if (server.current_client)
+        server.current_client->db = &server.db[server.current_client->db->id];
+}
+
+/* Load an RDB held in memory. With swapdb the current databases are kept
+ * untouched until the new dataset has been fully loaded. */
+static int loadRdbFromDisklessBuffer(sds buf, rdbSaveInfo *rsi, int swapdb) {
+    rio rdb;
+    int retval;
+    redisDb *olddb = NULL;
+    rax *old_slots = NULL;
+    PORT_LONGLONG *old_slot_counts = NULL;
+
+    if (swapdb) {
+        olddb = server.db;
+        server.db = createDbArray(server.dbnum);
+        if (server.cluster_enabled) {
+            old_slots = server.cluster->slots_to_keys;
+            old_slot_counts = zmalloc(sizeof(*old_slot_counts)*CLUSTER_SLOTS);
+            memcpy(old_slot_counts,server.cluster->slots_keys_count,
+                   sizeof(*old_slot_counts)*CLUSTER_SLOTS);
+            server.cluster->slots_to_keys = raxNew();
+            memset(server.cluster->slots_keys_count,0,
+                   sizeof(*old_slot_counts)*CLUSTER_SLOTS);
+        }
+    }
+
+    server.loading = 1;
+    server.loading_start_time = time(NULL);
+    server.loading_loaded_bytes = 0;
+    server.loading_total_bytes = sdslen(buf);
+    rioInitWithBuffer(&rdb,buf);
+    retval = rdbLoadRio(&rdb,rsi,0);
+    server.loading = 0;
+
+    if (swapdb) {
+        if (retval == C_OK) {
+            rebindClientsToCurrentDb();
+            freeDbArray(olddb,server.dbnum);
+            if (old_slots) {
+                raxFree(old_slots);
+                zfree(old_slot_counts);
+            }
+        } else {
+            freeDbArray(server.db,server.dbnum);
+            server.db = olddb;
+            if (old_slots) {
+                raxFree(server.cluster->slots_to_keys);
+                server.cluster->slots_to_keys = old_slots;
+                memcpy(server.cluster->slots_keys_count,old_slot_counts,
+                       sizeof(*old_slot_counts)*CLUSTER_SLOTS);
+                zfree(old_slot_counts);
+            }
+        }
+    }
+    return retval;
+}
+
+static void readSyncBulkPayloadOnce(aeEventLoop *el, int fd, void *privdata, int mask) {
     char buf[4096];
     ssize_t nread, readlen, nwritten;
     off_t left;
@@ -1356,10 +1533,14 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
     static char eofmark[CONFIG_RUN_ID_SIZE];
     static char lastbytes[CONFIG_RUN_ID_SIZE];
     static int usemark = 0;
+    static int diskless = 0;
 
     /* If repl_transfer_size == -1 we still have to read the bulk length
      * from the master reply. */
     if (server.repl_transfer_size == -1) {
+        sdsfree(server.repl_diskless_buf);
+        server.repl_diskless_buf = NULL;
+        diskless = 0;
         if (syncReadLine(fd,buf,1024,(PORT_LONGLONG)server.repl_syncio_timeout*1000) == -1) {  WIN_PORT_FIX /* cast (PORT_LONGLONG) */
             serverLog(LL_WARNING,
                 "I/O error reading bulk count from MASTER: %s",
@@ -1402,8 +1583,10 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
             /* Set any repl_transfer_size to avoid entering this code path
              * at the next call. */
             server.repl_transfer_size = 0;
+            diskless = replUseDisklessLoad();
             serverLog(LL_NOTICE,
-                "MASTER <-> REPLICA sync: receiving streamed RDB from master");
+                "MASTER <-> REPLICA sync: receiving streamed RDB from master%s",
+                diskless ? " (diskless load)" : "");
         } else {
             usemark = 0;
             server.repl_transfer_size = strtol(buf+1,NULL,10);
@@ -1465,7 +1648,12 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 
     server.repl_transfer_lastio = server.unixtime;
-    if ((nwritten = write(server.repl_transfer_fd,buf,nread)) != nread) {
+    if (diskless) {
+        if (server.repl_diskless_buf == NULL)
+            server.repl_diskless_buf = sdsempty();
+        server.repl_diskless_buf =
+            sdscatlen(server.repl_diskless_buf,buf,(size_t)nread);
+    } else if ((nwritten = write(server.repl_transfer_fd,buf,nread)) != nread) {
         serverLog(LL_WARNING,"Write error or short write writing to the DB dump file needed for MASTER <-> REPLICA synchronization: %s",
             (nwritten == -1) ? IF_WIN32(wsa_strerror(errno), strerror(errno)) : "short write");
         goto error;
@@ -1485,7 +1673,7 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
     /* Sync data on disk from time to time, otherwise at the end of the transfer
      * we may suffer a big delay as the memory buffers are copied into the
      * actual disk. */
-    if (server.repl_transfer_read >=
+    if (!diskless && server.repl_transfer_read >=
         server.repl_transfer_last_fsync_off + REPL_MAX_WRITTEN_BEFORE_FSYNC)
     {
         off_t sync_size = server.repl_transfer_read -
@@ -1503,6 +1691,7 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     if (eof_reached) {
         int aof_is_enabled = server.aof_state != AOF_OFF;
+        rdbSaveInfo rsi = RDB_SAVE_INFO_INIT;
 
 #ifdef _WIN32
         /* Close temp, since rename is unable to delete open file */
@@ -1523,54 +1712,115 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
             rdbRemoveTempFile(server.rdb_child_pid);
         }
 
-        /* Make sure the new file (also used for persistence) is fully synced
-         * (not covered by earlier calls to rdb_fsync_range). */
-        if (fsync(server.repl_transfer_fd) == -1) {
-            serverLog(LL_WARNING,
-                "Failed trying to sync the temp DB to disk in "
-                "MASTER <-> REPLICA synchronization: %s",
-                strerror(errno));
-            cancelReplicationHandshake();
-            return;
-        }
+        if (diskless) {
+            size_t newlen;
 
-        if (rename(server.repl_transfer_tmpfile,server.rdb_filename) == -1) {
-            serverLog(LL_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> REPLICA synchronization: %s", IF_WIN32(wsa_strerror(errno),strerror(errno)));
-            cancelReplicationHandshake();
-            return;
-        }
-        serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Flushing old data");
-        /* We need to stop any AOFRW fork before flusing and parsing
-         * RDB, otherwise we'll create a copy-on-write disaster. */
-        if(aof_is_enabled) stopAppendOnly();
-        signalFlushedDb(-1);
-        emptyDb(
-            -1,
-            server.repl_slave_lazy_flush ? EMPTYDB_ASYNC : EMPTYDB_NO_FLAGS,
-            replicationEmptyDbCallback);
-        /* Before loading the DB into memory we need to delete the readable
-         * handler, otherwise it will get called recursively since
-         * rdbLoad() will call the event loop to process events from time to
-         * time for non blocking loading. */
-        aeDeleteFileEvent(server.el,server.repl_transfer_s,AE_READABLE);
-        serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Loading DB in memory");
-        rdbSaveInfo rsi = RDB_SAVE_INFO_INIT;
-        if (rdbLoad(server.rdb_filename,&rsi) != C_OK) {
-            serverLog(LL_WARNING,"Failed trying to load the MASTER synchronization DB from disk");
-            cancelReplicationHandshake();
-            /* Re-enable the AOF if we disabled it earlier, in order to restore
-             * the original configuration. */
-            if (aof_is_enabled) restartAOFAfterSYNC();
-            return;
-        }
-        /* Final setup of the connected slave <- master link */
-        zfree(server.repl_transfer_tmpfile);
-#ifdef _WIN32
-        server.repl_transfer_tmpfile = NULL;
-#else
-        /* Moved before rename tmp->db in windows */
-        close(server.repl_transfer_fd);
+            serverLog(LL_NOTICE,
+                "MASTER <-> REPLICA sync: Loading DB in memory from the "
+                "diskless transfer");
+            if (server.repl_diskless_buf == NULL ||
+                sdslen(server.repl_diskless_buf) < CONFIG_RUN_ID_SIZE)
+            {
+                serverLog(LL_WARNING,
+                    "Diskless RDB transfer ended before the EOF mark");
+                cancelReplicationHandshake();
+                return;
+            }
+            newlen = sdslen(server.repl_diskless_buf)-CONFIG_RUN_ID_SIZE;
+            if (newlen == 0) sdsclear(server.repl_diskless_buf);
+            else sdsrange(server.repl_diskless_buf,0,newlen-1);
+
+            /* No temporary file was written on this path. */
+            unlink(server.repl_transfer_tmpfile);
+#ifndef _WIN32
+            close(server.repl_transfer_fd);
 #endif
+            server.repl_transfer_fd = -1;
+
+            if (aof_is_enabled) stopAppendOnly();
+            if (server.repl_diskless_load != REPL_DISKLESS_LOAD_SWAPDB) {
+                serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Flushing old data");
+                signalFlushedDb(-1);
+                emptyDb(
+                    -1,
+                    server.repl_slave_lazy_flush ? EMPTYDB_ASYNC : EMPTYDB_NO_FLAGS,
+                    replicationEmptyDbCallback);
+            } else {
+                serverLog(LL_NOTICE,
+                    "MASTER <-> REPLICA sync: Swapping databases after load");
+            }
+            /* Before loading the DB into memory we need to delete the readable
+             * handler, otherwise it will get called recursively since
+             * rdbLoad() will call the event loop to process events from time
+             * to time for non blocking loading. */
+            aeDeleteFileEvent(server.el,server.repl_transfer_s,AE_READABLE);
+            if (loadRdbFromDisklessBuffer(
+                    server.repl_diskless_buf,&rsi,
+                    server.repl_diskless_load == REPL_DISKLESS_LOAD_SWAPDB)
+                != C_OK)
+            {
+                serverLog(LL_WARNING,
+                    "Failed trying to load the MASTER synchronization DB "
+                    "from the diskless transfer");
+                sdsfree(server.repl_diskless_buf);
+                server.repl_diskless_buf = NULL;
+                cancelReplicationHandshake();
+                if (aof_is_enabled) restartAOFAfterSYNC();
+                return;
+            }
+            sdsfree(server.repl_diskless_buf);
+            server.repl_diskless_buf = NULL;
+            zfree(server.repl_transfer_tmpfile);
+            server.repl_transfer_tmpfile = NULL;
+        } else {
+            /* Make sure the new file (also used for persistence) is fully
+             * synced (not covered by earlier calls to rdb_fsync_range). */
+            if (fsync(server.repl_transfer_fd) == -1) {
+                serverLog(LL_WARNING,
+                    "Failed trying to sync the temp DB to disk in "
+                    "MASTER <-> REPLICA synchronization: %s",
+                    strerror(errno));
+                cancelReplicationHandshake();
+                return;
+            }
+
+            if (rename(server.repl_transfer_tmpfile,server.rdb_filename) == -1) {
+                serverLog(LL_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> REPLICA synchronization: %s", IF_WIN32(wsa_strerror(errno),strerror(errno)));
+                cancelReplicationHandshake();
+                return;
+            }
+            serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Flushing old data");
+            /* We need to stop any AOFRW fork before flusing and parsing
+             * RDB, otherwise we'll create a copy-on-write disaster. */
+            if(aof_is_enabled) stopAppendOnly();
+            signalFlushedDb(-1);
+            emptyDb(
+                -1,
+                server.repl_slave_lazy_flush ? EMPTYDB_ASYNC : EMPTYDB_NO_FLAGS,
+                replicationEmptyDbCallback);
+            /* Before loading the DB into memory we need to delete the readable
+             * handler, otherwise it will get called recursively since
+             * rdbLoad() will call the event loop to process events from time
+             * to time for non blocking loading. */
+            aeDeleteFileEvent(server.el,server.repl_transfer_s,AE_READABLE);
+            serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Loading DB in memory");
+            if (rdbLoad(server.rdb_filename,&rsi) != C_OK) {
+                serverLog(LL_WARNING,"Failed trying to load the MASTER synchronization DB from disk");
+                cancelReplicationHandshake();
+                /* Re-enable the AOF if we disabled it earlier, in order to
+                 * restore the original configuration. */
+                if (aof_is_enabled) restartAOFAfterSYNC();
+                return;
+            }
+            /* Final setup of the connected slave <- master link */
+            zfree(server.repl_transfer_tmpfile);
+#ifdef _WIN32
+            server.repl_transfer_tmpfile = NULL;
+#else
+            /* Moved before rename tmp->db in windows */
+            close(server.repl_transfer_fd);
+#endif
+        }
         replicationCreateMasterClient(server.repl_transfer_s,rsi.repl_stream_db);
         server.repl_state = REPL_STATE_CONNECTED;
         server.repl_down_since = 0;
@@ -1592,15 +1842,22 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
          * to the new file. */
         if (aof_is_enabled) restartAOFAfterSYNC();
     }
-    /* TLS may already hold more plaintext than the 4 KB chunk consumed above.
-     * A new socket readiness event would never arrive for it. */
-    if (tlsReplActive(fd) && tlsReplPending(fd) > 0)
-        readSyncBulkPayload(el,fd,privdata,mask);
     return;
 
 error:
     cancelReplicationHandshake();
     return;
+}
+
+/* Feed the plaintext OpenSSL already buffered without waiting for a new
+ * socket event. This is a loop, not a recursive call: a large RDB arrives
+ * in many 4 KB chunks and recursing once per chunk overflowed the stack of
+ * the replica even on a diskless TLS sync. */
+void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
+    while (1) {
+        readSyncBulkPayloadOnce(el,fd,privdata,mask);
+        if (!tlsReplActive(fd) || tlsReplPending(fd) == 0) break;
+    }
 }
 
 /* Send a synchronous command to the master. Used to send AUTH and
@@ -1744,8 +2001,15 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
             memcpy(psync_offset,"-1",3);
         }
 
-        /* Issue the PSYNC command */
-        reply = sendSynchronousCommand(SYNC_CMD_WRITE,fd,"PSYNC",psync_replid,psync_offset,NULL);
+        /* Issue the PSYNC command. When this node is handing over to the
+         * replica it is connecting to, the FAILOVER flag tells it to promote
+         * itself as soon as the handshake starts. */
+        if (server.failover_state == FAILOVER_STATE_IN_PROGRESS)
+            reply = sendSynchronousCommand(SYNC_CMD_WRITE,fd,"PSYNC",
+                psync_replid,psync_offset,"FAILOVER",NULL);
+        else
+            reply = sendSynchronousCommand(SYNC_CMD_WRITE,fd,"PSYNC",
+                psync_replid,psync_offset,NULL);
         if (reply != NULL) {
             serverLog(LL_WARNING,"Unable to send PSYNC to master: %s",reply);
             sdsfree(reply);
@@ -2090,6 +2354,11 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
      * master and so forth. */
     if (psync_result == PSYNC_TRY_LATER) goto error;
 
+    /* The coordinated failover handshake succeeded: this node is now a
+     * replica of the promoted node, so writes can be served again. */
+    if (server.failover_state == FAILOVER_STATE_IN_PROGRESS)
+        clearFailoverState();
+
     /* Note: if PSYNC does not return WAIT_REPLY, it will take care of
      * uninstalling the read handler from the file descriptor. */
 
@@ -2225,9 +2494,17 @@ void undoConnectWithMaster(void) {
 void replicationAbortSyncTransfer(void) {
     serverAssert(server.repl_state == REPL_STATE_TRANSFER);
     undoConnectWithMaster();
-    close(server.repl_transfer_fd);
-    unlink(server.repl_transfer_tmpfile);
-    zfree(server.repl_transfer_tmpfile);
+    if (server.repl_transfer_fd != -1) {
+        close(server.repl_transfer_fd);
+        server.repl_transfer_fd = -1;
+    }
+    if (server.repl_transfer_tmpfile != NULL) {
+        unlink(server.repl_transfer_tmpfile);
+        zfree(server.repl_transfer_tmpfile);
+        server.repl_transfer_tmpfile = NULL;
+    }
+    sdsfree(server.repl_diskless_buf);
+    server.repl_diskless_buf = NULL;
 }
 
 /* This function aborts a non blocking replication attempt if there is one
@@ -2251,6 +2528,194 @@ int cancelReplicationHandshake(void) {
         return 0;
     }
     return 1;
+}
+
+/* ------------------------- Coordinated failover -------------------------- */
+
+/* Return the address a replica is reachable at, preferring the IP it
+ * announced with REPLCONF ip-address. */
+static int failoverReplicaIp(client *replica, char *ip, size_t len) {
+    if (replica->slave_ip[0] != '\0') {
+        snprintf(ip,len,"%s",replica->slave_ip);
+        return C_OK;
+    }
+    if (anetPeerToString(replica->fd,ip,len,NULL) != -1) return C_OK;
+    return C_ERR;
+}
+
+static client *findFailoverReplica(const char *host, int port) {
+    listIter li;
+    listNode *ln;
+    char ip[NET_IP_STR_LEN];
+
+    listRewind(server.slaves,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        client *replica = listNodeValue(ln);
+        if (replica->slave_listening_port != port) continue;
+        if (failoverReplicaIp(replica,ip,sizeof(ip)) == C_ERR) continue;
+        if (!strcasecmp(host,ip)) return replica;
+    }
+    return NULL;
+}
+
+/* Forget the failover in progress (if any) and let clients write again. */
+void clearFailoverState(void) {
+    server.failover_state = FAILOVER_STATE_NONE;
+    server.failover_end_time = 0;
+    server.force_failover = 0;
+    zfree(server.target_replica_host);
+    server.target_replica_host = NULL;
+    server.target_replica_port = 0;
+    unpauseClients();
+}
+
+static void abortFailover(const char *err) {
+    if (server.failover_state == FAILOVER_STATE_NONE) return;
+    serverLog(LL_WARNING,"%s",err);
+    clearFailoverState();
+}
+
+/* Called once per second by replicationCron(). While waiting for the target
+ * replica to catch up, checks the deadline and starts the handover as soon as
+ * the replica acknowledged the whole replication stream (or immediately when
+ * FORCE was given). */
+void updateFailoverStatus(void) {
+    client *replica = NULL;
+    char ip[NET_IP_STR_LEN];
+
+    if (server.failover_state != FAILOVER_STATE_WAITING_FOR_SYNC) return;
+
+    if (server.failover_end_time && mstime() >= server.failover_end_time) {
+        abortFailover("Failover timed out before the replica was in sync.");
+        return;
+    }
+
+    if (server.target_replica_host) {
+        replica = findFailoverReplica(server.target_replica_host,
+                                      server.target_replica_port);
+    } else {
+        listIter li;
+        listNode *ln;
+        listRewind(server.slaves,&li);
+        while ((ln = listNext(&li)) != NULL) {
+            client *candidate = listNodeValue(ln);
+            if (candidate->replstate != SLAVE_STATE_ONLINE) continue;
+            if (candidate->repl_ack_off != server.master_repl_offset) continue;
+            if (failoverReplicaIp(candidate,ip,sizeof(ip)) == C_ERR) continue;
+            server.target_replica_host = zstrdup(ip);
+            server.target_replica_port = candidate->slave_listening_port;
+            replica = candidate;
+            break;
+        }
+    }
+    if (replica == NULL) return;
+    if (replica->replstate != SLAVE_STATE_ONLINE) return;
+
+    /* Without FORCE we only hand over once the replica has acknowledged the
+     * whole replication stream: from now on the master pauses writes, so the
+     * replica can never fall behind again. */
+    if (!server.force_failover &&
+        replica->repl_ack_off != server.master_repl_offset) return;
+
+    serverLog(LL_WARNING,"Failover target %s:%d is synced, failing over.",
+        server.target_replica_host, server.target_replica_port);
+    server.failover_state = FAILOVER_STATE_IN_PROGRESS;
+    replicationSetMaster(server.target_replica_host,
+                         server.target_replica_port);
+}
+
+/* FAILOVER [TO host port [FORCE]] [ABORT] [TIMEOUT milliseconds]
+ *
+ * On a master, asks a connected replica to take over. Once the replica has
+ * acknowledged all the data, writes are paused and this node connects to the
+ * replica with PSYNC ... FAILOVER, which makes the replica promote itself to
+ * master and resynchronize this node as its replica. */
+void failoverCommand(client *c) {
+    PORT_LONG port = 0, timeout = 0;
+    char *host = NULL;
+    int force = 0;
+    int j;
+
+    if (server.cluster_enabled) {
+        addReplyError(c,"FAILOVER is not supported in cluster mode.");
+        return;
+    }
+
+    if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"abort")) {
+        if (server.failover_state == FAILOVER_STATE_NONE) {
+            addReplyError(c,"No failover in progress.");
+            return;
+        }
+        abortFailover("Failover manually aborted.");
+        addReply(c,shared.ok);
+        return;
+    }
+
+    for (j = 1; j < c->argc; j++) {
+        int moreargs = (c->argc-1) - j;
+
+        if (!strcasecmp(c->argv[j]->ptr,"timeout") && moreargs) {
+            if (timeout) { addReply(c,shared.syntaxerr); return; }
+            if (getLongFromObjectOrReply(c,c->argv[j+1],&timeout,NULL)
+                != C_OK) return;
+            if (timeout <= 0) {
+                addReplyError(c,"FAILOVER timeout must be greater than 0");
+                return;
+            }
+            j++;
+        } else if (!strcasecmp(c->argv[j]->ptr,"to") && moreargs >= 2) {
+            if (host) { addReply(c,shared.syntaxerr); return; }
+            host = c->argv[j+1]->ptr;
+            if (getLongFromObjectOrReply(c,c->argv[j+2],&port,NULL) != C_OK)
+                return;
+            j += 2;
+        } else if (!strcasecmp(c->argv[j]->ptr,"force")) {
+            if (force) { addReply(c,shared.syntaxerr); return; }
+            force = 1;
+        } else {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+    }
+
+    if (server.failover_state != FAILOVER_STATE_NONE) {
+        addReplyError(c,"FAILOVER already in progress.");
+        return;
+    }
+    if (server.masterhost) {
+        addReplyError(c,"FAILOVER is not valid when server is a replica.");
+        return;
+    }
+    if (listLength(server.slaves) == 0) {
+        addReplyError(c,"FAILOVER requires connected replicas.");
+        return;
+    }
+    if (force && (!host || !timeout)) {
+        addReplyError(c,"FAILOVER with force option requires both a target "
+                        "host and port, and a timeout.");
+        return;
+    }
+    if (host) {
+        client *replica = findFailoverReplica(host,port);
+        if (replica == NULL) {
+            addReplyError(c,"FAILOVER target HOST and PORT is not a replica.");
+            return;
+        }
+        if (replica->replstate != SLAVE_STATE_ONLINE) {
+            addReplyError(c,"FAILOVER target replica is not online.");
+            return;
+        }
+        server.target_replica_host = zstrdup(host);
+        server.target_replica_port = (int)port;
+    }
+
+    server.force_failover = force;
+    server.failover_state = FAILOVER_STATE_WAITING_FOR_SYNC;
+    server.failover_end_time = timeout ? mstime() + timeout : 0;
+    pauseClients(LLONG_MAX,CLIENT_PAUSE_WRITE);
+    serverLog(LL_WARNING,"FAILOVER requested to %s:%d (timeout %lld ms).",
+        host ? host : "any in-sync replica", (int)port, (PORT_LONGLONG)timeout);
+    addReply(c,shared.ok);
 }
 
 /* Set replication to the specified master address and port. */
@@ -2329,6 +2794,10 @@ void replicaofCommand(client *c) {
         addReplyError(c,"REPLICAOF not allowed in cluster mode.");
         return;
     }
+
+    /* An explicit role change wins over a coordinated failover that is still
+     * waiting for its target replica. */
+    if (server.failover_state != FAILOVER_STATE_NONE) clearFailoverState();
 
     /* The special host/port combination "NO" "ONE" turns the instance
      * into a master. Otherwise the new master address is set. */
@@ -2891,6 +3360,9 @@ PORT_LONGLONG replicationGetSlaveOffset(void) {
 void replicationCron(void) {
     static PORT_LONGLONG replication_cron_loops = 0;
 
+    /* Progress a coordinated failover, if one was requested. */
+    updateFailoverStatus();
+
     /* Non blocking connection timeout? */
     if (server.masterhost &&
         (server.repl_state == REPL_STATE_CONNECTING ||
@@ -3096,7 +3568,9 @@ void replicationCron(void) {
 
         if (slaves_waiting &&
             (!server.repl_diskless_sync ||
-             max_idle > server.repl_diskless_sync_delay))
+             max_idle > server.repl_diskless_sync_delay ||
+             (server.repl_diskless_sync_max_replicas > 0 &&
+              slaves_waiting >= server.repl_diskless_sync_max_replicas)))
         {
             /* Start the BGSAVE. The called function may start a
              * BGSAVE with socket target or disk target depending on the

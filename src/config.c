@@ -37,6 +37,7 @@
 
 #include "server.h"
 #include "cluster.h"
+#include "tls.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -100,6 +101,20 @@ configEnum aof_fsync_enum[] = {
     {NULL, 0}
 };
 
+configEnum repl_diskless_load_enum[] = {
+    {"disabled", REPL_DISKLESS_LOAD_DISABLED},
+    {"on-empty-db", REPL_DISKLESS_LOAD_ON_EMPTY_DB},
+    {"swapdb", REPL_DISKLESS_LOAD_SWAPDB},
+    {NULL, 0}
+};
+
+configEnum sanitize_dump_payload_enum[] = {
+    {"no", SANITIZE_DUMP_PAYLOAD_NO},
+    {"yes", SANITIZE_DUMP_PAYLOAD_YES},
+    {"clients", SANITIZE_DUMP_PAYLOAD_CLIENTS},
+    {NULL, 0}
+};
+
 /* Output buffer limits presets. */
 clientBufferLimitsConfig clientBufferLimitsDefaults[CLIENT_TYPE_OBUF_COUNT] = {
     {0, 0, 0}, /* normal */
@@ -149,6 +164,21 @@ int yesnotoi(char *s) {
     if (!strcasecmp(s,"yes")) return 1;
     else if (!strcasecmp(s,"no")) return 0;
     else return -1;
+}
+
+/* tls-auth-clients takes three values, so yesnotoi() is not enough. Returns -1
+ * for anything that is not "yes", "no" or "optional". */
+static int tlsClientAuthFromString(const char *value) {
+    if (!strcasecmp(value,"yes")) return TLS_CLIENT_AUTH_YES;
+    if (!strcasecmp(value,"no")) return TLS_CLIENT_AUTH_NO;
+    if (!strcasecmp(value,"optional")) return TLS_CLIENT_AUTH_OPTIONAL;
+    return -1;
+}
+
+static const char *tlsClientAuthToString(int value) {
+    if (value == TLS_CLIENT_AUTH_YES) return "yes";
+    if (value == TLS_CLIENT_AUTH_OPTIONAL) return "optional";
+    return "no";
 }
 
 void appendServerSaveParams(time_t seconds, int changes) {
@@ -259,11 +289,34 @@ void loadServerConfigFromString(char* config) {
             zfree(server.tls_ca_cert_dir);
             server.tls_ca_cert_dir = zstrdup(argv[1]);
         } else if (!strcasecmp(argv[0],"tls-auth-clients") && argc == 2) {
-            if ((server.tls_auth_clients = yesnotoi(argv[1])) == -1) {
-                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            if ((server.tls_auth_clients =
+                    tlsClientAuthFromString(argv[1])) == -1)
+            {
+                err = "argument must be 'yes', 'no' or 'optional'"; goto loaderr;
             }
         } else if (!strcasecmp(argv[0],"tls-replication") && argc == 2) {
             if ((server.tls_replication = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"tls-cluster") && argc == 2) {
+            if ((server.tls_cluster = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"tls-protocols") && argc == 2) {
+            zfree(server.tls_protocols);
+            server.tls_protocols = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"tls-ciphers") && argc == 2) {
+            zfree(server.tls_ciphers);
+            server.tls_ciphers = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"tls-ciphersuites") && argc == 2) {
+            zfree(server.tls_ciphersuites);
+            server.tls_ciphersuites = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"tls-prefer-server-ciphers") && argc == 2) {
+            if ((server.tls_prefer_server_ciphers = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"tls-session-caching") && argc == 2) {
+            if ((server.tls_session_caching = yesnotoi(argv[1])) == -1) {
                 err = "argument must be 'yes' or 'no'"; goto loaderr;
             }
         } else if (!strcasecmp(argv[0],"tcp-backlog") && argc == 2) {
@@ -471,6 +524,27 @@ void loadServerConfigFromString(char* config) {
                 err = "repl-diskless-sync-delay can't be negative";
                 goto loaderr;
             }
+        } else if (!strcasecmp(argv[0],"repl-diskless-load") && argc==2) {
+            server.repl_diskless_load =
+                configEnumGetValue(repl_diskless_load_enum,argv[1]);
+            if (server.repl_diskless_load == INT_MIN) {
+                err = "argument must be 'disabled', 'on-empty-db' or 'swapdb'";
+                goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"repl-diskless-sync-max-replicas") &&
+                   argc == 2)
+        {
+            server.repl_diskless_sync_max_replicas = atoi(argv[1]);
+            if (server.repl_diskless_sync_max_replicas < 0) {
+                err = "repl-diskless-sync-max-replicas can't be negative";
+                goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"shutdown-timeout") && argc == 2) {
+            server.shutdown_timeout = atoi(argv[1]);
+            if (server.shutdown_timeout < 0) {
+                err = "shutdown-timeout can't be negative";
+                goto loaderr;
+            }
         } else if (!strcasecmp(argv[0],"repl-backlog-size") && argc == 2) {
             PORT_LONGLONG size = memtoll(argv[1],NULL);
             if (size <= 0) {
@@ -515,6 +589,13 @@ void loadServerConfigFromString(char* config) {
         } else if (!strcasecmp(argv[0],"rdbchecksum") && argc == 2) {
             if ((server.rdb_checksum = yesnotoi(argv[1])) == -1) {
                 err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"sanitize-dump-payload") && argc == 2) {
+            server.sanitize_dump_payload =
+                configEnumGetValue(sanitize_dump_payload_enum,argv[1]);
+            if (server.sanitize_dump_payload == INT_MIN) {
+                err = "argument must be 'no', 'yes' or 'clients'";
+                goto loaderr;
             }
         } else if (!strcasecmp(argv[0],"activerehashing") && argc == 2) {
             if ((server.activerehashing = yesnotoi(argv[1])) == -1) {
@@ -616,6 +697,10 @@ void loadServerConfigFromString(char* config) {
         {
             if ((server.rdb_save_incremental_fsync =
                  yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"aof-timestamp-enabled") && argc == 2) {
+            if ((server.aof_timestamp_enabled = yesnotoi(argv[1])) == -1) {
                 err = "argument must be 'yes' or 'no'"; goto loaderr;
             }
         } else if (!strcasecmp(argv[0],"aof-load-truncated") && argc == 2) {
@@ -753,6 +838,30 @@ void loadServerConfigFromString(char* config) {
                 server.cluster_announce_port > 65535)
             {
                 err = "Invalid port"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"cluster-announce-hostname") &&
+                   argc == 2)
+        {
+            if (strlen(argv[1]) >= CLUSTER_HOSTNAME_LEN) {
+                err = "cluster-announce-hostname is too long";
+                goto loaderr;
+            }
+            zfree(server.cluster_announce_hostname);
+            server.cluster_announce_hostname =
+                argv[1][0] ? zstrdup(argv[1]) : NULL;
+        } else if (!strcasecmp(argv[0],"cluster-preferred-endpoint") &&
+                   argc == 2)
+        {
+            if (!strcasecmp(argv[1],"ip")) {
+                server.cluster_preferred_endpoint = CLUSTER_ENDPOINT_IP;
+            } else if (!strcasecmp(argv[1],"hostname")) {
+                server.cluster_preferred_endpoint = CLUSTER_ENDPOINT_HOSTNAME;
+            } else {
+                err = "argument must be 'ip' or 'hostname'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"replica-announced") && argc == 2) {
+            if ((server.replica_announced = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
             }
         } else if (!strcasecmp(argv[0],"cluster-announce-bus-port") &&
                    argc == 2)
@@ -1101,6 +1210,35 @@ static int configSetOne(client *c, robj *nameobj, robj *o) {
     } config_set_special_field("cluster-announce-ip") {
         zfree(server.cluster_announce_ip);
         server.cluster_announce_ip = ((char*)o->ptr)[0] ? zstrdup(o->ptr) : NULL;
+    } config_set_special_field("cluster-announce-hostname") {
+        if (sdslen(o->ptr) >= CLUSTER_HOSTNAME_LEN) {
+            addReplyError(c,"cluster-announce-hostname is too long");
+            return C_ERR;
+        }
+        zfree(server.cluster_announce_hostname);
+        server.cluster_announce_hostname = sdslen(o->ptr) ?
+                                           zstrdup(o->ptr) : NULL;
+        if (server.cluster_enabled) clusterUpdateMyselfFlags();
+    } config_set_special_field("cluster-preferred-endpoint") {
+        if (!strcasecmp(o->ptr,"ip")) {
+            server.cluster_preferred_endpoint = CLUSTER_ENDPOINT_IP;
+        } else if (!strcasecmp(o->ptr,"hostname")) {
+            server.cluster_preferred_endpoint = CLUSTER_ENDPOINT_HOSTNAME;
+        } else {
+            addReplyError(c,"argument must be 'ip' or 'hostname'");
+            return C_ERR;
+        }
+    } config_set_special_field("replica-announced") {
+        int yn = yesnotoi(o->ptr);
+        if (yn == -1) {
+            addReplyError(c,"argument must be 'yes' or 'no'");
+            return C_ERR;
+        }
+        server.replica_announced = yn;
+        if (server.cluster_enabled) {
+            clusterUpdateMyselfFlags();
+            clusterUpdateState();
+        }
     } config_set_special_field("maxclients") {
         int orig_value = server.maxclients;
 
@@ -1235,6 +1373,66 @@ static int configSetOne(client *c, robj *nameobj, robj *o) {
     {
         zfree(server.slave_announce_ip);
         server.slave_announce_ip = ((char*)o->ptr)[0] ? zstrdup(o->ptr) : NULL;
+    } config_set_special_field("tls-protocols") {
+        char *old = server.tls_protocols;
+        server.tls_protocols = zstrdup(o->ptr);
+        if (tlsApplyConfig() != C_OK) {
+            zfree(server.tls_protocols);
+            server.tls_protocols = old;
+            addReplyError(c,tlsLastConfigError());
+            return C_ERR;
+        }
+        zfree(old);
+    } config_set_special_field("tls-ciphers") {
+        char *old = server.tls_ciphers;
+        server.tls_ciphers = zstrdup(o->ptr);
+        if (tlsApplyConfig() != C_OK) {
+            zfree(server.tls_ciphers);
+            server.tls_ciphers = old;
+            addReplyError(c,tlsLastConfigError());
+            return C_ERR;
+        }
+        zfree(old);
+    } config_set_special_field("tls-ciphersuites") {
+        char *old = server.tls_ciphersuites;
+        server.tls_ciphersuites = zstrdup(o->ptr);
+        if (tlsApplyConfig() != C_OK) {
+            zfree(server.tls_ciphersuites);
+            server.tls_ciphersuites = old;
+            addReplyError(c,tlsLastConfigError());
+            return C_ERR;
+        }
+        zfree(old);
+    } config_set_special_field("tls-prefer-server-ciphers") {
+        int old = server.tls_prefer_server_ciphers;
+        int yn = yesnotoi(o->ptr);
+        if (yn == -1) goto badfmt;
+        server.tls_prefer_server_ciphers = yn;
+        if (tlsApplyConfig() != C_OK) {
+            server.tls_prefer_server_ciphers = old;
+            addReplyError(c,tlsLastConfigError());
+            return C_ERR;
+        }
+    } config_set_special_field("tls-session-caching") {
+        int old = server.tls_session_caching;
+        int yn = yesnotoi(o->ptr);
+        if (yn == -1) goto badfmt;
+        server.tls_session_caching = yn;
+        if (tlsApplyConfig() != C_OK) {
+            server.tls_session_caching = old;
+            addReplyError(c,tlsLastConfigError());
+            return C_ERR;
+        }
+    } config_set_special_field("tls-auth-clients") {
+        int old = server.tls_auth_clients;
+        int mode = tlsClientAuthFromString(o->ptr);
+        if (mode == -1) goto badfmt;
+        server.tls_auth_clients = mode;
+        if (tlsApplyConfig() != C_OK) {
+            server.tls_auth_clients = old;
+            addReplyError(c,tlsLastConfigError());
+            return C_ERR;
+        }
 
     /* Boolean fields.
      * config_set_bool_field(name,var). */
@@ -1256,6 +1454,8 @@ static int configSetOne(client *c, robj *nameobj, robj *o) {
       "rdb-save-incremental-fsync",server.rdb_save_incremental_fsync) {
     } config_set_bool_field(
       "aof-load-truncated",server.aof_load_truncated) {
+    } config_set_bool_field(
+      "aof-timestamp-enabled",server.aof_timestamp_enabled) {
     } config_set_bool_field(
       "aof-use-rdb-preamble",server.aof_use_rdb_preamble) {
     } config_set_bool_field(
@@ -1382,6 +1582,11 @@ static int configSetOne(client *c, robj *nameobj, robj *o) {
     } config_set_numerical_field(
       "repl-diskless-sync-delay",server.repl_diskless_sync_delay,0,INT_MAX) {
     } config_set_numerical_field(
+      "repl-diskless-sync-max-replicas",
+      server.repl_diskless_sync_max_replicas,0,INT_MAX) {
+    } config_set_numerical_field(
+      "shutdown-timeout",server.shutdown_timeout,0,INT_MAX) {
+    } config_set_numerical_field(
       "slave-priority",server.slave_priority,0,INT_MAX) {
     } config_set_numerical_field(
       "replica-priority",server.slave_priority,0,INT_MAX) {
@@ -1457,6 +1662,12 @@ static int configSetOne(client *c, robj *nameobj, robj *o) {
       "maxmemory-policy",server.maxmemory_policy,maxmemory_policy_enum) {
     } config_set_enum_field(
       "appendfsync",server.aof_fsync,aof_fsync_enum) {
+    } config_set_enum_field(
+      "repl-diskless-load",server.repl_diskless_load,
+      repl_diskless_load_enum) {
+    } config_set_enum_field(
+      "sanitize-dump-payload",server.sanitize_dump_payload,
+      sanitize_dump_payload_enum) {
 
     /* Everyhing else is an error... */
     } config_set_else {
@@ -1554,6 +1765,7 @@ static int configGetNameAlreadyAdded(list *names, const char *name) {
 } while(0);
 
 void configGetCommand(client *c) {
+    /* CONFIG GET is a map in RESP3 and a flat field/value array in RESP2. */
     void *replylen = addDeferredMultiBulkLength(c);
     list *names = listCreate();
     int matches = 0;
@@ -1576,13 +1788,30 @@ void configGetCommand(client *c) {
     config_get_numerical_field("acllog-max-len",server.acllog_max_len);
     config_get_string_field("masterauth",server.masterauth);
     config_get_string_field("cluster-announce-ip",server.cluster_announce_ip);
+    config_get_string_field("cluster-announce-hostname",
+                            server.cluster_announce_hostname);
+    config_get_string_field("cluster-preferred-endpoint",
+                            server.cluster_preferred_endpoint ==
+                            CLUSTER_ENDPOINT_HOSTNAME ? "hostname" : "ip");
     config_get_numerical_field("tls-port",server.tls_port);
     config_get_string_field("tls-cert-file",server.tls_cert_file);
     config_get_string_field("tls-key-file",server.tls_key_file);
     config_get_string_field("tls-ca-cert-file",server.tls_ca_cert_file);
     config_get_string_field("tls-ca-cert-dir",server.tls_ca_cert_dir);
-    config_get_bool_field("tls-auth-clients",server.tls_auth_clients);
+    if (config_get_field_matches("tls-auth-clients")) {
+        config_get_add_name("tls-auth-clients");
+        addReplyBulkCString(c,"tls-auth-clients");
+        addReplyBulkCString(c,tlsClientAuthToString(server.tls_auth_clients));
+        matches++;
+    }
     config_get_bool_field("tls-replication",server.tls_replication);
+    config_get_bool_field("tls-cluster",server.tls_cluster);
+    config_get_string_field("tls-protocols",server.tls_protocols);
+    config_get_string_field("tls-ciphers",server.tls_ciphers);
+    config_get_string_field("tls-ciphersuites",server.tls_ciphersuites);
+    config_get_bool_field("tls-prefer-server-ciphers",
+                          server.tls_prefer_server_ciphers);
+    config_get_bool_field("tls-session-caching",server.tls_session_caching);
     config_get_string_field("unixsocket",server.unixsocket);
     config_get_string_field("logfile",server.logfile);
     config_get_string_field("pidfile",server.pidfile);
@@ -1663,6 +1892,13 @@ void configGetCommand(client *c) {
     config_get_numerical_field("cluster-slave-validity-factor",server.cluster_slave_validity_factor);
     config_get_numerical_field("cluster-replica-validity-factor",server.cluster_slave_validity_factor);
     config_get_numerical_field("repl-diskless-sync-delay",server.repl_diskless_sync_delay);
+    config_get_numerical_field("repl-diskless-sync-max-replicas",
+                               server.repl_diskless_sync_max_replicas);
+    config_get_numerical_field("shutdown-timeout",server.shutdown_timeout);
+    config_get_enum_field("repl-diskless-load",server.repl_diskless_load,
+            repl_diskless_load_enum);
+    config_get_enum_field("sanitize-dump-payload",server.sanitize_dump_payload,
+            sanitize_dump_payload_enum);
     config_get_numerical_field("tcp-keepalive",server.tcpkeepalive);
 
     /* Bool (yes/no) values */
@@ -1672,6 +1908,7 @@ void configGetCommand(client *c) {
             server.cluster_slave_no_failover);
     config_get_bool_field("cluster-replica-no-failover",
             server.cluster_slave_no_failover);
+    config_get_bool_field("replica-announced",server.replica_announced);
     config_get_bool_field("no-appendfsync-on-rewrite",
             server.aof_no_fsync_on_rewrite);
     config_get_bool_field("slave-serve-stale-data",
@@ -1704,6 +1941,8 @@ void configGetCommand(client *c) {
             server.rdb_save_incremental_fsync);
     config_get_bool_field("aof-load-truncated",
             server.aof_load_truncated);
+    config_get_bool_field("aof-timestamp-enabled",
+            server.aof_timestamp_enabled);
     config_get_bool_field("aof-use-rdb-preamble",
             server.aof_use_rdb_preamble);
     config_get_bool_field("latency-tracking",
@@ -1832,7 +2071,7 @@ void configGetCommand(client *c) {
     }
     }
 
-    setDeferredMultiBulkLength(c,replylen,(PORT_LONG)matches*2);  WIN_PORT_FIX /* cat (PORT_LONG) */
+    setDeferredMapLength(c,replylen,(PORT_LONG)matches);
     listRelease(names);
 }
 
@@ -2069,6 +2308,15 @@ void rewriteConfigYesNoOption(struct rewriteConfigState *state, char *option, in
         value ? "yes" : "no");
 
     rewriteConfigRewriteLine(state,option,line,force);
+}
+
+/* Rewrite tls-auth-clients, which takes no/yes/optional instead of a boolean. */
+void rewriteConfigTlsAuthClientsOption(struct rewriteConfigState *state) {
+    int force = server.tls_auth_clients != TLS_CLIENT_AUTH_NO;
+    sds line = sdscatprintf(sdsempty(),"tls-auth-clients %s",
+        tlsClientAuthToString(server.tls_auth_clients));
+
+    rewriteConfigRewriteLine(state,"tls-auth-clients",line,force);
 }
 
 /* Rewrite a string option. */
@@ -2389,6 +2637,13 @@ int rewriteConfig(char *path) {
     rewriteConfigNumericalOption(state,"cluster-announce-port",server.cluster_announce_port,CONFIG_DEFAULT_CLUSTER_ANNOUNCE_PORT);
     rewriteConfigNumericalOption(state,"cluster-announce-bus-port",server.cluster_announce_bus_port,CONFIG_DEFAULT_CLUSTER_ANNOUNCE_BUS_PORT);
     rewriteConfigNumericalOption(state,"tcp-backlog",server.tcp_backlog,CONFIG_DEFAULT_TCP_BACKLOG);
+    rewriteConfigTlsAuthClientsOption(state);
+    rewriteConfigYesNoOption(state,"tls-cluster",server.tls_cluster,0);
+    rewriteConfigStringOption(state,"tls-protocols",server.tls_protocols,"");
+    rewriteConfigStringOption(state,"tls-ciphers",server.tls_ciphers,"");
+    rewriteConfigStringOption(state,"tls-ciphersuites",server.tls_ciphersuites,"");
+    rewriteConfigYesNoOption(state,"tls-prefer-server-ciphers",server.tls_prefer_server_ciphers,0);
+    rewriteConfigYesNoOption(state,"tls-session-caching",server.tls_session_caching,1);
     rewriteConfigBindOption(state);
     rewriteConfigStringOption(state,"unixsocket",server.unixsocket,NULL);
     rewriteConfigOctalOption(state,"unixsocketperm",server.unixsocketperm,CONFIG_DEFAULT_UNIX_SOCKET_PERM);
@@ -2414,6 +2669,11 @@ int rewriteConfig(char *path) {
     rewriteConfigStringOption(state,"replica-announce-ip",server.slave_announce_ip,CONFIG_DEFAULT_SLAVE_ANNOUNCE_IP);
     rewriteConfigStringOption(state,"masterauth",server.masterauth,NULL);
     rewriteConfigStringOption(state,"cluster-announce-ip",server.cluster_announce_ip,NULL);
+    rewriteConfigStringOption(state,"cluster-announce-hostname",server.cluster_announce_hostname,NULL);
+    rewriteConfigStringOption(state,"cluster-preferred-endpoint",
+        server.cluster_preferred_endpoint == CLUSTER_ENDPOINT_HOSTNAME ?
+        "hostname" : "ip",CONFIG_DEFAULT_CLUSTER_PREFERRED_ENDPOINT);
+    rewriteConfigYesNoOption(state,"replica-announced",server.replica_announced,CONFIG_DEFAULT_REPLICA_ANNOUNCED);
     rewriteConfigYesNoOption(state,"replica-serve-stale-data",server.repl_serve_stale_data,CONFIG_DEFAULT_SLAVE_SERVE_STALE_DATA);
     rewriteConfigYesNoOption(state,"replica-read-only",server.repl_slave_ro,CONFIG_DEFAULT_SLAVE_READ_ONLY);
     rewriteConfigYesNoOption(state,"replica-ignore-maxmemory",server.repl_slave_ignore_maxmemory,CONFIG_DEFAULT_SLAVE_IGNORE_MAXMEMORY);
@@ -2424,6 +2684,10 @@ int rewriteConfig(char *path) {
     rewriteConfigYesNoOption(state,"repl-disable-tcp-nodelay",server.repl_disable_tcp_nodelay,CONFIG_DEFAULT_REPL_DISABLE_TCP_NODELAY);
     rewriteConfigYesNoOption(state,"repl-diskless-sync",server.repl_diskless_sync,CONFIG_DEFAULT_REPL_DISKLESS_SYNC);
     rewriteConfigNumericalOption(state,"repl-diskless-sync-delay",server.repl_diskless_sync_delay,CONFIG_DEFAULT_REPL_DISKLESS_SYNC_DELAY);
+    rewriteConfigNumericalOption(state,"repl-diskless-sync-max-replicas",server.repl_diskless_sync_max_replicas,CONFIG_DEFAULT_REPL_DISKLESS_SYNC_MAX_REPLICAS);
+    rewriteConfigNumericalOption(state,"shutdown-timeout",server.shutdown_timeout,CONFIG_DEFAULT_SHUTDOWN_TIMEOUT);
+    rewriteConfigEnumOption(state,"repl-diskless-load",server.repl_diskless_load,repl_diskless_load_enum,CONFIG_DEFAULT_REPL_DISKLESS_LOAD);
+    rewriteConfigEnumOption(state,"sanitize-dump-payload",server.sanitize_dump_payload,sanitize_dump_payload_enum,CONFIG_DEFAULT_SANITIZE_DUMP_PAYLOAD);
     rewriteConfigNumericalOption(state,"replica-priority",server.slave_priority,CONFIG_DEFAULT_SLAVE_PRIORITY);
     rewriteConfigNumericalOption(state,"min-replicas-to-write",server.repl_min_slaves_to_write,CONFIG_DEFAULT_MIN_SLAVES_TO_WRITE);
     rewriteConfigNumericalOption(state,"min-replicas-max-lag",server.repl_min_slaves_max_lag,CONFIG_DEFAULT_MIN_SLAVES_MAX_LAG);
@@ -2482,6 +2746,7 @@ int rewriteConfig(char *path) {
     rewriteConfigYesNoOption(state,"aof-rewrite-incremental-fsync",server.aof_rewrite_incremental_fsync,CONFIG_DEFAULT_AOF_REWRITE_INCREMENTAL_FSYNC);
     rewriteConfigYesNoOption(state,"rdb-save-incremental-fsync",server.rdb_save_incremental_fsync,CONFIG_DEFAULT_RDB_SAVE_INCREMENTAL_FSYNC);
     rewriteConfigYesNoOption(state,"aof-load-truncated",server.aof_load_truncated,CONFIG_DEFAULT_AOF_LOAD_TRUNCATED);
+    rewriteConfigYesNoOption(state,"aof-timestamp-enabled",server.aof_timestamp_enabled,0);
     rewriteConfigYesNoOption(state,"aof-use-rdb-preamble",server.aof_use_rdb_preamble,CONFIG_DEFAULT_AOF_USE_RDB_PREAMBLE);
     rewriteConfigEnumOption(state,"supervised",server.supervised_mode,supervised_mode_enum,SUPERVISED_NONE);
     rewriteConfigYesNoOption(state,"latency-tracking",server.latency_tracking,1);

@@ -146,6 +146,23 @@ typedef PORT_LONGLONG ustime_t; /* microsecond time type. */
 #define CONFIG_DEFAULT_RDB_FILENAME "dump.rdb"
 #define CONFIG_DEFAULT_REPL_DISKLESS_SYNC 0
 #define CONFIG_DEFAULT_REPL_DISKLESS_SYNC_DELAY 5
+#define CONFIG_DEFAULT_REPL_DISKLESS_SYNC_MAX_REPLICAS 0
+#define CONFIG_DEFAULT_SHUTDOWN_TIMEOUT 10
+#define CONFIG_DEFAULT_REPLICA_ANNOUNCED 1
+#define CONFIG_DEFAULT_CLUSTER_PREFERRED_ENDPOINT "ip"
+#define CLUSTER_ENDPOINT_IP 0
+#define CLUSTER_ENDPOINT_HOSTNAME 1
+#define FAILOVER_STATE_NONE 0
+#define FAILOVER_STATE_WAITING_FOR_SYNC 1
+#define FAILOVER_STATE_IN_PROGRESS 2
+#define SANITIZE_DUMP_PAYLOAD_NO 0
+#define SANITIZE_DUMP_PAYLOAD_YES 1
+#define SANITIZE_DUMP_PAYLOAD_CLIENTS 2
+#define CONFIG_DEFAULT_SANITIZE_DUMP_PAYLOAD SANITIZE_DUMP_PAYLOAD_NO
+#define REPL_DISKLESS_LOAD_DISABLED 0
+#define REPL_DISKLESS_LOAD_ON_EMPTY_DB 1
+#define REPL_DISKLESS_LOAD_SWAPDB 2
+#define CONFIG_DEFAULT_REPL_DISKLESS_LOAD REPL_DISKLESS_LOAD_DISABLED
 #define CONFIG_DEFAULT_SLAVE_SERVE_STALE_DATA 1
 #define CONFIG_DEFAULT_SLAVE_READ_ONLY 1
 #define CONFIG_DEFAULT_SLAVE_IGNORE_MAXMEMORY 1
@@ -292,6 +309,12 @@ typedef PORT_LONGLONG ustime_t; /* microsecond time type. */
 #define CLIENT_TRACKING_CACHING (1ULL<<37)      /* CACHING yes/no given this cmd. */
 #define CLIENT_TRACKING_NOLOOP (1ULL<<38)       /* Don't notify self-modifications. */
 #define CLIENT_TLS (1ULL<<39)                   /* Client socket is protected by TLS. */
+
+/* tls-auth-clients values. "optional" verifies a client certificate when the
+ * client presents one but still accepts clients without a certificate. */
+#define TLS_CLIENT_AUTH_NO 0
+#define TLS_CLIENT_AUTH_YES 1
+#define TLS_CLIENT_AUTH_OPTIONAL 2
 
 /* Client block type (btype field in client structure)
  * if CLIENT_BLOCKED flag is set. */
@@ -479,6 +502,9 @@ typedef PORT_LONGLONG ustime_t; /* microsecond time type. */
 #define NOTIFY_EXPIRED (1<<8)     /* x */
 #define NOTIFY_EVICTED (1<<9)     /* e */
 #define NOTIFY_STREAM (1<<10)     /* t */
+#define NOTIFY_NEW (1<<11)        /* n */
+#define NOTIFY_KEY_MISS (1<<12)   /* m */
+/* "A" covers every type class except the key miss and new key events. */
 #define NOTIFY_ALL (NOTIFY_GENERIC | NOTIFY_STRING | NOTIFY_LIST | NOTIFY_SET | NOTIFY_HASH | NOTIFY_ZSET | NOTIFY_EXPIRED | NOTIFY_EVICTED | NOTIFY_STREAM) /* A flag */
 
 /* Get the first bind addr or NULL */
@@ -795,6 +821,8 @@ typedef struct client {
     PORT_ULONGLONG reply_bytes; /* Tot bytes of objects in reply list. */
     size_t sentlen;         /* Amount of bytes already sent in the current
                                buffer or object being sent. */
+    PORT_ULONGLONG net_in_bytes;  /* Total bytes read from this connection. */
+    PORT_ULONGLONG net_out_bytes; /* Total bytes written to this connection. */
     time_t ctime;           /* Client creation time. */
     time_t lastinteraction; /* Time of the last interaction, used for timeout */
     time_t obuf_soft_limit_reached_time;
@@ -807,6 +835,7 @@ typedef struct client {
     off_t repldboff;        /* Replication DB file offset. */
     off_t repldbsize;       /* Replication DB file size. */
     sds replpreamble;       /* Replication DB preamble. */
+    sds repl_chunk;         /* Plaintext read from a diskless TLS relay. */
     PORT_LONGLONG read_reploff; /* Read replication offset if this is a master. */
     PORT_LONGLONG reploff;      /* Applied replication offset if this is a master. */
     PORT_LONGLONG repl_ack_off; /* Replication ack offset, if this is a slave. */
@@ -1062,8 +1091,14 @@ struct redisServer {
     char *tls_key_file;         /* Server private key (PEM) */
     char *tls_ca_cert_file;     /* CA bundle for client authentication */
     char *tls_ca_cert_dir;      /* CA hash directory for client authentication */
-    int tls_auth_clients;       /* Require a verified client certificate */
+    int tls_auth_clients;       /* TLS_CLIENT_AUTH_NO, _YES or _OPTIONAL */
     int tls_replication;        /* Connect to the master over TLS */
+    int tls_cluster;            /* Use TLS on the cluster bus */
+    char *tls_protocols;        /* Allowed TLS protocol versions */
+    char *tls_ciphers;          /* Cipher list for TLSv1.2 and below */
+    char *tls_ciphersuites;     /* Cipher suites for TLSv1.3 */
+    int tls_prefer_server_ciphers; /* Server picks the cipher, not the client */
+    int tls_session_caching;    /* Reuse TLS sessions */
     int tcp_backlog;            /* TCP listen() backlog */
     char *bindaddr[CONFIG_BINDADDR_MAX]; /* Addresses we should bind to */
     int bindaddr_count;         /* Number of addresses in server.bindaddr[] */
@@ -1183,6 +1218,8 @@ struct redisServer {
     time_t aof_rewrite_time_start;  /* Current AOF rewrite start time. */
     int aof_lastbgrewrite_status;   /* C_OK or C_ERR */
     PORT_ULONG aof_delayed_fsync;  /* delayed AOF fsync() counter */
+    int aof_timestamp_enabled;      /* Add #TS annotations to the AOF */
+    time_t aof_cur_timestamp;       /* Last timestamp written to the AOF */
     int aof_rewrite_incremental_fsync;/* fsync incrementally while aof rewriting? */
     int rdb_save_incremental_fsync;   /* fsync incrementally while rdb saving? */
     int aof_last_write_status;      /* C_OK or C_ERR */
@@ -1208,6 +1245,7 @@ struct redisServer {
     char *rdb_filename;             /* Name of RDB file */
     int rdb_compression;            /* Use compression in RDB? */
     int rdb_checksum;               /* Use RDB checksum? */
+    int sanitize_dump_payload;      /* Deep-validate payloads on RESTORE. */
     time_t lastsave;                /* Unix time of last successful save */
     time_t lastbgsave_try;          /* Unix time of last attempted bgsave */
     time_t rdb_save_time_last;      /* Time used by last RDB save run. */
@@ -1255,6 +1293,17 @@ struct redisServer {
     int repl_good_slaves_count;     /* Number of slaves with lag <= max_lag. */
     int repl_diskless_sync;         /* Send RDB to slaves sockets directly. */
     int repl_diskless_sync_delay;   /* Delay to start a diskless repl BGSAVE. */
+    int repl_diskless_sync_max_replicas; /* Start before the delay expires
+                                            once this many replicas wait. */
+    int shutdown_timeout;           /* Seconds to wait for replicas before
+                                       SHUTDOWN. */
+    int failover_state;             /* FAILOVER_STATE_... */
+    mstime_t failover_end_time;     /* Deadline for waiting for sync (0: none). */
+    int force_failover;             /* Fail over even if the replica lags. */
+    char *target_replica_host;      /* FAILOVER TO host port target. */
+    int target_replica_port;
+    int repl_diskless_load;         /* Load RDB directly from the master
+                                       socket: disabled, on-empty-db, swapdb. */
     /* Replication (slave) */
     char *masterauth;               /* AUTH with this password with master */
     char *masterhost;               /* Hostname of master */
@@ -1265,6 +1314,7 @@ struct redisServer {
     int repl_syncio_timeout; /* Timeout for synchronous I/O calls */
     int repl_state;          /* Replication status if the instance is a slave */
     off_t repl_transfer_size; /* Size of RDB to read from master during sync. */
+    sds repl_diskless_buf;    /* RDB buffered for repl-diskless-load. */
     off_t repl_transfer_read; /* Amount of RDB read from master during sync. */
     off_t repl_transfer_last_fsync_off; /* Offset when we fsync-ed last time. */
     int repl_transfer_s;     /* Slave -> Master SYNC socket */
@@ -1351,8 +1401,11 @@ struct redisServer {
     int cluster_slave_no_failover;  /* Prevent slave from starting a failover
                                        if the master is in failure state. */
     char *cluster_announce_ip;  /* IP address to announce on cluster bus. */
+    char *cluster_announce_hostname; /* Hostname announced on cluster bus. */
+    int cluster_preferred_endpoint;  /* CLUSTER_ENDPOINT_IP or _HOSTNAME. */
     int cluster_announce_port;     /* base port to announce on cluster bus. */
     int cluster_announce_bus_port; /* bus port to announce on cluster bus. */
+    int replica_announced;         /* Announce replicas in CLUSTER SLOTS. */
     int cluster_module_flags;      /* Set of flags that Redis modules are able
                                       to set in order to suppress certain
                                       native Redis Cluster features. Check the
@@ -1510,6 +1563,7 @@ extern double R_Zero, R_PosInf, R_NegInf, R_Nan;
 extern dictType hashDictType;
 extern dictType replScriptCacheDictType;
 extern dictType keyptrDictType;
+extern dictType keylistDictType;
 extern dictType modulesDictType;
 
 /*-----------------------------------------------------------------------------
@@ -1554,6 +1608,7 @@ void resetClient(client *c);
 void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask);
 void *addDeferredMultiBulkLength(client *c);
 void setDeferredMultiBulkLength(client *c, void *node, PORT_LONG length);
+void setDeferredMapLength(client *c, void *node, PORT_LONG length);
 void processInputBuffer(client *c);
 void processInputBufferAndReplicate(client *c);
 int processPendingCommandsAndResetClient(client *c);
@@ -1722,6 +1777,7 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc);
 void replicationFeedSlavesFromMasterStream(list *slaves, char *buf, size_t buflen);
 void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv, int argc);
 void updateSlavesWaitingBgsave(int bgsaveerr, int type);
+void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask);
 void replicationCron(void);
 void replicationHandleMasterDisconnection(void);
 void replicationCacheMaster(client *c);
@@ -1991,6 +2047,7 @@ void objectSetLRUOrLFU(robj *val, PORT_LONGLONG lfu_freq, PORT_LONGLONG lru_idle
                        PORT_LONGLONG lru_clock);
 #define LOOKUP_NONE 0
 #define LOOKUP_NOTOUCH (1<<0)
+#define LOOKUP_NONOTIFY (1<<1)
 void dbAdd(redisDb *db, robj *key, robj *val);
 void dbOverwrite(redisDb *db, robj *key, robj *val);
 void setKey(redisDb *db, robj *key, robj *val);
@@ -2004,6 +2061,8 @@ robj *dbUnshareStringValue(redisDb *db, robj *key, robj *o);
 #define EMPTYDB_NO_FLAGS 0      /* No flags. */
 #define EMPTYDB_ASYNC (1<<0)    /* Reclaim memory in another thread. */
 PORT_LONGLONG emptyDb(int dbnum, int flags, void(callback)(void*));
+redisDb *createDbArray(int num);
+void freeDbArray(redisDb *dbs, int num);
 
 int selectDb(client *c, int id);
 void signalModifiedKey(redisDb *db, robj *key);
@@ -2249,6 +2308,7 @@ void touchCommand(client *c);
 void pttlCommand(client *c);
 void persistCommand(client *c);
 void replicaofCommand(client *c);
+void failoverCommand(client *c);
 void roleCommand(client *c);
 void debugCommand(client *c);
 void msetCommand(client *c);

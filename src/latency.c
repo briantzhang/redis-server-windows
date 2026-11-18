@@ -513,7 +513,7 @@ sds createLatencyReport(void) {
 /* ---------------------- Latency command implementation -------------------- */
 
 /* Reply with one command histogram: calls plus cumulative microsecond
- * buckets, represented as a flat array because this build speaks RESP2. */
+ * buckets. RESP3 uses maps; RESP2 receives the same data as flat arrays. */
 static void latencyCommandReplyWithHistogram(client *c,
                                              struct redisCommand *cmd)
 {
@@ -522,7 +522,7 @@ static void latencyCommandReplyWithHistogram(client *c,
     void *histlen;
     int j, emitted = 0;
 
-    addReplyMultiBulkLen(c,4);
+    addReplyMapLen(c,2);
     addReplyBulkCString(c,"calls");
     addReplyLongLong(c,(PORT_LONGLONG)h->count);
     addReplyBulkCString(c,"histogram_usec");
@@ -535,7 +535,7 @@ static void latencyCommandReplyWithHistogram(client *c,
         previous = cumulative;
         emitted++;
     }
-    setDeferredMultiBulkLength(c,histlen,emitted*2);
+    setDeferredMapLength(c,histlen,emitted);
 }
 
 /* LATENCY HISTOGRAM [command ...]: all commands with samples, or only the
@@ -566,7 +566,7 @@ static void latencyCommandReplyWithHistograms(client *c, int start, int end) {
             emitted++;
         }
     }
-    setDeferredMultiBulkLength(c,replylen,emitted*2);
+    setDeferredMapLength(c,replylen,emitted);
 }
 
 /* latencyCommand() helper to produce a time-delay reply for all the samples

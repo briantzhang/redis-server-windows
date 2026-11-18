@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp28
+# Redis for Windows 5.0.14.1-bp44
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp28`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp44`。
 
 ## 这个版本新增了什么
 
@@ -82,10 +82,22 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `SCAN ... TYPE type` | 6.0 | 只返回指定类型的键；未知类型名返回空页 |
 | `HELLO [protover [AUTH user pass] [SETNAME name]]` | 6.0 | 握手；接受协议 2 和 3，其它版本返回 NOPROTO；协议 3 下回复为 RESP3 map |
 | RESP3 push 帧 | 6.0 | 协议 3 下 Pub/Sub 的订阅确认、消息和 `CLIENT TRACKING` 失效用 `>` 推送；RESP2 仍是普通数组，失效继续走 `__redis__:invalidate` 频道 |
+| RESP3 订阅态命令 | 7.0 | 协议 3 的订阅连接可以继续执行普通命令，回包与 push 消息可区分；协议 2 仍只允许订阅管理和 PING/QUIT/RESET |
+| keyspace 通知 `n` / `m` | 7.0 | 新增键发 `new` 事件，读取不存在的键发 `keymiss` 事件；`A` 别名不含这两类 |
+| AOF 时间戳注释（`aof-timestamp-enabled`） | 7.0 | 每次写入最多每秒追加一条 `#TS:<unix>` 注释，重写时在文件开头记录一次；加载时跳过注释行 |
 | ACL 键读写权限（`%R~` / `%W~` / `%RW~`） | 7.0 | 每个键模式可只授读、只授写或两者；按命令键规格区分读写，`SET` 等选项相关命令按命令级写标志判断 |
+| `CLUSTER ADDSLOTSRANGE start end [start end ...]` / `CLUSTER DELSLOTSRANGE start end [start end ...]` | 7.0 | 按区间分配或删除本节点槽位，一条命令可以给多段；任一段非法则整条命令不生效 |
+| `CLUSTER SHARDS` / `CLUSTER LINKS` | 7.0 | 按分片汇总槽位与主从节点；列出集群总线连接的方向、建立时间与收发字节 |
+| `FAILOVER [TO host port [FORCE]] [ABORT] [TIMEOUT ms]` | 6.2 | 主库把手里的写请求暂停，等副本追平后主动退位；`TO` 指定目标副本，`ABORT` 取消，`TIMEOUT` 限时 |
+| `sanitize-dump-payload no\|yes\|clients` | 7.0 | `RESTORE` 前深校验 DUMP 内部的 ziplist/listpack/intset/zipmap/stream 结构，而不只校验版本与 CRC |
+| `repl-diskless-load disabled\|on-empty-db\|swapdb` | 7.0 | 从库把收到的无盘 RDB 直接解析；`swapdb` 先装进临时库，成功后整体替换 |
+| `shutdown-timeout` | 7.0 | `SHUTDOWN` 等待副本确认的毫秒数，超时才继续退出 |
+| TLS 集群总线（`tls-cluster yes`） | 6.0 | 节点之间的总线握手、PING/PONG、槽位广播与故障转移投票走 TLS；要求所有节点使用同一 CA |
+| `cluster-announce-hostname` / `cluster-preferred-endpoint` / `replica-announced` | 7.0 | 公告节点主机名，选择客户端按 IP 还是主机名连接，以及副本是否出现在 `CLUSTER SLOTS`/`SHARDS` 中 |
 | `FUNCTION LOAD/DELETE/FLUSH/LIST/DUMP/RESTORE`、`FCALL`、`FCALL_RO` | 7.0 | 按库管理 Lua 函数，函数源码随 RDB/AOF 保存；DUMP 为本版私有格式 |
-| TLS 客户端监听（`tls-port`、证书、客户端证书认证） | 6.0 | 用 OpenSSL 3 在现有 Windows IOCP 连接上做 TLS 1.2/1.3；明文 `port` 可同时保留 |
-| TLS 主从复制（`tls-replication`） | 6.0 | 从库连主库的 `tls-port`，握手、PSYNC、RDB 传输和增量流都走加密连接 |
+| TLS 客户端监听（`tls-port`、证书、`tls-auth-clients` 三态客户端证书认证） | 6.0 | 用 OpenSSL 3 在现有 Windows IOCP 连接上做 TLS 1.2/1.3；明文 `port` 可同时保留 |
+| TLS 主从复制（`tls-replication`） | 6.0 | 从库连主库的 `tls-port`，握手、PSYNC、RDB 传输和增量流都走加密连接；支持 `repl-diskless-sync` 无盘全量同步 |
+| TLS 配置项（`tls-protocols`、`tls-ciphers`、`tls-ciphersuites`、`tls-prefer-server-ciphers`、`tls-session-caching`） | 6.0 | 限定协议版本与套件、服务端优先选择套件、开关会话缓存；可按配置启动，也可 `CONFIG SET` 热应用，新连接生效 |
 | `CLIENT TRACKING` / `CACHING` / `GETREDIR` / `TRACKINGINFO` | 6.0 / 6.2 | 客户端缓存追踪；RESP3 连接直接收到 push 失效，RESP2 连接仍需 `REDIRECT` 到 `__redis__:invalidate` 订阅者 |
 | `tracking-table-max-keys` | 6.0 | TrackingTable 键数上限，CONFIG GET/SET/REWRITE |
 | `INFO clients/stats`、`MEMORY STATS` tracking 字段 | 6.0 / 6.2 | `tracking_clients`、`tracking_total_*`、`clients.tracking.table.*` |
@@ -99,9 +111,9 @@ ACL 支持 `on/off`、`>password`、`+@category/-@category`、`+cmd/-cmd`、`~ke
 
 命令语义参照 Redis `7.0.15`（BSD）手工适配，没有引入 Redis 8 的源码。完整说明见 [BACKPORT-RELEASE.md](BACKPORT-RELEASE.md)。
 
-集群模式沿用底座的 Redis 5.0 集群实现：`cluster-enabled yes` 启动后使用 16384 个槽，支持 `CLUSTER MEET`、`ADDSLOTS`、`SLOTS`、`NODES`、`KEYSLOT`、`COUNTKEYSINSLOT`、`REPLICATE` 等命令。bp25 用三个本机节点验证了组网、槽位分配、`MOVED` 重定向和槽位撤下后的 `CLUSTERDOWN`；集群总线端口固定为客户端端口 +10000，规划端口时要同时预留。
+集群模式沿用底座的 Redis 5.0 集群实现：`cluster-enabled yes` 启动后使用 16384 个槽，支持 `CLUSTER MEET`、`ADDSLOTS`、`SLOTS`、`NODES`、`KEYSLOT`、`COUNTKEYSINSLOT`、`REPLICATE` 等命令。bp25 用三个本机节点验证了组网、槽位分配、`MOVED` 重定向和槽位撤下后的 `CLUSTERDOWN`；bp35 增加 `CLUSTER ADDSLOTSRANGE`/`CLUSTER DELSLOTSRANGE`，按区间分配和删除槽位；bp36 增加 `CLUSTER SHARDS` 与 `CLUSTER LINKS`，bp37 让总线本身也能走 TLS（`tls-cluster yes`），bp38 加入 `cluster-announce-hostname`、`cluster-preferred-endpoint` 与 `replica-announced`；集群总线端口固定为客户端端口 +10000，规划端口时要同时预留。
 
-TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM 证书链和私钥；设置 `tls-ca-cert-file` 后可用 `tls-auth-clients yes` 要求客户端证书。明文 `port` 可以同时保留，方便本地运维连接。TLS 由 OpenSSL 3 的 memory BIO 接入现有 IOCP 收发路径，不改变命令解析与执行线程模型；程序目录必须同时有 `libssl-3-x64.dll` 和 `libcrypto-3-x64.dll`。从库设置 `tls-replication yes` 后可以连主库的 `tls-port`，握手、`PSYNC`、RDB 传输和后续增量命令都在同一个 TLS 会话里；主库给从库回 `+FULLRESYNC`、`+CONTINUE`、RDB 内容和心跳换行时同样走加密通道，主库启用 `repl-diskless-sync` 时遇到 TLS 从库会自动退回磁盘方式传 RDB。
+TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM 证书链和私钥；设置 `tls-ca-cert-file` 后可用 `tls-auth-clients yes` 要求客户端证书；`optional` 会校验客户端出示的证书，同时允许不带证书的匿名连接。明文 `port` 可以同时保留，方便本地运维连接。TLS 由 OpenSSL 3 的 memory BIO 接入现有 IOCP 收发路径，不改变命令解析与执行线程模型；程序目录必须同时有 `libssl-3-x64.dll` 和 `libcrypto-3-x64.dll`。从库设置 `tls-replication yes` 后可以连主库的 `tls-port`，握手、`PSYNC`、RDB 传输和后续增量命令都在同一个 TLS 会话里；主库给从库回 `+FULLRESYNC`、`+CONTINUE`、RDB 内容和心跳换行时同样走加密通道，主库启用 `repl-diskless-sync yes` 时，TLS 从库也能无盘同步：RDB 子进程把数据写进一对回环套接字，由主进程转发进 TLS 会话，不再落盘。 `tls-protocols` 用空格分隔 `TLSv1`/`TLSv1.1`/`TLSv1.2`/`TLSv1.3`；`tls-ciphers` 管 TLS 1.2 及以下，`tls-ciphersuites` 管 TLS 1.3；`tls-session-caching no` 关闭会话复用。这几项与 `tls-prefer-server-ciphers`、`tls-auth-clients` 都支持 `CONFIG SET`，重建上下文后对新建连接生效，已有连接不受影响。
 
 `CLIENT PAUSE WRITE` 只拦写命令与 `EXEC`，`CLIENT PAUSE ALL` 连读命令一起拦；被暂停的连接在恢复后按原顺序执行已解析的命令。`CONFIG SET` 多参数时逐对应用，后面的参数非法时前面的已经生效。`COMMAND LIST FILTERBY ACLCAT` 用命令级读写标志近似 `read`/`write`/`keyspace` 分类；`COMMAND GETKEYSANDFLAGS` 按每条命令的键规格给出标志，同一条命令的不同键可以不同，例如 `BITOP` 的目标键是 `OW update`、源键是 `RO access`。键位置不固定的参数（`SORT` 的 `STORE`）仍按命令级标志近似。`CLIENT KILL LADDR` 匹配的是服务端监听地址，因此同一监听地址上的所有连接都会命中；`MAXAGE` 按连接建立到现在的秒数计算。`LATENCY HISTOGRAM` 使用固定的对数桶，不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界，适合看数量级而不是精确尾延迟。`latency-tracking no` 只停止新采样，已有直方图保留到下一次重置。`WAITAOF` 在本版没有异步 fsync 确认机制：它在命令内同步刷盘后立即返回 `[本机确认, 0]`，不会阻塞到超时，也不跟踪副本的 AOF 落盘。`SHUTDOWN ABORT` 只能取消已置位但尚未执行的关闭请求，此时没有“关闭进行中”的状态。
 
@@ -109,7 +121,7 @@ TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM �
 
 以下能力不在本版中，调用会返回 `unknown command` 或沿用底座的旧行为：
 
-- 集群总线仍是明文；不支持 `tls-cluster`、证书热加载和 TLS 会话配置项
+- 证书与 `tls-cluster` 的切换只能在启动配置时完成，`CONFIG SET` 不会热加载证书或重建集群总线 TLS 上下文
 - 客户端内存驱逐只按查询缓冲、回复缓冲和参数向量估算，不按 Redis 7 的客户端内存桶分摊
 - 多段 AOF（`appenddirname`）、新版 RDB 格式
 - Redis 8 的查询引擎
@@ -130,13 +142,13 @@ TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM �
 
 ## 验证
 
-在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，91 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
+在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，110 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
 
 ```bash
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮覆盖 `FUNCTION` / `FCALL` 及 DUMP/RESTORE 往返、三节点集群组网与重定向、TLS 明文/密文双监听、256 KiB 往返、流水线和客户端证书认证，TLS 主从复制的全量同步、部分重同步与增量传播，RESP3 下 Pub/Sub 与 `CLIENT TRACKING` 的 push 帧（RESP2 仍使用数组和 Pub/Sub 频道），以及 ACL 的 `%R~`/`%W~` 键读写权限；保留 bp23 的 RESP3 和 bp22 及更早用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟，以及 RDB 和 AOF 重启；本轮覆盖 `FUNCTION` / `FCALL` 及 DUMP/RESTORE 往返、三节点集群组网与重定向、TLS 明文/密文双监听、256 KiB 往返、流水线和客户端证书认证，TLS 主从复制的全量同步、部分重同步与增量传播，TLS 协议/套件/会话配置的运行时校验与热应用，`tls-auth-clients` 在 `no`/`yes`/`optional` 之间切换及不受信客户端证书的拒绝，无盘复制下 TLS 与明文从库的并行全量同步，RESP3 订阅连接执行普通命令，`new`/`keymiss` 通知事件，以及 AOF 时间戳注释的写入、重写与重载，RESP3 下 Pub/Sub 与 `CLIENT TRACKING` 的 push 帧（RESP2 仍使用数组和 Pub/Sub 频道），以及 ACL 的 `%R~`/`%W~` 键读写权限，`CLUSTER ADDSLOTSRANGE`/`DELSLOTSRANGE` 的区间分配、删除与错误校验，`CLUSTER SHARDS`/`LINKS` 的输出，集群总线 TLS 组网，`cluster-announce-hostname` 与 `replica-announced`，`shutdown-timeout` 等待副本，`repl-diskless-load` 的 `on-empty-db`/`swapdb`，`sanitize-dump-payload` 的三种模式与损坏 payload 拒绝，`FAILOVER` 的 ABORT/超时/指定目标/自动选目标，以及 Windows 底座在持续写入下的 BGSAVE/BGREWRITEAOF、AOF 运行时开关、分段写入、大 value、连接抖动和空闲超时；保留 bp23 的 RESP3 和 bp22 及更早用例。
 
 这轮验证不等于已合入上游全部安全补丁，也没有做生产压力测试。
 

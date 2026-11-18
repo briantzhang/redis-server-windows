@@ -1,8 +1,8 @@
 # 运维手册
 
-适用版本：Redis for Windows `5.0.14.1-bp28`，仅 Windows x64，支持单机和集群模式。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
+适用版本：Redis for Windows `5.0.14.1-bp44`，仅 Windows x64，支持单机和集群模式。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
 
-本文只覆盖这一个可执行文件的日常操作。它不包含多段 AOF，相关配置项写进 `redis.conf` 也不会生效。TLS 只覆盖客户端监听，见第 4c 节；主从复制和集群总线仍是明文。集群模式沿用底座实现，见第 4b 节。ACL 已按 Redis 6 的范围实现，见第 3 节。
+本文只覆盖这一个可执行文件的日常操作。它不包含多段 AOF，相关配置项写进 `redis.conf` 也不会生效。TLS 覆盖客户端监听、主从复制和集群总线，见第 4c、4d、4e 节；主动切换主库见第 4f 节。集群模式沿用底座实现，见第 4b 节。ACL 已按 Redis 6 的范围实现，见第 3 节。
 
 ## 1. 目录与文件
 
@@ -39,7 +39,7 @@
 .\redis-server.exe --version
 ```
 
-应看到 `v=5.0.14.1-bp28`。如果不是这个版本号，说明运行的不是这份回移。
+应看到 `v=5.0.14.1-bp44`。如果不是这个版本号，说明运行的不是这份回移。
 
 另开一个窗口检查存活：
 
@@ -367,6 +367,8 @@ CONFIG SET latency-tracking no -- 停止采集，已有数据保留
 
 直方图按 1024ns 起、2 的幂分桶，`histogram_usec` 是“桶上界 → 累计次数”的扁平数组。它适合判断延迟量级，不是精确的尾延迟分布。直方图只存在内存里，重启或 `CONFIG RESETSTAT` 后从零开始。
 
+键空间通知沿用底座的 `notify-keyspace-events`，并补上 Redis 7.0 的两类事件：`n` 在新增键时发 `new`，`m` 在读取不存在的键时发 `keymiss`。`A` 别名不包含这两类，需要时显式写进去，例如 `KEnm`。`keymiss` 只出现在普通读命令查不到键的路径上，执行 RDB/AOF 的子进程运行期间不产生。
+
 ## 4a. Functions
 
 本版支持基础 Redis Functions：`#!lua name=<库名>` 声明库，`redis.register_function()` 注册回调，调用入口是 `FCALL` / `FCALL_RO`。函数以源码形式保存：RDB 使用 AUX 字段，AOF rewrite 在开头写出 `FUNCTION LOAD`。
@@ -375,9 +377,11 @@ CONFIG SET latency-tracking no -- 停止采集，已有数据保留
 
 ## 4b. 集群模式
 
-在配置中设置 `cluster-enabled yes`，并为每个节点指定独立的 `cluster-config-file`。集群总线监听客户端端口 +10000，配置防火墙和端口规划时要同时放行这两个端口。可用 `CLUSTER MEET` 加入节点，用 `CLUSTER ADDSLOTS` 分配槽位；`CLUSTER INFO` 的 `cluster_state` 变成 `ok` 后才会服务对应槽。客户端收到 `MOVED` 后应连接目标节点重试。
+在配置中设置 `cluster-enabled yes`，并为每个节点指定独立的 `cluster-config-file`。集群总线监听客户端端口 +10000，配置防火墙和端口规划时要同时放行这两个端口。可用 `CLUSTER MEET` 加入节点，用 `CLUSTER ADDSLOTS` 或 `CLUSTER ADDSLOTSRANGE` 分配槽位（后者按区间给，可用 `CLUSTER DELSLOTSRANGE` 成段撤回）；`CLUSTER INFO` 的 `cluster_state` 变成 `ok` 后才会服务对应槽。客户端收到 `MOVED` 后应连接目标节点重试。
 
 本版沿用底座 Redis 5.0 的集群实现，没有改写槽迁移和故障转移代码。三节点本机组网、槽位分配、`MOVED` 重定向与 `CLUSTERDOWN` 已有黑盒覆盖；跨机器、网络分区和真实故障切换仍应在目标环境单独验证。
+
+`CLUSTER SHARDS` 按分片汇总槽位与主从节点，`CLUSTER LINKS` 列出本节点看到的总线连接。节点要把主机名而不是 IP 公告给客户端时，设置 `cluster-announce-hostname <name>` 并把 `cluster-preferred-endpoint` 设为 `hostname`，此时 `CLUSTER SLOTS`/`SHARDS`/`NODES` 输出主机名；`replica-announced no` 让副本不出现在这些回复里。总线加密见第 4e 节。
 
 ## 4c. TLS 客户端监听
 
@@ -393,9 +397,12 @@ tls-auth-clients yes
 ```
 
 - 证书和私钥都是 PEM。`tls-cert-file` 要按“服务器证书、中间证书”的顺序放完整链，`tls-key-file` 是不带口令的私钥。
-- `tls-auth-clients no` 只加密、不校验客户端证书，仍应配合 ACL 或 `requirepass` 使用；`yes` 要求客户端出示由 `tls-ca-cert-file`（或 `tls-ca-cert-dir`）签发的证书，没有证书的连接会在握手中被拒绝。
+- `tls-auth-clients no` 只加密、不校验客户端证书，仍应配合 ACL 或 `requirepass` 使用；`yes` 要求客户端出示由 `tls-ca-cert-file`（或 `tls-ca-cert-dir`）签发的证书，没有证书的连接会在握手中被拒绝；`optional` 向客户端索取证书，出示了不受信证书的连接照样被拒绝，但允许不带证书的连接。`yes` 和 `optional` 都要求配置 CA。
 - `tls-ca-cert-dir` 走 OpenSSL 的哈希目录格式，Windows 上不常用，优先用 `tls-ca-cert-file`。
-- `tls-port`、证书路径和 `tls-auth-clients` 在启动时读取；改证书或开关 TLS 需要重启进程。
+- `tls-protocols` 用空格分隔允许的协议版本（`TLSv1`、`TLSv1.1`、`TLSv1.2`、`TLSv1.3`），留空表示沿用 TLS 1.2 及以上的默认下限；`tls-ciphers` 配置 TLS 1.2 及以下的套件列表，`tls-ciphersuites` 配置 TLS 1.3 的套件。
+- `tls-prefer-server-ciphers yes` 让服务端按自己的顺序选择套件，`tls-session-caching no` 关闭 TLS 会话复用。
+- 这几项和 `tls-auth-clients` 可以在运行时用 `CONFIG SET` 修改：服务重建 SSL 上下文，新建连接按新设置握手，已有连接继续工作；值非法时命令返回错误并保留原设置。`CONFIG REWRITE` 会把当前值写回配置文件。
+- `tls-port` 和证书路径只在启动时读取；换证书或开关 TLS 监听需要重启进程。
 - 程序目录必须有 `libssl-3-x64.dll` 和 `libcrypto-3-x64.dll`，缺一个进程就起不来。发布包已带上这两个文件和 OpenSSL 许可证。
 - `INFO server` 的 `tls_port` 显示监听端口，`CONFIG GET tls-*` 可核对当前配置。
 
@@ -418,7 +425,7 @@ openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
 openssl s_client -connect 127.0.0.1:6380 -servername redis.example -CAfile ca.crt
 ```
 
-需要客户端证书时再带 `-cert client.crt -key client.key`。TLS 覆盖客户端连接和主从复制；集群总线、Sentinel 仍是明文，也没有证书热加载、`tls-protocols`、`tls-ciphers` 等配置项。
+需要客户端证书时再带 `-cert client.crt -key client.key`。TLS 覆盖客户端连接和主从复制；集群总线、Sentinel 仍是明文，证书路径也不支持热加载。
 
 ## 4d. TLS 主从复制
 
@@ -442,8 +449,42 @@ tls-ca-cert-file D:/redis/certs/ca.crt
 
 - 握手、`PING`/`REPLCONF`/`PSYNC`、RDB 传输和后续增量命令都在同一条 TLS 会话里；`INFO replication` 的 `master_link_status` 与明文复制一样显示 `up`。
 - 主库设置 `tls-auth-clients yes` 时，从库也必须配置由同一 CA 签发的证书和私钥，否则握手中被拒绝。
-- 主库启用 `repl-diskless-sync yes` 时，遇到 TLS 从库会自动退回磁盘方式生成并发送 RDB。
+- 主库启用 `repl-diskless-sync yes` 时 TLS 从库同样走无盘方式：RDB 子进程写进内部回环套接字，主进程转发进 TLS 会话，`dir` 下不会出现 `dump.rdb`。TLS 和明文从库可以同时连同一个无盘主库。
 - 已加密链路上不要再叠加 `masterauth` 以外的明文隧道；更换证书或修改 `tls-replication` 都需要重启进程。
+
+## 4e. TLS 集群总线
+
+所有节点设置相同的 `tls-cluster yes` 和同一 CA，总线端口（客户端端口 +10000）的握手、PING/PONG、槽位广播与故障转移投票都会加密：
+
+```text
+cluster-enabled yes
+cluster-config-file nodes-6380.conf
+tls-cluster yes
+tls-cert-file D:/redis/certs/node.crt
+tls-key-file D:/redis/certs/node.key
+tls-ca-cert-file D:/redis/certs/ca.crt
+```
+
+- 节点证书的 CN/SAN 不影响集群成员判定，`CLUSTER NODES` 里的地址仍由 `cluster-announce-*` 和 `cluster-preferred-endpoint` 决定。
+- 所有节点的 `tls-cluster` 必须一致：一部分节点开、一部分关时，总线握手失败，节点互相看不到。
+- 与客户端监听一样，证书文件只在启动时读取；`tls-cluster` 不支持运行时切换，改动后要滚动重启。
+
+## 4f. 主动故障转移（FAILOVER）
+
+`FAILOVER` 让当前主库把角色交给一个副本，而不是等主库失联后由集群或哨兵决定：
+
+```text
+FAILOVER TO 10.0.0.11 6379 TIMEOUT 30000
+FAILOVER ABORT
+```
+
+- 不带 `TO` 时，主库从在线副本里选一个已经追平的；带 `TO host port` 时只考虑该副本。
+- 命令返回 `OK` 后，主库暂停普通客户端的写命令（复制链路不受影响），等待目标副本的 ACK 追平当前偏移量。
+- 追平后主库以目标副本的身份发起 `PSYNC <replid> <offset> FAILOVER`，目标副本校验 replid 后自我提升为主库；旧主库随后作为副本继续同步，客户端写入不会丢。
+- `TIMEOUT ms` 限制等待时间，超时或目标副本掉线会回到 `no-failover` 并恢复写入；`ABORT` 立即取消。
+- `FORCE` 必须和 `TO`、`TIMEOUT` 一起用，允许在目标副本尚未追平时就切换，未确认的写入可能丢失。
+- 进度看 `INFO replication` 的 `master_failover_state`：`no-failover`、`waiting-for-sync` 或 `in-progress`。
+- 集群模式会拒绝该命令，副本上也不接受；集群请继续使用 `CLUSTER FAILOVER`。
 
 ## 5. 持久化与恢复
 
@@ -480,6 +521,14 @@ BGREWRITEAOF
 
 本版把带过期时间的 `SET` 记成 `SET` 加绝对时间的 `PEXPIREAT`。所以从 AOF 恢复后，TTL 不会因为“重放时重新计算相对时间”而变长。
 
+需要按时间定位某段写入时，可以打开 `aof-timestamp-enabled yes`：每条写入前最多每秒追加一行 `#TS:<unix 时间戳>`，`BGREWRITEAOF` 生成的新文件开头也会记录一次。这些行是注释，重放时会被跳过；默认关闭，打开后文件会略微变大。
+
+副本用无盘方式接收 RDB 时，默认仍先写临时文件再加载（`repl-diskless-load disabled`）。设置 `repl-diskless-load on-empty-db` 可以直接解析流，要求本地库为空；`swapdb` 把收到的 RDB 装进一组临时数据库，成功后整体替换，失败时旧数据不受影响。直接解析期间内存占用会暂时接近两份数据。
+
+`RESTORE` 默认只校验 DUMP 尾部的版本和 CRC64，内部编码损坏要等访问该键时才暴露。打开 `sanitize-dump-payload yes` 会在加载前完整校验 ziplist、listpack、intset、zipmap、quicklist 和流的 PEL/消费组结构，不合法就返回 `Bad data format` 且不落库；`clients` 只校验客户端发来的 `RESTORE`，不校验从主库复制来的数据。校验成本随值的大小线性增长，默认 `no` 不产生这项开销。
+
+`SHUTDOWN` 会等待副本确认当前偏移量，最多等 `shutdown-timeout` 毫秒（默认 10 秒），超时后照常退出；`SHUTDOWN NOW` 跳过等待。
+
 需要确认 AOF 已经落盘时：
 
 ```text
@@ -499,7 +548,7 @@ BGREWRITEAOF
 
 等 `INFO persistence` 里两次后台任务的状态都变成 `ok`，再复制 `dir` 下的 `dump.rdb` 和 `appendonly.aof`。复制过程中不要 `SHUTDOWN`，也不要再手动触发保存。
 
-备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp28-20261109.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
+备份文件名带上时间和版本，例如 `dump-5.0.14.1-bp35-20261117.rdb`，和程序分开存放。恢复演练至少做一次：把备份放到一个新目录、用另一个端口起一个临时实例读出来核对，不要在生产端口上试。
 
 流的 `entries-added` 和 `max-deleted-entry-id` 不写入 RDB 快照：从 `dump.rdb` 恢复后前者按当前长度重算、后者归零；从 AOF 恢复（含 AOF 重写）会保留。若业务依赖这两个计数，恢复时优先使用 AOF，或在恢复后用 `XSETID <key> <id> ENTRIESADDED <n> MAXDELETEDID <id>` 校正。
 
@@ -540,6 +589,7 @@ AOF 启动失败：
 ## 9. 不在本版范围内的事
 
 - 不支持把一份数据目录挂给两个进程同时写。
+- Windows 构建不加载 Redis 模块：`loadmodule` 配置会被忽略，`MODULE LIST` 为空。因此含模块数据的 RDB 和含模块类型的 DUMP payload 无法加载或 `RESTORE`；Functions 走 Lua，不依赖模块，可以使用。
 - 集群功能沿用底座实现，已有本机三节点覆盖，但没有验证哨兵、跨机器网络分区和真实故障切换；生产不要仅凭本版测试结论做故障切换。
 - ACL 已实现用户、口令、命令分类、键/频道通配符和 `%R~`/`%W~` 键读写权限；`SET`、`SETEX` 这类选项相关命令按命令级标志近似。见第 3 节。
-- 客户端可以用 `HELLO 3` 切到 RESP3：map、set、null、bool、double 和 verbatim 都有。协议 3 下 Pub/Sub 的订阅确认、消息以及 `CLIENT TRACKING` 失效都用 push 帧（`>`）发送，失效不需要 `REDIRECT`；协议 2 仍是普通数组，失效继续走 `__redis__:invalidate` 频道，必须 `REDIRECT` 到已订阅该频道的连接。Redisson 单机模式下的 `SET ... KEEPTTL`、`GETEX`、`GETDEL` 属于本版已实现的范围。
+- 客户端可以用 `HELLO 3` 切到 RESP3：map、set、null、bool、double 和 verbatim 都有。协议 3 下 Pub/Sub 的订阅确认、消息以及 `CLIENT TRACKING` 失效都用 push 帧（`>`）发送，失效不需要 `REDIRECT`；协议 2 仍是普通数组，失效继续走 `__redis__:invalidate` 频道，必须 `REDIRECT` 到已订阅该频道的连接。协议 3 的订阅连接可以继续执行任意普通命令（回包与 push 分开），协议 2 的订阅连接仍只允许订阅管理命令和 PING/QUIT/RESET。Redisson 单机模式下的 `SET ... KEEPTTL`、`GETEX`、`GETDEL` 属于本版已实现的范围。

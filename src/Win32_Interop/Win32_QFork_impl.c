@@ -112,7 +112,8 @@ int do_aofSave(char* filename, int aof_pipe_read_ack, int aof_pipe_read_data, in
     return C_OK;
 }
 
-int rdbSaveRioWithEOFMark(rio *rdb, int *error);
+int rdbSaveRioWithEOFMark(rio *rdb, int *error, rdbSaveInfo *rsi);
+rdbSaveInfo *rdbPopulateSaveInfo(rdbSaveInfo *rsi);
 
 // This function is meant to be an exact replica of the fork() child path in rdbSaveToSlavesSockets
 int do_rdbSaveToSlavesSockets(int *fds, int numfds, uint64_t *clientids)
@@ -120,6 +121,7 @@ int do_rdbSaveToSlavesSockets(int *fds, int numfds, uint64_t *clientids)
 #ifndef NO_QFORKIMPL
     int retval;
     rio slave_sockets;
+    rdbSaveInfo rsi, *rsiptr;
 
     server.rdb_child_pid = GetCurrentProcessId();
 
@@ -134,7 +136,12 @@ int do_rdbSaveToSlavesSockets(int *fds, int numfds, uint64_t *clientids)
 
     redisSetProcTitle("redis-rdb-to-slaves");
     
-    retval = rdbSaveRioWithEOFMark(&slave_sockets,NULL);
+    /* The child works on the parent's mapped memory, so the replication
+     * information can be populated here exactly like the fork() child does.
+     * Passing a garbage rsi pointer (the prototype used to take two
+     * arguments) crashed every diskless full synchronization. */
+    rsiptr = rdbPopulateSaveInfo(&rsi);
+    retval = rdbSaveRioWithEOFMark(&slave_sockets,NULL,rsiptr);
     if (retval == C_OK && rioFlush(&slave_sockets) == 0)
         retval = C_ERR;
     

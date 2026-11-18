@@ -360,6 +360,7 @@ ssize_t aofWrite(int fd, const char *buf, size_t len) {
  * However if force is set to 1 we'll write regardless of the background
  * fsync. */
 #define AOF_WRITE_LOG_ERROR_RATE 30 /* Seconds between errors logging. */
+#define AOF_ANNOTATION_LINE_MAX_LEN 28 /* "#TS:<unix time>" plus CRLF */
 void flushAppendOnlyFile(int force) {
     ssize_t nwritten;
     int sync_in_progress = 0;
@@ -603,9 +604,32 @@ sds catAppendOnlyExpireAtCommand(sds buf, struct redisCommand *cmd, robj *key, r
     return buf;
 }
 
+/* Generate a "#TS:<unix time>" annotation for the AOF. An annotation is
+ * produced at most once per second unless 'force' is set, which the rewrite
+ * child uses to record the time the rewrite started. */
+static sds genAofTimestampAnnotationIfNeeded(int force) {
+    sds ts = NULL;
+
+    if (force || server.aof_cur_timestamp < server.unixtime) {
+        server.aof_cur_timestamp = force ? time(NULL) : server.unixtime;
+        ts = sdscatfmt(sdsempty(),"#TS:%I\r\n",server.aof_cur_timestamp);
+        serverAssert(sdslen(ts) <= AOF_ANNOTATION_LINE_MAX_LEN);
+    }
+    return ts;
+}
+
 void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int argc) {
     sds buf = sdsempty();
     robj *tmpargv[3];
+
+    /* Annotate the write with the current time when configured. */
+    if (server.aof_timestamp_enabled) {
+        sds ts = genAofTimestampAnnotationIfNeeded(0);
+        if (ts != NULL) {
+            buf = sdscatsds(buf,ts);
+            sdsfree(ts);
+        }
+    }
 
     /* The DB this command was targeting is not the same as the last command
      * we appended. To issue a SELECT command is needed. */
@@ -803,6 +827,8 @@ int loadAppendOnlyFile(char *filename) {
             else
                 goto readerr;
         }
+        /* "#TS:<unix time>" annotations are comments, not commands. */
+        if (buf[0] == '#') continue;
         if (buf[0] != '*') goto fmterr;
         if (buf[1] == '\0') goto readerr;
         argc = atoi(buf+1);
@@ -1347,6 +1373,16 @@ int rewriteAppendOnlyFileRio(rio *aof) {
     dictEntry *de;
     size_t processed = 0;
     int j;
+
+    /* Record the time the rewritten file started. */
+    if (server.aof_timestamp_enabled) {
+        sds ts = genAofTimestampAnnotationIfNeeded(1);
+        if (rioWrite(aof,ts,sdslen(ts)) == 0) {
+            sdsfree(ts);
+            goto werr;
+        }
+        sdsfree(ts);
+    }
 
     /* Function libraries are replayed before any key-space command so that
      * functions called by the rewritten dataset already exist. */

@@ -9,6 +9,7 @@
 #define CLUSTER_OK 0          /* Everything looks ok */
 #define CLUSTER_FAIL 1        /* The cluster can't work */
 #define CLUSTER_NAMELEN 40    /* sha1 hex length */
+#define CLUSTER_HOSTNAME_LEN 34 /* Fits the reserved bytes in clusterMsg. */
 #define CLUSTER_PORT_INCR 10000 /* Cluster port = baseport + PORT_INCR */
 
 /* The following defines are amount of time, sometimes expressed as
@@ -44,6 +45,11 @@ typedef struct clusterLink {
     sds sndbuf;                 /* Packet send buffer */
     sds rcvbuf;                 /* Packet reception buffer */
     struct clusterNode *node;   /* Node related to this link if any, or NULL */
+    int inbound;                /* Accepted link ("from") vs outgoing ("to") */
+    int peer_name_set;          /* Whether peer_name has been learned */
+    char peer_name[CLUSTER_NAMELEN]; /* Peer ID for CLUSTER LINKS */
+    struct listNode *link_ref;  /* Position in server.cluster->links */
+    struct tlsLinkState *tls;   /* TLS state when tls-cluster is enabled */
 } clusterLink;
 
 /* Cluster node flags and macros. */
@@ -57,6 +63,7 @@ typedef struct clusterLink {
 #define CLUSTER_NODE_MEET 128     /* Send a MEET message to this node */
 #define CLUSTER_NODE_MIGRATE_TO 256 /* Master elegible for replica migration. */
 #define CLUSTER_NODE_NOFAILOVER 512 /* Slave will not try to failver. */
+#define CLUSTER_NODE_NOANNOUNCE 1024 /* Replica hidden from CLUSTER SLOTS/SHARDS */
 #define CLUSTER_NODE_NULL_NAME "\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
 
 #define nodeIsMaster(n) ((n)->flags & CLUSTER_NODE_MASTER)
@@ -135,6 +142,7 @@ typedef struct clusterNode {
     mstime_t orphaned_time;     /* Starting time of orphaned master condition */
     PORT_LONGLONG repl_offset;      /* Last known repl offset for this node. */
     char ip[NET_IP_STR_LEN];  /* Latest known IP address of this node */
+    char hostname[CLUSTER_HOSTNAME_LEN]; /* Latest known hostname, or "" */
     int port;                   /* Latest known clients port of this node */
     int cport;                  /* Latest known cluster port of this node. */
     clusterLink *link;          /* TCP/IP link with this node */
@@ -148,6 +156,7 @@ typedef struct clusterState {
     int size;             /* Num of master nodes with at least one slot */
     dict *nodes;          /* Hash table of name -> clusterNode structures */
     dict *nodes_black_list; /* Nodes we don't re-add for a few seconds. */
+    list *links;            /* All live inbound and outbound bus links */
     clusterNode *migrating_slots_to[CLUSTER_SLOTS];
     clusterNode *importing_slots_from[CLUSTER_SLOTS];
     clusterNode *slots[CLUSTER_SLOTS];
@@ -267,7 +276,10 @@ typedef struct {
     unsigned char myslots[CLUSTER_SLOTS/8];
     char slaveof[CLUSTER_NAMELEN];
     char myip[NET_IP_STR_LEN];    /* Sender IP, if not all zeroed. */
-    char notused1[34];  /* 34 bytes reserved for future usage. */
+    char hostname[CLUSTER_HOSTNAME_LEN]; /* Sender hostname, if announced.
+                                            These 34 bytes were reserved in
+                                            the original 5.0 wire header, so
+                                            the message size is unchanged. */
     uint16_t cport;      /* Sender TCP cluster bus port */
     uint16_t flags;      /* Sender node flags */
     unsigned char state; /* Cluster state from the POV of the sender */
@@ -284,6 +296,8 @@ typedef struct {
                                             master is up. */
 
 /* ---------------------- API exported outside cluster.c -------------------- */
+void clusterUpdateMyselfFlags(void);
+void clusterUpdateState(void);
 clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, int argc, int *hashslot, int *ask);
 int clusterRedirectBlockedClientIfNeeded(client *c);
 void clusterRedirectClient(client *c, clusterNode *n, int hashslot, int error_code);

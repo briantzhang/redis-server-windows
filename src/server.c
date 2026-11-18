@@ -291,7 +291,7 @@ struct redisCommand redisCommandTable[] = {
     {"exec",execCommand,1,"sM",0,NULL,0,0,0,0,0},
     {"discard",discardCommand,1,"sF",0,NULL,0,0,0,0,0},
     {"sync",syncCommand,1,"ars",0,NULL,0,0,0,0,0},
-    {"psync",syncCommand,3,"ars",0,NULL,0,0,0,0,0},
+    {"psync",syncCommand,-3,"ars",0,NULL,0,0,0,0,0},
     {"replconf",replconfCommand,-1,"aslt",0,NULL,0,0,0,0,0},
     {"flushdb",flushdbCommand,-1,"w",0,NULL,0,0,0,0,0},
     {"flushall",flushallCommand,-1,"w",0,NULL,0,0,0,0,0},
@@ -305,6 +305,7 @@ struct redisCommand redisCommandTable[] = {
     {"persist",persistCommand,2,"wF",0,NULL,1,1,1,0,0},
     {"slaveof",replicaofCommand,3,"ast",0,NULL,0,0,0,0,0},
     {"replicaof",replicaofCommand,3,"ast",0,NULL,0,0,0,0,0},
+    {"failover",failoverCommand,-1,"ast",0,NULL,0,0,0,0,0},
     {"role",roleCommand,1,"lst",0,NULL,0,0,0,0,0},
     {"debug",debugCommand,-2,"as",0,NULL,0,0,0,0,0},
     {"config",configCommand,-2,"last",0,NULL,0,0,0,0,0},
@@ -1675,8 +1676,14 @@ void initServerConfig(void) {
     server.tls_key_file = NULL;
     server.tls_ca_cert_file = NULL;
     server.tls_ca_cert_dir = NULL;
-    server.tls_auth_clients = 0;
+    server.tls_auth_clients = TLS_CLIENT_AUTH_NO;
     server.tls_replication = 0;
+    server.tls_cluster = 0;
+    server.tls_protocols = zstrdup("");
+    server.tls_ciphers = zstrdup("");
+    server.tls_ciphersuites = zstrdup("");
+    server.tls_prefer_server_ciphers = 0;
+    server.tls_session_caching = 1;
     server.tcp_backlog = CONFIG_DEFAULT_TCP_BACKLOG;
     server.bindaddr_count = 0;
     server.unixsocket = NULL;
@@ -1712,6 +1719,8 @@ void initServerConfig(void) {
     server.supervised = 0;
     server.supervised_mode = SUPERVISED_NONE;
     server.aof_state = AOF_OFF;
+    server.aof_timestamp_enabled = 0;
+    server.aof_cur_timestamp = 0;
     server.aof_fsync = CONFIG_DEFAULT_AOF_FSYNC;
     server.aof_no_fsync_on_rewrite = CONFIG_DEFAULT_AOF_NO_FSYNC_ON_REWRITE;
     server.aof_rewrite_perc = AOF_REWRITE_PERC;
@@ -1738,6 +1747,7 @@ void initServerConfig(void) {
     server.acllog_max_len = 128;
     server.rdb_compression = CONFIG_DEFAULT_RDB_COMPRESSION;
     server.rdb_checksum = CONFIG_DEFAULT_RDB_CHECKSUM;
+    server.sanitize_dump_payload = CONFIG_DEFAULT_SANITIZE_DUMP_PAYLOAD;
     server.stop_writes_on_bgsave_err = CONFIG_DEFAULT_STOP_WRITES_ON_BGSAVE_ERROR;
     server.activerehashing = CONFIG_DEFAULT_ACTIVE_REHASHING;
     server.active_defrag_running = 0;
@@ -1770,8 +1780,11 @@ void initServerConfig(void) {
     server.cluster_slave_no_failover = CLUSTER_DEFAULT_SLAVE_NO_FAILOVER;
     server.cluster_configfile = zstrdup(CONFIG_DEFAULT_CLUSTER_CONFIG_FILE);
     server.cluster_announce_ip = CONFIG_DEFAULT_CLUSTER_ANNOUNCE_IP;
+    server.cluster_announce_hostname = NULL;
+    server.cluster_preferred_endpoint = CLUSTER_ENDPOINT_IP;
     server.cluster_announce_port = CONFIG_DEFAULT_CLUSTER_ANNOUNCE_PORT;
     server.cluster_announce_bus_port = CONFIG_DEFAULT_CLUSTER_ANNOUNCE_BUS_PORT;
+    server.replica_announced = CONFIG_DEFAULT_REPLICA_ANNOUNCED;
     server.cluster_module_flags = CLUSTER_MODULE_FLAG_NONE;
     server.migrate_cached_sockets = dictCreate(&migrateCacheDictType,NULL);
     server.next_client_id = 1; /* Client IDs, start from 1 .*/
@@ -1809,6 +1822,16 @@ void initServerConfig(void) {
     server.repl_disable_tcp_nodelay = CONFIG_DEFAULT_REPL_DISABLE_TCP_NODELAY;
     server.repl_diskless_sync = CONFIG_DEFAULT_REPL_DISKLESS_SYNC;
     server.repl_diskless_sync_delay = CONFIG_DEFAULT_REPL_DISKLESS_SYNC_DELAY;
+    server.repl_diskless_sync_max_replicas =
+        CONFIG_DEFAULT_REPL_DISKLESS_SYNC_MAX_REPLICAS;
+    server.repl_diskless_load = CONFIG_DEFAULT_REPL_DISKLESS_LOAD;
+    server.shutdown_timeout = CONFIG_DEFAULT_SHUTDOWN_TIMEOUT;
+    server.failover_state = FAILOVER_STATE_NONE;
+    server.failover_end_time = 0;
+    server.force_failover = 0;
+    server.target_replica_host = NULL;
+    server.target_replica_port = 0;
+    server.repl_diskless_buf = NULL;
     server.repl_ping_slave_period = CONFIG_DEFAULT_REPL_PING_SLAVE_PERIOD;
     server.repl_timeout = CONFIG_DEFAULT_REPL_TIMEOUT;
     server.repl_min_slaves_to_write = CONFIG_DEFAULT_MIN_SLAVES_TO_WRITE;
@@ -2272,9 +2295,25 @@ void initServer(void) {
         listenToPort(server.port,server.ipfd,&server.ipfd_count) == C_ERR)
         exit(1);
 
-    /* Open the TLS listening socket. */
-    if (server.tls_port != 0) {
+    /* Open the TLS listening socket. A TLS cluster bus needs the same
+     * certificate even when no TLS client port is configured. */
+    if (server.tls_cluster && !server.cluster_enabled) {
+        serverLog(LL_WARNING,"tls-cluster requires cluster-enabled yes");
+        exit(1);
+    }
+    if (server.tls_cluster &&
+        (!server.tls_cert_file || !server.tls_key_file ||
+         (!server.tls_ca_cert_file && !server.tls_ca_cert_dir)))
+    {
+        serverLog(LL_WARNING,"tls-cluster requires tls-cert-file, "
+                             "tls-key-file and a CA (tls-ca-cert-file or "
+                             "tls-ca-cert-dir)");
+        exit(1);
+    }
+    if (server.tls_port != 0 || server.tls_cluster) {
         if (tlsInit() != C_OK) exit(1);
+    }
+    if (server.tls_port != 0) {
         if (listenToPort(server.tls_port,server.tlsfd,
                          &server.tlsfd_count) == C_ERR)
             exit(1);
@@ -2965,8 +3004,11 @@ int processCommand(client *c) {
         return C_OK;
     }
 
-    /* Only allow SUBSCRIBE and UNSUBSCRIBE in the context of Pub/Sub */
-    if (c->flags & CLIENT_PUBSUB &&
+    /* In RESP2 a subscribed connection can only manage its subscriptions:
+     * replies and messages share one stream, so commands would be ambiguous.
+     * RESP3 delivers messages as push frames, which the client can tell
+     * apart, so any command is allowed while subscribed. */
+    if ((c->flags & CLIENT_PUBSUB) && c->resp == 2 &&
         c->cmd->proc != pingCommand &&
         c->cmd->proc != subscribeCommand &&
         c->cmd->proc != unsubscribeCommand &&
@@ -3227,7 +3269,7 @@ void pingCommand(client *c) {
         return;
     }
 
-    if (c->flags & CLIENT_PUBSUB) {
+    if ((c->flags & CLIENT_PUBSUB) && c->resp == 2) {
         addReply(c,shared.mbulkhdr[2]);
         addReplyBulkCBuffer(c,"pong",4);
         if (c->argc == 1)
@@ -4237,7 +4279,13 @@ sds genRedisInfoString(char *section) {
                 slaveid++;
             }
         }
+        char *failover_state = "no-failover";
+        if (server.failover_state == FAILOVER_STATE_WAITING_FOR_SYNC)
+            failover_state = "waiting-for-sync";
+        else if (server.failover_state == FAILOVER_STATE_IN_PROGRESS)
+            failover_state = "in-progress";
         info = sdscatprintf(info,
+            "master_failover_state:%s\r\n"
             "master_replid:%s\r\n"
             "master_replid2:%s\r\n"
             "master_repl_offset:%lld\r\n"
@@ -4246,6 +4294,7 @@ sds genRedisInfoString(char *section) {
             "repl_backlog_size:%lld\r\n"
             "repl_backlog_first_byte_offset:%lld\r\n"
             "repl_backlog_histlen:%lld\r\n",
+            failover_state,
             server.replid,
             server.replid2,
             server.master_repl_offset,
