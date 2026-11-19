@@ -5104,6 +5104,24 @@ class BackportRegression(unittest.TestCase):
         time.sleep(0.05)
         self.assertEqual(sub2._read(), [b"message", b"push:chan2", b"plain"])
 
+    def test_resp3_shard_pubsub_push_frames(self):
+        sub = self.connect()
+        self.addCleanup(sub.close)
+        sub.sock.sendall(sub.encode(("HELLO", "3")))
+        sub._read()
+        sub.sock.sendall(sub.encode(("SSUBSCRIBE", "push:shard")))
+        self.assertEqual(sub.reader.readline(), bytes([62, 51, 13, 10]))
+        self.assertEqual([sub._read() for _ in range(3)],
+                         [b"ssubscribe", b"push:shard", 1])
+        self.assertEqual(self.cmd("SPUBLISH", "push:shard", bytes([0]) + b"data"), 1)
+        self.assertEqual(sub.reader.readline(), bytes([62, 51, 13, 10]))
+        self.assertEqual([sub._read() for _ in range(3)],
+                         [b"smessage", b"push:shard", bytes([0]) + b"data"])
+        sub.sock.sendall(sub.encode(("SUNSUBSCRIBE", "push:shard")))
+        self.assertEqual(sub.reader.readline(), bytes([62, 51, 13, 10]))
+        self.assertEqual([sub._read() for _ in range(3)],
+                         [b"sunsubscribe", b"push:shard", 0])
+
     def test_resp3_tracking_push_invalidate(self):
         if self.server is None:
             self.skipTest("CLIENT TRACKING test requires --server")
