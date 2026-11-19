@@ -931,6 +931,28 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("GETEX", key, "PXAT", LLONG_MAX), b"old")
         self.assertGreater(self.cmd("PTTL", key), 10 ** 15)
 
+    def test_getdel_getex_aof_and_transaction(self):
+        if self.server is None:
+            self.skipTest("AOF propagation tests require --server")
+        key = self.key("getex:aof")
+        self.cmd("SET", key, "v")
+
+        self.assertEqual(self.cmd("MULTI"), b"OK")
+        self.assertEqual(self.cmd("GETEX", key, "PX", 120000), b"QUEUED")
+        self.assertEqual(self.cmd("GETDEL", self.key("getex:gone")), b"QUEUED")
+        self.assertEqual(self.cmd("EXEC"), [b"v", None])
+
+        key2 = self.key("getdel:aof")
+        binary = bytes([0]) + b"binary"
+        self.assertEqual(self.cmd("SET", key2, binary), b"OK")
+        self.assertEqual(self.cmd("GETDEL", key2), binary)
+        self.assertIsNone(self.cmd("GET", key2))
+
+        self.restart()
+        self.assertIn(self.cmd("PTTL", key), range(100000, 120001))
+        self.assertEqual(self.cmd("GET", key), b"v")
+        self.assertIsNone(self.cmd("GET", key2))
+
     def test_expire_condition_matrix(self):
         for command in ("EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT"):
             with self.subTest(command=command):
