@@ -1617,6 +1617,39 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("DBSIZE"), 0)
         self.cmd("CONFIG", "SET", "lazyfree-lazy-user-flush", "no")
 
+    def test_lrandmember(self):
+        key = self.key("lrandmember")
+        self.assertEqual(self.cmd("DEL", key), 0)
+        self.assertIsNone(self.cmd("LRANDMEMBER", key))
+        self.assertIsNone(self.cmd("LRANDMEMBER", key, "3"))
+
+        values = [b"a", b"b", b"c", b"d"]
+        self.assertEqual(self.cmd("RPUSH", key, *values), 4)
+        self.assertIn(self.cmd("LRANDMEMBER", key), values)
+
+        sample = self.cmd("LRANDMEMBER", key, "3")
+        self.assertEqual(len(sample), 3)
+        self.assertEqual(len(set(sample)), 3)
+        self.assertTrue(set(sample) <= set(values))
+
+        full = self.cmd("LRANDMEMBER", key, "4")
+        self.assertEqual(set(full), set(values))
+        more = self.cmd("LRANDMEMBER", key, "5")
+        self.assertEqual(len(more), 4)
+        self.assertEqual(set(more), set(values))
+
+        repeats = self.cmd("LRANDMEMBER", key, "-8")
+        self.assertEqual(len(repeats), 8)
+        self.assertTrue(set(repeats) <= set(values))
+        self.assertEqual(self.cmd("LLEN", key), 4)
+
+        self.assertEqual(self.cmd("LRANDMEMBER", key, "0"), [])
+        with self.assertRaises(RedisError):
+            self.cmd("LRANDMEMBER", key, "x")
+        self.assertEqual(self.cmd("SET", self.key("lrandmember:wrong"), "v"), b"OK")
+        with self.assertRaises(RedisError):
+            self.cmd("LRANDMEMBER", self.key("lrandmember:wrong"))
+
     def test_lpos_and_lmove(self):
         self.cmd("DEL", "lpos", "lsrc", "ldst", "lplain")
         self.cmd("RPUSH", "lpos", "a", "b", "c", "b", "a")

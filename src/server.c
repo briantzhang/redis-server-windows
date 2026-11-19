@@ -186,6 +186,7 @@ struct redisCommand redisCommandTable[] = {
     {"lmpop",lmpopCommand,-4,"w",0,mpopGetKeys,0,0,0,0,0},
     {"blmpop",blmpopCommand,-5,"ws",0,mpopGetKeys,0,0,0,0,0},
     {"lpos",lposCommand,-3,"r",0,NULL,1,1,1,0,0},
+    {"lrandmember",lrandmemberCommand,-2,"rR",0,NULL,1,1,1,0,0},
     {"sadd",saddCommand,-3,"wmF",0,NULL,1,1,1,0,0},
     {"srem",sremCommand,-3,"wF",0,NULL,1,1,1,0,0},
     {"smove",smoveCommand,4,"wF",0,NULL,1,2,1,0,0},

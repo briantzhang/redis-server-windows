@@ -1248,3 +1248,117 @@ void lmpopCommand(client *c) {
 void blmpopCommand(client *c) {
     lmpopGenericCommand(c,2,1);
 }
+
+/* LRANDMEMBER key [count]
+ *
+ * Return random elements without removing them. COUNT may be negative to
+ * allow repeated elements, matching the other *RANDMEMBER commands. */
+void lrandmemberCommand(client *c) {
+    robj *o, *value;
+    PORT_LONG l, count = 1, i;
+    int count_present = 0;
+
+    if (c->argc > 3) {
+        addReplyErrorFormat(c,"wrong number of arguments for '%s' command",
+                            c->cmd->name);
+        return;
+    }
+    if (c->argc == 3 && getLongFromObjectOrReply(c,c->argv[2],&l,NULL) != C_OK)
+        return;
+    if (c->argc == 3) {
+        count = l;
+        count_present = 1;
+    }
+
+    o = lookupKeyReadOrReply(c,c->argv[1],
+        count_present ? shared.nullmultibulk : shared.nullbulk);
+    if (o == NULL || checkType(c,o,OBJ_LIST)) return;
+
+    PORT_LONG llen = listTypeLength(o);
+    if (llen == 0) {
+        addReply(c,count_present ? shared.nullmultibulk : shared.nullbulk);
+        return;
+    }
+
+    if (!count_present) {
+        PORT_ULONG idx = random() % (PORT_ULONG)llen;
+        quicklistEntry entry;
+        if (quicklistIndex(o->ptr,(PORT_LONG)idx,&entry)) {
+            if (entry.value)
+                value = createStringObject((char*)entry.value,entry.sz);
+            else
+                value = createStringObjectFromLongLong(entry.longval);
+        } else {
+            value = NULL;
+        }
+        if (value) {
+            addReplyBulk(c,value);
+            decrRefCount(value);
+        } else {
+            addReply(c,shared.nullbulk);
+        }
+        return;
+    }
+
+    int unique = (count >= 0);
+    if (count < 0) {
+        count = -count;
+        unique = 0;
+    }
+    if (count > llen && unique) count = llen;
+    if (count > 1024*1024) count = 1024*1024;
+    addReplyMultiBulkLen(c,count);
+    if (!unique) {
+        for (i = 0; i < count; i++) {
+            PORT_ULONG idx = random() % (PORT_ULONG)llen;
+            quicklistEntry entry;
+            if (quicklistIndex(o->ptr,(PORT_LONG)idx,&entry)) {
+                if (entry.value)
+                    value = createStringObject((char*)entry.value,entry.sz);
+                else
+                    value = createStringObjectFromLongLong(entry.longval);
+            } else {
+                value = NULL;
+            }
+            if (value) {
+                addReplyBulk(c,value);
+                decrRefCount(value);
+            } else {
+                addReply(c,shared.nullbulk);
+            }
+        }
+        return;
+    }
+
+    /* The list cannot hold duplicates in this path. Pick distinct indexes
+     * with a small O(n) membership test; sampled commands are bounded. */
+    PORT_LONG *picked = zmalloc(sizeof(PORT_LONG)*(size_t)count);
+    int npicked = 0;
+    while (npicked < count) {
+        PORT_LONG idx = (PORT_LONG)(random() % (PORT_ULONG)llen);
+        int seen = 0, j;
+        for (j = 0; j < npicked; j++) {
+            if (picked[j] == idx) { seen = 1; break; }
+        }
+        if (seen) continue;
+        picked[npicked++] = idx;
+    }
+    for (i = 0; i < count; i++) {
+        quicklistEntry entry;
+        if (quicklistIndex(o->ptr,picked[i],&entry)) {
+            if (entry.value)
+                value = createStringObject((char*)entry.value,entry.sz);
+            else
+                value = createStringObjectFromLongLong(entry.longval);
+        } else {
+            value = NULL;
+        }
+        if (value) {
+            addReplyBulk(c,value);
+            decrRefCount(value);
+        } else {
+            addReply(c,shared.nullbulk);
+        }
+    }
+    zfree(picked);
+}

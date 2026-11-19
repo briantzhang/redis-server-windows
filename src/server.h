@@ -2329,6 +2329,7 @@ void sortCommand(client *c);
 void sortroCommand(client *c);
 void lremCommand(client *c);
 void lposCommand(client *c);
+void lrandmemberCommand(client *c);
 void lmoveCommand(client *c);
 void blmoveCommand(client *c);
 void lmpopCommand(client *c);
