@@ -3554,6 +3554,47 @@ class BackportRegression(unittest.TestCase):
             for node in nodes:
                 node.close()
 
+    def test_client_unblock_modes(self):
+        if self.server is None:
+            self.skipTest("CLIENT UNBLOCK tests require --server")
+        admin = self.cmd
+
+        def blocked(command):
+            client = self.connect()
+            self.addCleanup(client.close)
+            client.sock.sendall(RESP2.encode(command))
+            time.sleep(0.05)
+            with self.connect() as probe:
+                info = probe.command("CLIENT", "LIST")
+            lines = [x for x in info.splitlines()
+                     if b"flags=b" in x and
+                     b"cmd=%s" % command[0].lower().encode() in x.lower()]
+            self.assertEqual(len(lines), 1, info)
+            fields = dict(part.split(b"=",1) for part in lines[0].split()
+                          if b"=" in part)
+            return client, int(fields[b"id"])
+
+        # TIMEOUT mode uses the same nil reply as a normal timeout.
+        victim, victim_id = blocked(
+            ("BLPOP", self.key("unblock:timeout"), "60"))
+        self.assertEqual(admin("CLIENT", "UNBLOCK", victim_id, "TIMEOUT"), 1)
+        self.assertIsNone(victim._read())
+
+        # ERROR mode returns an explicit -UNBLOCKED error and keeps the
+        # connection usable.
+        victim, victim_id = blocked(
+            ("BLPOP", self.key("unblock:error"), "60"))
+        self.assertEqual(admin("CLIENT", "UNBLOCK", victim_id, "ERROR"), 1)
+        reply = victim._read()
+        self.assertTrue(isinstance(reply, RedisError) or
+                        (isinstance(reply, bytes) and b"UNBLOCKED" in reply),
+                        repr(reply))
+        self.assertEqual(victim.command("PING"), b"PONG")
+
+        self.assertEqual(admin("CLIENT", "UNBLOCK", 999999), 0)
+        with self.assertRaises(RedisError):
+            admin("CLIENT", "UNBLOCK", 1, "INVALID")
+
     def test_client_info_unpause_pause(self):
         if self.server is None:
             self.skipTest("CLIENT PAUSE tests require --server")
