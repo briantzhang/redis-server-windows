@@ -690,6 +690,23 @@ class BackportRegression(unittest.TestCase):
         for command in ("EXPIRETIME", "PEXPIRETIME"):
             self.assertEqual(self.cmd(command, key), -2)
 
+        # EXPIRETIME does not refresh LRU/access metadata.
+        key = self.key("key:idle")
+        self.cmd("SET", key, "v")
+        self.cmd("PEXPIREAT", key, self.now_ms() + 180000)
+        time.sleep(1.1)
+        self.assertGreaterEqual(self.cmd("OBJECT", "IDLETIME", key), 1)
+        self.assertGreater(self.cmd("PEXPIRETIME", key), 0)
+        self.assertGreaterEqual(self.cmd("OBJECT", "IDLETIME", key), 1)
+
+        # RESTORE ABSTTL restores the same absolute deadline.
+        payload = self.cmd("DUMP", key)
+        deadline = self.cmd("PEXPIRETIME", key)
+        self.assertEqual(self.cmd("DEL", key), 1)
+        self.assertEqual(
+            self.cmd("RESTORE", key, deadline, payload, "ABSTTL"), b"OK")
+        self.assertEqual(self.cmd("PEXPIRETIME", key), deadline)
+
     def test_set_get_missing_binary_and_conditions(self):
         key = self.key("key")
         binary = b"\x00old\r\n\xff"
