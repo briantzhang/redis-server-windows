@@ -1624,6 +1624,32 @@ class BackportRegression(unittest.TestCase):
         self.restart()
         self.assertEqual(self.cmd("GET", key), b"value")
 
+    def test_aof_toggle_with_corrupt_tail(self):
+        """A truncated AOF tail is repaired and later writes survive."""
+        if self.server is None:
+            self.skipTest("AOF multipart tests require --server")
+        key = self.key("toggle:corrupt")
+        self.assertEqual(self.cmd("CONFIG", "SET", "appendonly", "yes"), b"OK")
+        self.wait_info_field("persistence", "aof_enabled", "1")
+        self.assertEqual(self.cmd("SET", key, b"v"), b"OK")
+        incr = self.server.directory / "appendonlydir" / "appendonly.aof.1.incr.aof"
+        self.client.close()
+        self.server.stop()
+        size = incr.stat().st_size
+        fragment = bytes([42, 50]) + bytes([13, 10]) + b"$3" + bytes([13, 10]) + b"SET" + bytes([13, 10]) + b"$1" + bytes([13, 10]) + b"x"
+        with incr.open("ab") as handle:
+            handle.write(fragment)
+        self.server.start()
+        self.client = self.connect()
+        self.addCleanup(self.client.close)
+        self.assertEqual(self.cmd("GET", key), b"v")
+        self.assertEqual(incr.stat().st_size, size)
+
+        # Subsequent writes append to the repaired tail and survive reload.
+        self.assertEqual(self.cmd("SET", key, b"v3"), b"OK")
+        self.restart()
+        self.assertEqual(self.cmd("GET", key), b"v3")
+
     def test_zunion_zinter_zdiff(self):
         self.cmd("DEL", "za", "zb", "out")
         self.cmd("ZADD", "za", "1", "a", "2", "b")
