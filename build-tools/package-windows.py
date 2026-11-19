@@ -8,7 +8,7 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '5.0.14.1-bp49'
+VERSION = '5.0.14.1-bp65'
 NAME = 'Redis-x64-' + VERSION
 DIST = ROOT / 'dist'
 PKG = DIST / NAME
@@ -106,7 +106,7 @@ if not exist data mkdir data
 "%~dp0redis-server.exe" "%~dp0redis.windows.conf" --dir "%~dp0data"
 popd
 ''', encoding='ascii', newline='\r\n')
-    (PKG/'README.md').write_text('''# Redis Windows 5.0.14.1-bp49
+    (PKG/'README.md').write_text('''# Redis Windows {version}
 
 Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；关闭窗口或 Ctrl+C 停止。
 默认监听 127.0.0.1:6379，AOF 每秒同步，多段文件保存在 data/appendonlydir/；
@@ -187,7 +187,7 @@ TLS：按 redis.windows.conf 的注释配置 tls-port 和证书后重启；必�
 需要远程连接时由管理员配置监听地址、强密码与访问控制。
 
 请保留 COPYING。回归结果见 regression-windows.log，构建与测试范围见 verification-windows.md。
-''', encoding='utf-8')
+'''.format(version=VERSION), encoding='utf-8')
     (PKG/'manifest.json').write_text(json.dumps({
         'version': VERSION, 'platform': 'windows-x64',
         'base_tag': 'v5.0.14.1',
