@@ -2256,6 +2256,35 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("BZMPOP", "0", "1", missing, "MIN"), b"QUEUED")
         self.assertEqual(self.cmd("EXEC"), [None])
 
+    def test_network_interleaved_clients(self):
+        if self.server is None:
+            self.skipTest("network stability tests require --server")
+        baseline = int(self.info_fields("clients")["connected_clients"])
+        clients = [self.connect() for _ in range(8)]
+        self.addCleanup(lambda: [client.close() for client in clients])
+
+        # Interleave small commands and a large response across sockets to
+        # exercise IOCP completion ordering and output buffer write handlers.
+        big_key = self.key("network:interleaved")
+        payload = bytes(range(256)) * 2048
+        clients[0].sock.sendall(clients[0].encode(("SET", big_key, payload)))
+        for round_no in range(30):
+            for index, client in enumerate(clients[1:], 1):
+                key = self.key("network:interleaved:%d" % index)
+                client.sock.sendall(client.encode(("INCR", key)))
+                self.assertEqual(client._read(), round_no + 1)
+        self.assertEqual(clients[0]._read(), b"OK")
+        self.assertEqual(clients[0].command("GET", big_key), payload)
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if int(self.info_fields("clients")["connected_clients"]) <= baseline + 10:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("clients leaked: %r" % self.info_fields("clients"))
+        self.assertIsNone(self.server.process.poll(), "server exited")
+
     def test_client_no_touch_and_no_evict(self):
         key = self.key("client:flags")
         self.cmd("DEL", key)
