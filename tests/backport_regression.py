@@ -3960,6 +3960,41 @@ class BackportRegression(unittest.TestCase):
         with self.assertRaises(RedisError):
             self.cmd("ACL", "WHOAMI", "extra")
 
+    def test_client_output_buffer_limit_config(self):
+        if self.server is None:
+            self.skipTest("CLIENT output buffer tests require --server")
+        original = dict(zip(*[iter(self.cmd(
+            "CONFIG", "GET", "client-output-buffer-limit"))] * 2))
+        try:
+            self.assertEqual(
+                self.cmd("CONFIG", "SET", "client-output-buffer-limit",
+                         "normal 1048576 524288 5"), b"OK")
+            value = dict(zip(*[iter(self.cmd(
+                "CONFIG", "GET", "client-output-buffer-limit"))] * 2))[
+                    b"client-output-buffer-limit"]
+            self.assertIn(b"normal 1048576 524288 5", value)
+
+            # Invalid class and malformed tuples are rejected without
+            # changing the live configuration.
+            for setting in (("bogus 1 1 1",),
+                            ("normal -1 0 0",),
+                            ("normal 1 1",)):
+                with self.subTest(setting=setting):
+                    with self.assertRaises(RedisError):
+                        self.cmd("CONFIG", "SET",
+                                 "client-output-buffer-limit", *setting)
+            current = dict(zip(*[iter(self.cmd(
+                "CONFIG", "GET", "client-output-buffer-limit"))] * 2))
+            self.assertEqual(current, {
+                b"client-output-buffer-limit": value})
+
+            self.assertEqual(
+                self.cmd("CONFIG", "SET", "client-output-buffer-limit",
+                         "normal 0 0 0"), b"OK")
+        finally:
+            self.cmd("CONFIG", "SET", "client-output-buffer-limit",
+                     original[b"client-output-buffer-limit"])
+
     def test_client_info_protocol_and_tracking_fields(self):
         if self.server is None:
             self.skipTest("client tests require --server")
