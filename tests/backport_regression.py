@@ -660,6 +660,40 @@ class BackportRegression(unittest.TestCase):
         with self.assertRaises(RedisError):
             self.cmd("SMISMEMBER")
 
+    def test_object_help_and_metadata(self):
+        if self.server is None:
+            self.skipTest("OBJECT tests require --server")
+        key = self.key("object:metadata")
+        self.cmd("SET", key, "v")
+
+        help_text = b"\n".join(self.cmd("OBJECT", "HELP"))
+        for name in (b"ENCODING", b"FREQ", b"IDLETIME", b"REFCOUNT"):
+            self.assertIn(name, help_text)
+
+        enc = self.cmd("OBJECT", "ENCODING", key)
+        self.assertIn(enc, (b"int", b"embstr", b"raw"))
+        self.assertGreaterEqual(self.cmd("OBJECT", "REFCOUNT", key), 1)
+        self.assertIsNone(self.cmd("OBJECT", "ENCODING", self.key("object:missing")))
+        with self.assertRaises(RedisError):
+            self.cmd("OBJECT", "NOSUCH", key)
+        with self.assertRaises(RedisError):
+            self.cmd("OBJECT", "HELP", "extra")
+
+        # FREQ and IDLETIME are mutually exclusive with their policies.
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "maxmemory-policy", "allkeys-lfu"), b"OK")
+        self.addCleanup(self.cmd, "CONFIG", "SET", "maxmemory-policy", "noeviction")
+        freq = self.cmd("OBJECT", "FREQ", key)
+        self.assertGreaterEqual(freq, 0)
+        self.assertLessEqual(freq, 255)
+        with self.assertRaises(RedisError):
+            self.cmd("OBJECT", "IDLETIME", key)
+        self.assertEqual(
+            self.cmd("CONFIG", "SET", "maxmemory-policy", "noeviction"), b"OK")
+        self.assertGreaterEqual(self.cmd("OBJECT", "IDLETIME", key), 0)
+        with self.assertRaises(RedisError):
+            self.cmd("OBJECT", "FREQ", key)
+
     def test_expiretime_and_pexpiretime(self):
         key = self.key("key")
         for command in ("EXPIRETIME", "PEXPIRETIME"):
