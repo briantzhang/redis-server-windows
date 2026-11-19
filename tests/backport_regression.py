@@ -3012,6 +3012,25 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("FCALL", "echo", "0", "again"), b"again")
         self.assertEqual(self.cmd("FUNCTION", "FLUSH"), b"OK")
 
+    def test_redis_cli_cluster_help(self):
+        """The Windows redis-cli build exposes the full cluster manager set."""
+        cli = Path(OPTIONS.server).with_name("redis-cli.exe") if OPTIONS.server else None
+        if cli is None or not cli.exists():
+            self.skipTest("redis-cli tests require --server")
+        result = subprocess.run(
+            [str(cli), "--cluster", "help"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
+        output = result.stdout.decode("utf-8", "replace")
+        self.assertIn(result.returncode, (0, 1), output)
+        self.assertIn("Cluster Manager Commands:", output)
+        for command in ("create", "check", "info", "fix", "reshard",
+                        "rebalance", "add-node", "del-node", "call",
+                        "set-timeout", "import", "help"):
+            self.assertIn(command, output)
+        for option in ("--cluster-replicas", "--cluster-yes",
+                       "--cluster-replace", "--cluster-simulate"):
+            self.assertIn(option, output)
+
     def test_cluster_three_nodes(self):
         if self.server is None:
             self.skipTest("cluster tests require --server")
