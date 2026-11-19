@@ -2524,6 +2524,38 @@ class BackportRegression(unittest.TestCase):
             self.cmd("XPENDING", key, "g", "IDLE", "not-a-number",
                      "-", "+", "10")
 
+    def test_stream_xackdel(self):
+        key = self.key("xackdel")
+        self.cmd("DEL", key)
+        self.assertEqual(self.cmd("XACKDEL", key, "g", "1-1"), [0, 0])
+        self.cmd("XADD", key, "1-1", "f", "v1")
+        self.cmd("XADD", key, "2-1", "f", "v2")
+        self.cmd("XADD", key, "3-1", "f", "v3")
+        self.assertEqual(self.cmd("XGROUP", "CREATE", key, "g", "0"), b"OK")
+        self.assertEqual(self.cmd("XREADGROUP", "GROUP", "g", "c", "COUNT", "3",
+                                  "STREAMS", key, ">")[0][1].__len__(), 3)
+
+        pending = self.cmd("XPENDING", key, "g")
+        self.assertEqual(pending[0], 3)
+        reply = self.cmd("XACKDEL", key, "g", "1-1", "2-1")
+        self.assertEqual(reply, [2, 2])
+        self.assertEqual(self.cmd("XLEN", key), 1)
+        self.assertEqual(self.cmd("XPENDING", key, "g")[0], 1)
+
+        # Already acknowledged/deleted IDs are reported as zero.
+        self.assertEqual(self.cmd("XACKDEL", key, "g", "1-1"), [0, 0])
+        # KEEPREF acknowledges without removing the PEL entry.
+        self.assertEqual(self.cmd("XACKDEL", key, "g", "3-1", "KEEPREF"), [1, 1])
+        self.assertEqual(self.cmd("XPENDING", key, "g")[0], 1)
+        self.assertEqual(self.cmd("XLEN", key), 0)
+
+        with self.assertRaises(RedisError):
+            self.cmd("XACKDEL", key, "g", "bad-id")
+        wrong = self.key("xackdel:string")
+        self.cmd("SET", wrong, "v")
+        with self.assertRaises(RedisError):
+            self.cmd("XACKDEL", wrong, "g", "1-1")
+
     def test_stream_xautoclaim(self):
         key = self.key("xautoclaim")
         for ms in range(1, 6):

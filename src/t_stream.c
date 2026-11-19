@@ -2281,6 +2281,79 @@ void xsetidCommand(client *c) {
     notifyKeyspaceEvent(NOTIFY_STREAM,"xsetid",c->argv[1],c->db->id);
 }
 
+/* XACKDEL <key> <group> <ID1> [ID2 ...] [KEEPREF]
+ *
+ * Acknowledge pending entries and remove the matching stream entries. The
+ * reply has two elements: the number of acknowledged PEL entries and the
+ * number of stream entries actually deleted. With KEEPREF the PEL entry is
+ * acknowledged but left in place so it can be inspected or deleted later. */
+void xackdelCommand(client *c) {
+    int keepref = 0, j, acked = 0, deleted = 0;
+    robj *o = lookupKeyWrite(c->db,c->argv[1]);
+    streamCG *group = NULL;
+    robj **ids = zmalloc(sizeof(robj*)*(size_t)c->argc);
+
+    if (o == NULL) {
+        addReplyArrayLen(c,2);
+        addReplyLongLong(c,0);
+        addReplyLongLong(c,0);
+        return;
+    }
+    if (checkType(c,o,OBJ_STREAM)) return;
+    group = streamLookupCG(o->ptr,c->argv[2]->ptr);
+    if (group == NULL) {
+        addReplyArrayLen(c,2);
+        addReplyLongLong(c,0);
+        addReplyLongLong(c,0);
+        return;
+    }
+
+    int nids = 0;
+    for (j = 3; j < c->argc; j++) {
+        if (!strcasecmp(c->argv[j]->ptr,"KEEPREF")) {
+            keepref = 1;
+        } else {
+            streamID id;
+            if (streamParseStrictIDOrReply(c,c->argv[j],&id,0) != C_OK) return;
+            ids[nids++] = c->argv[j];
+        }
+    }
+
+    for (j = 0; j < nids; j++) {
+        streamID id;
+        streamParseStrictIDOrReply(c,ids[j],&id,0); /* checked above */
+        unsigned char buf[sizeof(streamID)];
+        streamEncodeID(buf,&id);
+        streamNACK *nack = raxFind(group->pel,buf,sizeof(buf));
+        if (nack != raxNotFound) {
+            if (!keepref) {
+                raxRemove(group->pel,buf,sizeof(buf),NULL);
+                raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
+                streamFreeNACK(nack);
+            }
+            acked++;
+            server.dirty++;
+        }
+        if (streamDeleteItem(o->ptr,&id)) {
+            if (streamCompareID(&id,&((stream*)o->ptr)->max_deleted_entry_id) > 0)
+                ((stream*)o->ptr)->max_deleted_entry_id = id;
+            deleted++;
+            server.dirty++;
+        }
+    }
+
+    if (acked || deleted) {
+        signalModifiedKey(c->db,c->argv[1]);
+        notifyKeyspaceEvent(NOTIFY_STREAM,"xack",c->argv[1],c->db->id);
+        if (deleted)
+            notifyKeyspaceEvent(NOTIFY_STREAM,"xdel",c->argv[1],c->db->id);
+    }
+    zfree(ids);
+    addReplyArrayLen(c,2);
+    addReplyLongLong(c,acked);
+    addReplyLongLong(c,deleted);
+}
+
 /* XACK <key> <group> <id> <id> ... <id>
  *
  * Acknowledge a message as processed. In practical terms we just check the

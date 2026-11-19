@@ -374,6 +374,7 @@ struct redisCommand redisCommandTable[] = {
     {"xgroup",xgroupCommand,-2,"wm",0,NULL,2,2,1,0,0},
     {"xsetid",xsetidCommand,-3,"wmF",0,NULL,1,1,1,0,0},
     {"xack",xackCommand,-4,"wF",0,NULL,1,1,1,0,0},
+    {"xackdel",xackdelCommand,-4,"wF",0,NULL,1,1,1,0,0},
     {"xpending",xpendingCommand,-3,"rR",0,NULL,1,1,1,0,0},
     {"xclaim",xclaimCommand,-6,"wRF",0,NULL,1,1,1,0,0},
     {"xautoclaim",xautoclaimCommand,-6,"wRF",0,NULL,1,1,1,0,0},

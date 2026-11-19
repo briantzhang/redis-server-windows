@@ -2478,6 +2478,7 @@ void xreadCommand(client *c);
 void xgroupCommand(client *c);
 void xsetidCommand(client *c);
 void xackCommand(client *c);
+void xackdelCommand(client *c);
 void xpendingCommand(client *c);
 void xclaimCommand(client *c);
 void xautoclaimCommand(client *c);
