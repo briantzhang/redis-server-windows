@@ -3554,8 +3554,11 @@ static void addReplyCommandDocs(client *c, struct redisCommand *cmd) {
     const char *complexity = doc ? doc->complexity : NULL;
     const char *since = doc ? doc->since : NULL;
     const char *group = doc ? doc->group : "unknown";
+    const char *key_specs = (!doc || doc->spec_at < 0 || doc->spec_n <= 0)
+                            ? NULL : "yes";
     PORT_LONG maplen = 1; /* group */
 
+    if (key_specs) maplen++;
     if (summary) maplen++;
     if (complexity) maplen++;
     if (since) maplen++;
@@ -3563,6 +3566,10 @@ static void addReplyCommandDocs(client *c, struct redisCommand *cmd) {
     if (doc && doc->hist_n > 0) maplen++;
 
     addReplyMapLen(c, maplen);
+    if (key_specs) {
+        addReplyBulkCString(c,"key_specs");
+        addReplyLongLong(c,1);
+    }
     if (summary) {
         addReplyBulkCString(c,"summary");
         addReplyBulkCString(c,summary);

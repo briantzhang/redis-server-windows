@@ -3913,6 +3913,7 @@ class BackportRegression(unittest.TestCase):
         self.assertIn(b"value", get_docs[b"summary"].lower())
         self.assertEqual(get_docs[b"since"], b"1.0.0")
         self.assertEqual(get_docs[b"complexity"], b"O(1)")
+        self.assertEqual(get_docs[b"key_specs"], 1)
         get_key = self.flat_map(get_docs[b"arguments"][0])
         self.assertEqual(get_key[b"name"], b"key")
         self.assertEqual(get_key[b"type"], b"key")

@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp75
+# Redis for Windows 5.0.14.1-bp76
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
@@ -77,7 +77,7 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | ACL 频道权限：`&pattern`、`allchannels`、`resetchannels` | 6.0 | 对 `SUBSCRIBE`/`PSUBSCRIBE`/`PUBLISH`/`SSUBSCRIBE`/`SPUBLISH` 生效 |
 | 脚本内的 ACL 检查 | 6.0 | `EVAL`/`EVALSHA` 里的 `redis.call` 按调用者的用户权限校验命令、键与频道 |
 | `SCRIPT FLUSH [ASYNC\|SYNC]` | 6.2 | `ASYNC` 把脚本缓存交给后台线程释放，`SYNC` 立即清空；Lua 解释器都在主线程重建 |
-| `COMMAND DOCS [command ...]` | 7.0 | 返回命令文档（summary/complexity/since/group/arguments/history）；参数按层级展开，没有文档的命令给出 `group=unknown` |
+| `COMMAND DOCS [command ...]` | 7.0 | 返回命令文档（summary/complexity/since/group/arguments/history/key_specs）；参数按层级展开，没有文档的命令给出 `group=unknown` |
 | `ZRANK` / `ZREVRANK` 的 `WITHSCORE` | 7.2 | 排名同时返回分数；成员或键不存在时返回空数组 |
 | `ACL HELP` | 6.0 | 列出 ACL 子命令；`ACL WHOAMI` 继续对已认证用户放行 |
 | `SCAN ... TYPE type` | 6.0 | 只返回指定类型的键；未知类型名返回空页 |
