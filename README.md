@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp71
+# Redis for Windows 5.0.14.1-bp72
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
@@ -104,7 +104,7 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `tracking-table-max-keys` | 6.0 | TrackingTable 键数上限，CONFIG GET/SET/REWRITE |
 | `INFO clients/stats`、`MEMORY STATS` tracking 字段 | 6.0 / 6.2 | `tracking_clients`、`tracking_total_*`、`clients.tracking.table.*` |
 | `QUIT` | 1.0 | 正式进入命令表，可被 COMMAND/ACL 看到 |
-| `XINFO CONSUMERS` 的 `inactive` | 7.2 | 距上次成功投递的毫秒数；尚未成功投递时为 -1；`idle` 仍按上次尝试交互计算 |
+| `XINFO CONSUMERS` 的 `inactive` | 7.2 | 距上次成功投递的毫秒数；尚未成功投递时为 -1；`idle` 仍按上次尝试交互计算；`XCLAIM`/`XAUTOCLAIM`（含 `JUSTID`）刷新投递时钟 |
 | `UNLINK` / `SWAPDB` / `WAIT` / `ROLE` 回归 | 4.0 / 4.0 / 3.0 / 2.8 | 异步删除、库交换、副本确认等待与角色查询；实现早已存在，bp16 补黑盒覆盖 |
 
 过期时间在秒数乘 1000、相对时间加当前时间之前做有符号 64 位溢出检查，非法值报错且不改动数据。

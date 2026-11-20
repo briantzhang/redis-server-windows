@@ -2809,6 +2809,9 @@ void xclaimCommand(client *c) {
                                     NULL,NULL,STREAM_RWR_RAWENTRIES,NULL);
                 if (!emitted) addReply(c,shared.nullbulk);
             }
+            /* An explicit XCLAIM is a successful delivery even when JUSTID
+             * skips the entry payload. JUSTID only changes the reply shape,
+             * not the consumer's activity clock. */
             arraylen++;
             consumer->active_time = mstime();
 
@@ -3342,6 +3345,13 @@ static void xinfoReplyWithStreamInfo(client *c, stream *s) {
                         streamNACK *nack = pi.data;
                         streamID id;
                         streamDecodeID(pi.key,&id);
+
+                        /* A successful XCLAIM updates the PEL delivery time
+                         * even with JUSTID, so keep the same clock used by
+                         * XINFO CONSUMERS when an entry has been redelivered
+                         * more recently than the cached activity timestamp. */
+                        if (nack->delivery_time > consumer->active_time)
+                            consumer->active_time = nack->delivery_time;
 
                         addReplyMapLen(c,3);
                         addReplyBulkCString(c,"id");

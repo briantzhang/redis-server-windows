@@ -5051,6 +5051,44 @@ class BackportRegression(unittest.TestCase):
         self.assertIn(b"active-time", cfull)
         self.assertGreater(cfull[b"active-time"], 0)
 
+    def test_xinfo_consumers_inactive_tracks_redelivery(self):
+        key = self.key("xinfo:inactive:redelivery")
+        self.cmd("DEL", key)
+        self.cmd("XADD", key, "1-0", "f", "1")
+        self.cmd("XADD", key, "2-0", "f", "2")
+        self.cmd("XGROUP", "CREATE", key, "g", "0")
+        self.cmd("XREADGROUP", "GROUP", "g", "c1", "COUNT", "1",
+                 "STREAMS", key, ">")
+        self.cmd("XREADGROUP", "GROUP", "g", "c2", "COUNT", "1",
+                 "STREAMS", key, ">")
+
+        time.sleep(0.05)
+        before = dict((self.flat_map(row)[b"name"], self.flat_map(row))
+                      for row in self.cmd("XINFO", "CONSUMERS", key, "g"))
+        self.assertGreaterEqual(before[b"c2"][b"inactive"], 40)
+
+        # XCLAIM JUSTID redelivers a message without the entry payload;
+        # the destination consumer's inactive clock must still restart.
+        self.cmd("XCLAIM", key, "g", "c1", "0", "2-0", "JUSTID")
+        time.sleep(0.05)
+        active = dict((self.flat_map(row)[b"name"], self.flat_map(row))
+                      for row in self.cmd("XINFO", "CONSUMERS", key, "g"))
+        self.assertGreaterEqual(active[b"c1"][b"inactive"], 0)
+        self.assertLessEqual(active[b"c1"][b"inactive"],
+                             before[b"c2"][b"inactive"] + 2)
+        self.assertEqual(active[b"c1"][b"pending"], 2)
+        self.assertEqual(active[b"c2"][b"pending"], 0)
+
+        reclaimed = self.cmd("XAUTOCLAIM", key, "g", "c3", "0", "0-0",
+                             "JUSTID")
+        self.assertEqual(len(reclaimed[1]), 2)
+        auto = dict((self.flat_map(row)[b"name"], self.flat_map(row))
+                    for row in self.cmd("XINFO", "CONSUMERS", key, "g"))
+        self.assertGreaterEqual(auto[b"c3"][b"inactive"], 0)
+        self.assertEqual(auto[b"c3"][b"pending"], 2)
+        self.assertEqual(auto[b"c1"][b"pending"], 0)
+        self.assertEqual(auto[b"c2"][b"pending"], 0)
+
     def test_xinfo_consumers_active_time_survives_restart(self):
         if self.server is None:
             self.skipTest("Consumer active-time persistence requires --server")
