@@ -3437,6 +3437,13 @@ class BackportRegression(unittest.TestCase):
 
             shard = self.flat_map(admin.command("CLUSTER", "SHARDS")[0])
             self.assertEqual(shard[b"shard-id"], myid)
+            self.assertEqual(
+                admin.command("CLUSTER", "SHARDS", myid),
+                admin.command("CLUSTER", "SHARDS"))
+            self.assertEqual(
+                admin.command("CLUSTER", "SHARDS", "0"*40), [])
+            with self.assertRaises(RedisError):
+                admin.command("CLUSTER", "SHARDS", myid, "extra")
             help_text = b"\n".join(admin.command("CLUSTER", "HELP"))
             for name in (b"MYSHARDID", b"MIGRATION", b"SLOT-STATS",
                          b"COUNTKEYSINSLOT", b"GETKEYSINSLOT", b"LINKS"):

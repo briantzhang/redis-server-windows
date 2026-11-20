@@ -4498,6 +4498,7 @@ static void clusterReplyShardNode(client *c, clusterNode *node) {
 
 static void clusterReplyShards(client *c) {
     int num_masters = 0;
+    char *filter = c->argc > 2 ? c->argv[2]->ptr : NULL;
     void *replylen = addDeferredMultiBulkLength(c);
     dictIterator *di = dictGetSafeIterator(server.cluster->nodes);
     dictEntry *de;
@@ -4507,6 +4508,7 @@ static void clusterReplyShards(client *c) {
         int start = -1, j, i, healthy_slaves = 0;
 
         if (!nodeIsMaster(node) || node->numslots == 0) continue;
+        if (filter && strncmp(filter,node->name,CLUSTER_NAMELEN)) continue;
         for (i = 0; i < node->numslaves; i++)
             if (!nodeFailed(node->slaves[i]) &&
                 !(node->slaves[i]->flags & CLUSTER_NODE_NOANNOUNCE))
@@ -4808,7 +4810,7 @@ void clusterCommand(client *c) {
 "RESET [hard|soft] -- Reset current node (default: soft).",
 "SET-config-epoch <epoch> - Set config epoch of current node.",
 "SETSLOT <slot> (importing|migrating|stable|node <node-id>) -- Set slot state.",
-"SHARDS -- Return information about slot ranges and their shard nodes.",
+"SHARDS [shard-id] -- Return information about slot ranges and their shard nodes.",
 "REPLICAS <node-id> -- Return <node-id> replicas.",
 "SLOT-STATS [SLOTSRANGE start end ...] -- Return local slot statistics.",
 "SLOTS -- Return information about slots range mappings. Each range is made of:",
@@ -4870,8 +4872,9 @@ NULL
     } else if (!strcasecmp(c->argv[1]->ptr,"slots") && c->argc == 2) {
         /* CLUSTER SLOTS */
         clusterReplyMultiBulkSlots(c);
-    } else if (!strcasecmp(c->argv[1]->ptr,"shards") && c->argc == 2) {
-        /* CLUSTER SHARDS */
+    } else if (!strcasecmp(c->argv[1]->ptr,"shards") &&
+               (c->argc == 2 || c->argc == 3)) {
+        /* CLUSTER SHARDS [shard-id] */
         clusterReplyShards(c);
     } else if (!strcasecmp(c->argv[1]->ptr,"links") && c->argc == 2) {
         /* CLUSTER LINKS */

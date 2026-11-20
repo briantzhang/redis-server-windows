@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp74
+# Redis for Windows 5.0.14.1-bp75
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -77,7 +77,7 @@
 | RESP3 push 帧 | 6.0 | 协议 3 下 Pub/Sub 的订阅确认、消息和 `CLIENT TRACKING` 失效以 `>` 推送，可与命令回复区分 |
 | ACL 键读写权限（`%R~` / `%W~` / `%RW~`） | 7.0 | 每个键模式只授读、只授写或两者；按命令键规格区分读写，`SET`/`SETEX` 按命令级写标志近似 |
 | `FUNCTION LOAD/DELETE/FLUSH/LIST/DUMP/RESTORE`、`FCALL`、`FCALL_RO` | 7.0 | Lua 函数按库管理并随 RDB/AOF 保存；DUMP 为本版私有格式 |
-| `CLUSTER SHARDS` / `CLUSTER LINKS` | 7.0 | 分片视角的槽位与节点汇总；总线连接的方向、建立时间与收发计数 |
+| `CLUSTER SHARDS [shard-id]` / `CLUSTER LINKS` | 7.0 | 分片视角的槽位与节点汇总；总线连接的方向、建立时间与收发计数 |
 | `FAILOVER [TO host port [FORCE]] [ABORT] [TIMEOUT ms]` | 6.2 | 主库暂停普通客户端写入，等目标副本 ACK 追平后以副本身份 `PSYNC ... FAILOVER` 退位；目标副本自我提升 |
 | `sanitize-dump-payload no\|yes\|clients` | 7.0 | `RESTORE` 前深校验 DUMP 内部编码：ziplist、listpack、intset、zipmap、quicklist、stream 的 PEL 与消费组；校验失败不落库 |
 | `repl-diskless-load disabled\|on-empty-db\|swapdb` | 7.0 | 从库直接解析流式 RDB；`swapdb` 装进临时库，成功后一次性替换，失败保留旧数据 |
