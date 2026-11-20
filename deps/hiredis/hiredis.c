@@ -48,6 +48,8 @@
 #ifdef _WIN32
 #include "win32_hiredis.h"
 #endif
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 static redisReply *createReplyObject(int type);
 static void *createStringObject(const redisReadTask *task, char *str, size_t len);
@@ -598,6 +600,199 @@ redisReader *redisReaderCreate(void) {
 	return redisReaderCreateWithFunctions(&defaultFunctions);
 }
 
+static char *redisTlsDupString(const char *s) {
+	size_t len = strlen(s) + 1;
+	char *copy = malloc(len);
+	if (copy != NULL)
+		memcpy(copy, s, len);
+	return copy;
+}
+
+static void redisTlsSetError(redisContext *c, int type, const char *prefix) {
+	char buf[256];
+	unsigned long err = ERR_get_error();
+	size_t len;
+
+	if (err == 0 && type != REDIS_ERR_SSL) {
+		__redisSetError(c, type, prefix);
+		return;
+	}
+
+	buf[0] = '\0';
+	if (err != 0)
+		ERR_error_string_n(err, buf, sizeof(buf));
+	len = strlen(buf);
+	if (prefix != NULL && len + 2 < sizeof(buf)) {
+		memmove(buf + strlen(prefix) + 2, buf, len + 1);
+		memcpy(buf, prefix, strlen(prefix));
+		memcpy(buf + strlen(prefix), ": ", 2);
+	}
+	__redisSetError(c, type, buf);
+}
+
+static void redisTlsCleanup(redisContext *c) {
+	SSL *ssl = (SSL *)c->tls_ssl;
+
+	if (ssl != NULL) {
+		SSL_free(ssl);
+		c->tls_ssl = NULL;
+		c->tls_in_bio = NULL;
+		c->tls_out_bio = NULL;
+	}
+	if (c->tls_ctx != NULL) {
+		SSL_CTX_free((SSL_CTX *)c->tls_ctx);
+		c->tls_ctx = NULL;
+	}
+}
+
+static ssize_t redisTlsRawWrite(redisContext *c, const void *buf, size_t len) {
+	return write(c->fd, buf, len);
+}
+
+static int redisTlsDrainOutput(redisContext *c) {
+	BIO *out = (BIO *)c->tls_out_bio;
+	char *data;
+	long pending;
+	ssize_t nwritten, total;
+
+	while ((pending = BIO_get_mem_data(out, &data)) > 0) {
+		total = redisTlsRawWrite(c, data, (size_t)pending);
+		if (total <= 0) {
+			__redisSetError(c, REDIS_ERR_IO, NULL);
+			return REDIS_ERR;
+		}
+		nwritten = total;
+		while (nwritten < pending) {
+			total = redisTlsRawWrite(c, data + nwritten, (size_t)(pending - nwritten));
+			if (total <= 0) {
+				__redisSetError(c, REDIS_ERR_IO, NULL);
+				return REDIS_ERR;
+			}
+			nwritten += total;
+		}
+		BIO_reset(out);
+	}
+	return REDIS_OK;
+}
+
+static int redisTlsHandshake(redisContext *c) {
+	SSL *ssl = (SSL *)c->tls_ssl;
+	BIO *in = (BIO *)c->tls_in_bio;
+	char buf[1024 * 16];
+	int rc, sslerr, nread, i;
+
+	SSL_set_connect_state(ssl);
+	for (i = 0; i < 32; i++) {
+		rc = SSL_connect(ssl);
+		if (redisTlsDrainOutput(c) == REDIS_ERR)
+			return REDIS_ERR;
+		if (rc == 1)
+			return REDIS_OK;
+
+		sslerr = SSL_get_error(ssl, rc);
+		if (sslerr == SSL_ERROR_WANT_WRITE)
+			continue;
+		if (sslerr != SSL_ERROR_WANT_READ) {
+			redisTlsSetError(c, REDIS_ERR_SSL, "TLS handshake failed");
+			return REDIS_ERR;
+		}
+
+		nread = (int)read(c->fd, buf, sizeof(buf));
+		if (nread > 0) {
+			BIO_write(in, buf, nread);
+			continue;
+		}
+		if (nread == 0 || (nread < 0 && errno != EAGAIN && errno != EINTR)) {
+			__redisSetError(c, nread == 0 ? REDIS_ERR_EOF : REDIS_ERR_IO,
+				nread == 0 ? "Server closed the connection" : NULL);
+			return REDIS_ERR;
+		}
+	}
+	__redisSetError(c, REDIS_ERR_OTHER, "TLS handshake timed out");
+	return REDIS_ERR;
+}
+
+static int redisTlsSetup(redisContext *c, const char *host) {
+	SSL_CTX *ctx;
+	SSL *ssl;
+	BIO *in, *out;
+	const char *verify_host;
+
+	ctx = SSL_CTX_new(TLS_client_method());
+	if (ctx == NULL) {
+		redisTlsSetError(c, REDIS_ERR_SSL, "TLS context creation failed");
+		return REDIS_ERR;
+	}
+	c->tls_ctx = ctx;
+
+	if (c->tls_verify) {
+		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+		if (c->tls_ca_cert != NULL) {
+			if (SSL_CTX_load_verify_locations(ctx, c->tls_ca_cert, NULL) != 1) {
+				redisTlsSetError(c, REDIS_ERR_SSL, "Could not load CA certificate");
+				return REDIS_ERR;
+			}
+		} else if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+			redisTlsSetError(c, REDIS_ERR_SSL, "Could not load default CA certificates");
+			return REDIS_ERR;
+		}
+	} else {
+		SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+	}
+
+	if (c->tls_cert != NULL) {
+		if (SSL_CTX_use_certificate_chain_file(ctx, c->tls_cert) != 1) {
+			redisTlsSetError(c, REDIS_ERR_SSL, "Could not load client certificate");
+			return REDIS_ERR;
+		}
+		if (c->tls_key == NULL)
+			c->tls_key = redisTlsDupString(c->tls_cert);
+		if (SSL_CTX_use_PrivateKey_file(ctx, c->tls_key, SSL_FILETYPE_PEM) != 1) {
+			redisTlsSetError(c, REDIS_ERR_SSL, "Could not load client private key");
+			return REDIS_ERR;
+		}
+		if (SSL_CTX_check_private_key(ctx) != 1) {
+			redisTlsSetError(c, REDIS_ERR_SSL, "Client certificate and key do not match");
+			return REDIS_ERR;
+		}
+	}
+
+	ssl = SSL_new(ctx);
+	if (ssl == NULL) {
+		redisTlsSetError(c, REDIS_ERR_SSL, "TLS connection creation failed");
+		return REDIS_ERR;
+	}
+	c->tls_ssl = ssl;
+
+	in = BIO_new(BIO_s_mem());
+	out = BIO_new(BIO_s_mem());
+	if (in == NULL || out == NULL) {
+		redisTlsSetError(c, REDIS_ERR_SSL, "TLS BIO creation failed");
+		return REDIS_ERR;
+	}
+	c->tls_in_bio = in;
+	c->tls_out_bio = out;
+	SSL_set_bio(ssl, in, out);
+
+	verify_host = (c->tls_host != NULL) ? c->tls_host : host;
+	if (verify_host != NULL && verify_host[0] != '\0') {
+		SSL_set_tlsext_host_name(ssl, verify_host);
+		if (c->tls_verify)
+			SSL_set1_host(ssl, verify_host);
+	}
+	return REDIS_OK;
+}
+
+static void redisContextInitTlsStrings(redisContext *c, const char *host,
+	const char *ca_cert, const char *cert, const char *key, int verify)
+{
+	if (host != NULL) c->tls_host = redisTlsDupString(host);
+	if (ca_cert != NULL) c->tls_ca_cert = redisTlsDupString(ca_cert);
+	if (cert != NULL) c->tls_cert = redisTlsDupString(cert);
+	if (key != NULL) c->tls_key = redisTlsDupString(key);
+	c->tls_verify = verify;
+}
+
 static redisContext *redisContextInit(void) {
 	redisContext *c;
 
@@ -607,6 +802,7 @@ static redisContext *redisContextInit(void) {
 
 	c->err = 0;
 	c->errstr[0] = '\0';
+	c->fd = -1;
 	c->obuf = sdsempty();
 	c->reader = redisReaderCreate();
 	c->tcp.host = NULL;
@@ -625,7 +821,8 @@ static redisContext *redisContextInit(void) {
 void redisFree(redisContext *c) {
 	if (c == NULL)
 		return;
-	if (c->fd > 0)
+	redisTlsCleanup(c);
+	if (c->fd >= 0)
 		close(c->fd);
 	if (c->obuf != NULL)
 		sdsfree(c->obuf);
@@ -639,6 +836,14 @@ void redisFree(redisContext *c) {
 		free(c->unix_sock.path);
 	if (c->timeout)
 		free(c->timeout);
+	if (c->tls_host)
+		free(c->tls_host);
+	if (c->tls_ca_cert)
+		free(c->tls_ca_cert);
+	if (c->tls_cert)
+		free(c->tls_cert);
+	if (c->tls_key)
+		free(c->tls_key);
 	free(c);
 }
 
@@ -650,12 +855,16 @@ int redisFreeKeepFd(redisContext *c) {
 }
 
 int redisReconnect(redisContext *c) {
+	int rc;
+
 	c->err = 0;
 	memset(c->errstr, '\0', strlen(c->errstr));
 
-	if (c->fd > 0) {
+	if (c->fd >= 0) {
 		close(c->fd);
+		c->fd = -1;
 	}
+	redisTlsCleanup(c);
 
 	sdsfree(c->obuf);
 	redisReaderFree(c->reader);
@@ -664,17 +873,22 @@ int redisReconnect(redisContext *c) {
 	c->reader = redisReaderCreate();
 
 	if (c->connection_type == REDIS_CONN_TCP) {
-		return redisContextConnectBindTcp(c, c->tcp.host, c->tcp.port,
+		rc = redisContextConnectBindTcp(c, c->tcp.host, c->tcp.port,
 			c->timeout, c->tcp.source_addr);
     } else if (c->connection_type == REDIS_CONN_UNIX) {
-		return redisContextConnectUnix(c, c->unix_sock.path, c->timeout);
+		rc = redisContextConnectUnix(c, c->unix_sock.path, c->timeout);
     } else {
 		/* Something bad happened here and shouldn't have. There isn't
 		   enough information in the context to reconnect. */
 		__redisSetError(c, REDIS_ERR_OTHER, "Not enough information to reconnect");
+		return REDIS_ERR;
 	}
+	if (rc == REDIS_ERR || !(c->flags & REDIS_TLS))
+		return rc;
 
-	return REDIS_ERR;
+	if (redisTlsSetup(c, c->tcp.host) == REDIS_ERR)
+		return REDIS_ERR;
+	return redisTlsHandshake(c);
 }
 
 /* Connect to a Redis instance. On error the field error in the returned
@@ -689,6 +903,26 @@ redisContext *redisConnect(const char *ip, int port) {
 
 	c->flags |= REDIS_BLOCK;
 	redisContextConnectTcp(c, ip, port, NULL);
+	return c;
+}
+
+redisContext *redisConnectTLS(const char *ip, int port, const char *ca_cert,
+	const char *cert, const char *key, const char *sni, int verify)
+{
+	redisContext *c;
+
+	c = redisContextInit();
+	if (c == NULL)
+		return NULL;
+
+	c->flags |= REDIS_BLOCK | REDIS_TLS;
+	redisContextInitTlsStrings(c, sni, ca_cert, cert, key, verify);
+	redisContextConnectTcp(c, ip, port, NULL);
+	if (c->err)
+		return c;
+	if (redisTlsSetup(c, ip) == REDIS_ERR)
+		return c;
+	redisTlsHandshake(c);
 	return c;
 }
 
@@ -812,11 +1046,66 @@ int redisEnableKeepAlive(redisContext *c) {
  * see if there is a reply available. */
 int redisBufferRead(redisContext *c) {
 	char buf[1024 * 16];
-	int nread;
+	int nread, sslrc, sslerr, i, got;
 
 	/* Return early when the context has seen an error. */
 	if (c->err)
 		return REDIS_ERR;
+
+	if (c->flags & REDIS_TLS) {
+		SSL *ssl = (SSL *)c->tls_ssl;
+		BIO *in = (BIO *)c->tls_in_bio;
+
+		if (ssl == NULL || in == NULL) {
+			__redisSetError(c, REDIS_ERR_OTHER, "TLS connection is not initialized");
+			return REDIS_ERR;
+		}
+		for (i = 0; i < 32; i++) {
+			sslrc = SSL_read(ssl, buf, sizeof(buf));
+			if (sslrc > 0) {
+				if (redisReaderFeed(c->reader, buf, sslrc) != REDIS_OK) {
+					__redisSetError(c, c->reader->err, c->reader->errstr);
+					return REDIS_ERR;
+				}
+				/* One decrypted record is enough for this read cycle, just as
+				 * the plaintext path returns after a single socket read. The
+				 * blocking command loop calls us again when it needs more. */
+				sslerr = SSL_ERROR_NONE;
+				break;
+			}
+			sslerr = SSL_get_error(ssl, sslrc);
+			if (sslerr == SSL_ERROR_WANT_WRITE) {
+				if (redisTlsDrainOutput(c) == REDIS_ERR)
+					return REDIS_ERR;
+				continue;
+			}
+			if (sslerr != SSL_ERROR_WANT_READ)
+				break;
+
+			nread = (int)read(c->fd, buf, sizeof(buf));
+			if (nread > 0) {
+				BIO_write(in, buf, nread);
+				continue;
+			}
+			if (nread == 0) {
+				__redisSetError(c, REDIS_ERR_EOF, "Server closed the connection");
+				return REDIS_ERR;
+			}
+			if (errno != EAGAIN && errno != EINTR) {
+				__redisSetError(c, REDIS_ERR_IO, NULL);
+				return REDIS_ERR;
+			}
+			break;
+		}
+		got = (sslrc > 0) ? REDIS_OK : REDIS_ERR;
+		if (got == REDIS_ERR) {
+			if (sslerr == SSL_ERROR_ZERO_RETURN)
+				__redisSetError(c, REDIS_ERR_EOF, "Server closed the connection");
+			else
+				redisTlsSetError(c, REDIS_ERR_SSL, "TLS read failed");
+		}
+		return got;
+	}
 
 	nread = (int)read(c->fd, buf, sizeof(buf));                                   WIN_PORT_FIX /* cast (int) */
 		if (nread == -1) {
@@ -887,7 +1176,34 @@ int redisBufferWrite(redisContext *c, int *done) {
 	if (c->err)
 		return REDIS_ERR;
 
-	if (sdslen(c->obuf) > 0) {
+	if ((c->flags & REDIS_TLS) && sdslen(c->obuf) > 0) {
+		SSL *ssl = (SSL *)c->tls_ssl;
+		size_t total = 0;
+		int sslrc;
+
+		if (ssl == NULL) {
+			__redisSetError(c, REDIS_ERR_OTHER, "TLS connection is not initialized");
+			return REDIS_ERR;
+		}
+		while (total < sdslen(c->obuf)) {
+			sslrc = SSL_write(ssl, c->obuf + total, (int)(sdslen(c->obuf) - total));
+			if (sslrc <= 0) {
+				if (SSL_get_error(ssl, sslrc) == SSL_ERROR_WANT_WRITE) {
+					if (redisTlsDrainOutput(c) == REDIS_ERR)
+						return REDIS_ERR;
+					continue;
+				}
+				redisTlsSetError(c, REDIS_ERR_SSL, "TLS write failed");
+				return REDIS_ERR;
+			}
+			total += (size_t)sslrc;
+		}
+		if (redisTlsDrainOutput(c) == REDIS_ERR)
+			return REDIS_ERR;
+		sdsfree(c->obuf);
+		c->obuf = sdsempty();
+	}
+	else if (sdslen(c->obuf) > 0) {
 		nwritten = (int)write(c->fd, c->obuf, sdslen(c->obuf));                   WIN_PORT_FIX /* cast (int) */
 			if (nwritten == -1) {
 				if ((errno == EAGAIN && !(c->flags & REDIS_BLOCK)) || (errno == EINTR)) {

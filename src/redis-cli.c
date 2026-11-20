@@ -212,6 +212,12 @@ static struct config {
     char *hostip;
     int hostport;
     char *hostsocket;
+    int tls;
+    int tls_insecure;
+    char *tls_cacert;
+    char *tls_cert;
+    char *tls_key;
+    char *tls_sni;
     PORT_LONG repeat;
     PORT_LONG interval;
     int dbnum;
@@ -406,17 +412,25 @@ static sds percentDecode(const char *pe, size_t len) {
  *  [1]: https://www.iana.org/assignments/uri-schemes/prov/redis */
 static void parseRedisUri(const char *uri) {
 
-    const char *scheme = "redis://";
+    const char *scheme;
     const char *curr = uri;
     const char *end = uri + strlen(uri);
     const char *userinfo, *username, *port, *host, *path;
+    size_t schemelen;
 
     /* URI must start with a valid scheme. */
-    if (strncasecmp(scheme, curr, strlen(scheme))) {
+    if (!strncasecmp("rediss://", curr, 9)) {
+        scheme = "rediss://";
+        schemelen = 9;
+        config.tls = 1;
+    } else if (!strncasecmp("redis://", curr, 8)) {
+        scheme = "redis://";
+        schemelen = 8;
+    } else {
         fprintf(stderr,"Invalid URI scheme\n");
         exit(1);
     }
-    curr += strlen(scheme);
+    curr += schemelen;
     if (curr == end) return;
 
     /* Extract user info. */
@@ -797,6 +811,15 @@ static int cliSelect(void) {
  *      CC_FORCE: The connection is performed even if there is already
  *                a connected socket.
  *      CC_QUIET: Don't print errors if connection fails. */
+static redisContext *cliCreateContext(const char *ip, int port) {
+    if (config.tls) {
+        return redisConnectTLS(ip, port, config.tls_cacert, config.tls_cert,
+            config.tls_key, config.tls_sni ? config.tls_sni : ip,
+            !config.tls_insecure);
+    }
+    return redisConnect(ip, port);
+}
+
 static int cliConnect(int flags) {
     if (context == NULL || flags & CC_FORCE) {
         if (context != NULL) {
@@ -804,7 +827,7 @@ static int cliConnect(int flags) {
         }
 
         if (config.hostsocket == NULL) {
-            context = redisConnect(config.hostip,config.hostport);
+            context = cliCreateContext(config.hostip,config.hostport);
         } else {
             context = redisConnectUnix(config.hostsocket);
         }
@@ -1255,7 +1278,7 @@ static redisReply *reconnectingRedisCommand(redisContext *c, const char *fmt, ..
             fflush(stdout);
 
             redisFree(c);
-            c = redisConnect(config.hostip,config.hostport);
+            c = cliCreateContext(config.hostip,config.hostport);
             usleep(1000000);
         }
 
@@ -1281,21 +1304,6 @@ static redisReply *reconnectingRedisCommand(redisContext *c, const char *fmt, ..
 
 static int parseOptions(int argc, char **argv) {
     int i;
-
-    /* The bundled hiredis has no TLS transport. Fail with a clear message
-     * instead of attempting a plaintext handshake against a TLS port. */
-    for (i = 1; i < argc; i++) {
-        if (!strcmp(argv[i],"--tls") || !strcmp(argv[i],"--sni") ||
-            !strcmp(argv[i],"--cacert") || !strcmp(argv[i],"--cert") ||
-            !strcmp(argv[i],"--key") || !strcmp(argv[i],"--insecure") ||
-            !strncmp(argv[i],"rediss://",9)) {
-            fprintf(stderr,
-                "This Windows build of redis-cli does not support TLS. "
-                "Use a TLS-capable client for tls-port connections; "
-                "the bundled redis-cli only speaks plaintext.\n");
-            exit(1);
-        }
-    }
 
     for (i = 1; i < argc; i++) {
         int lastarg = i==argc-1;
@@ -1326,6 +1334,19 @@ static int parseOptions(int argc, char **argv) {
             config.auth = argv[++i];
         } else if (!strcmp(argv[i],"-u") && !lastarg) {
             parseRedisUri(argv[++i]);
+        } else if (!strcmp(argv[i],"--tls")) {
+            config.tls = 1;
+        } else if (!strcmp(argv[i],"--sni") && !lastarg) {
+            config.tls_sni = argv[++i];
+        } else if (!strcmp(argv[i],"--cacert") && !lastarg) {
+            config.tls_cacert = argv[++i];
+        } else if (!strcmp(argv[i],"--cert") && !lastarg) {
+            config.tls_cert = argv[++i];
+        } else if (!strcmp(argv[i],"--key") && !lastarg) {
+            config.tls_key = argv[++i];
+        } else if (!strcmp(argv[i],"--insecure")) {
+            config.tls_insecure = 1;
+            config.tls = 1;
         } else if (!strcmp(argv[i],"--raw")) {
             config.output = OUTPUT_RAW;
         } else if (!strcmp(argv[i],"--no-raw")) {
@@ -1545,7 +1566,13 @@ static void usage(void) {
 "                     You can also use the " REDIS_CLI_AUTH_ENV " environment\n"
 "                     variable to pass this password more safely\n"
 "                     (if both are used, this argument takes predecence).\n"
-"  -u <uri>           Server URI (rediss:// is not supported in this build).\n"
+"  -u <uri>           Server URI (redis:// or rediss://).\n"
+"  --tls              Use TLS when connecting to the server.\n"
+"  --sni <name>       Server name for TLS SNI and hostname verification.\n"
+"  --cacert <file>    CA certificate used to verify the server.\n"
+"  --cert <file>      Client certificate chain file.\n"
+"  --key <file>       Client private key file.\n"
+"  --insecure         Skip TLS certificate verification.\n"
 "  -r <repeat>        Execute specified command N times.\n"
 "  -i <interval>      When -r is used, waits <interval> seconds per command.\n"
 "                     It is possible to specify sub-second times like -i 0.1.\n"
@@ -2324,7 +2351,7 @@ cleanup:
 
 static int clusterManagerNodeConnect(clusterManagerNode *node) {
     if (node->context) redisFree(node->context);
-    node->context = redisConnect(node->ip, node->port);
+    node->context = cliCreateContext(node->ip, node->port);
     if (node->context->err) {
         fprintf(stderr,"Could not connect to Redis at ");
         fprintf(stderr,"%s:%d: %s\n", node->ip, node->port,
@@ -5578,7 +5605,7 @@ static int clusterManagerCommandImport(int argc, char **argv) {
     char *reply_err = NULL;
     redisReply *src_reply = NULL;
     // Connect to the source node.
-    redisContext *src_ctx = redisConnect(src_ip, src_port);
+    redisContext *src_ctx = cliCreateContext(src_ip, src_port);
     if (src_ctx->err) {
         success = 0;
         fprintf(stderr,"Could not connect to Redis at %s:%d: %s.\n", src_ip,

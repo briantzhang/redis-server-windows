@@ -79,6 +79,9 @@
 /* Flag that is set when we should set SO_REUSEADDR before calling bind() */
 #define REDIS_REUSEADDR 0x80
 
+/* Flag that is set when the blocking connection uses TLS. */
+#define REDIS_TLS 0x100
+
 #define REDIS_KEEPALIVE_INTERVAL 15 /* seconds */
 
 /* number of times we retry to connect in the case of EADDRNOTAVAIL and
@@ -163,10 +166,24 @@ typedef struct redisContext {
         char *path;
     } unix_sock;
 
+    /* TLS state is owned by the context and freed with redisFree(). */
+    void *tls_ctx;
+    void *tls_ssl;
+    void *tls_in_bio;
+    void *tls_out_bio;
+    char *tls_host;
+    char *tls_ca_cert;
+    char *tls_cert;
+    char *tls_key;
+    int tls_verify;
+
 } redisContext;
 
 redisContext *redisConnect(const char *ip, int port);
 redisContext *redisConnectWithTimeout(const char *ip, int port, const struct timeval tv);
+redisContext *redisConnectTLS(const char *ip, int port, const char *ca_cert,
+                              const char *cert, const char *key,
+                              const char *sni, int verify);
 redisContext *redisConnectNonBlock(const char *ip, int port);
 redisContext *redisConnectBindNonBlock(const char *ip, int port,
                                        const char *source_addr);

@@ -48,6 +48,7 @@
 #define REDIS_ERR_EOF 3 /* End of file */
 #define REDIS_ERR_PROTOCOL 4 /* Protocol error */
 #define REDIS_ERR_OOM 5 /* Out of memory */
+#define REDIS_ERR_SSL 6 /* TLS error */
 #define REDIS_ERR_OTHER 2 /* Everything else... */
 
 #define REDIS_REPLY_STRING 1

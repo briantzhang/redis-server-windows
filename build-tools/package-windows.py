@@ -8,7 +8,7 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '5.0.14.1-bp80'
+VERSION = '5.0.14.1-bp81'
 NAME = 'Redis-x64-' + VERSION
 DIST = ROOT / 'dist'
 PKG = DIST / NAME
@@ -120,8 +120,10 @@ Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；
 检查版本：redis-server.exe --version
 测试连接：redis-cli.exe -h 127.0.0.1 -p 6379 PING
 TLS：按 redis.windows.conf 的注释配置 tls-port 和证书后重启；必须保留
-      libssl-3-x64.dll 与 libcrypto-3-x64.dll。随包 redis-cli 不支持 TLS，
-      请用支持 TLS 的客户端连接，许可证见 licenses/openssl-LICENSE.txt。
+      libssl-3-x64.dll 与 libcrypto-3-x64.dll。随包 redis-cli 可用
+      --tls --cacert <CA> -p <tls-port> PING 连接；也可用 rediss:// URI。
+      自签名测试环境可加 --insecure；双向认证用 --cert 与 --key。
+      OpenSSL 许可证见 licenses/openssl-LICENSE.txt。
       主从复制加密：从库设置 tls-replication yes，并用 replicaof 指向主库
       tls-port；主库要求客户端证书时从库也要配置证书和私钥。主库开
       repl-diskless-sync yes 时 TLS 从库同样无盘同步。

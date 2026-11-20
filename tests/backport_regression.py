@@ -3094,6 +3094,43 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("FCALL", "echo", "0", "again"), b"again")
         self.assertEqual(self.cmd("FUNCTION", "FLUSH"), b"OK")
 
+    def test_redis_cli_tls_ping(self):
+        """The Windows redis-cli negotiates TLS and verifies test certificates."""
+        cli = Path(OPTIONS.server).with_name("redis-cli.exe") if OPTIONS.server else None
+        if cli is None or not cli.exists() or self.server.tls is None:
+            self.skipTest("redis-cli TLS tests require --server and openssl")
+        certs = self.server.tls
+        port = str(self.server.tls_port)
+        loops = ("127.0.0.1", "localhost")
+        for ca_mode in ("--cacert", "--insecure"):
+            for host in loops:
+                args = [str(cli), "--tls", "-h", host, "-p", port, "PING"]
+                if ca_mode == "--cacert":
+                    args[1:1] = [ca_mode, str(certs["ca"])]
+                else:
+                    args.insert(1, ca_mode)
+                result = subprocess.run(
+                    args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    timeout=20)
+                self.assertEqual(
+                    result.returncode, 0,
+                    "%s\n%s" % (args, result.stdout.decode("utf-8", "replace")))
+                self.assertIn(b"PONG", result.stdout)
+
+        uri = "rediss://127.0.0.1:%s" % port
+        result = subprocess.run(
+            [str(cli), "-u", uri, "--insecure", "PING"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
+        self.assertIn(b"PONG", result.stdout)
+
+        result = subprocess.run(
+            [str(cli), "--tls", "-h", "127.0.0.1", "-p", port,
+             "--cacert", str(certs["client_cert"]), "PING"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"certificate", result.stdout.lower())
+
     def test_redis_cli_cluster_help(self):
         """The Windows redis-cli build exposes the full cluster manager set."""
         cli = Path(OPTIONS.server).with_name("redis-cli.exe") if OPTIONS.server else None
