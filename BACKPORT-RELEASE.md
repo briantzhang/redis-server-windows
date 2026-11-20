@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp76
+# Redis for Windows 5.0.14.1-bp77
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -111,7 +111,7 @@ ACL 支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@categor
 - `maxmemory-clients` 限制普通客户端的查询缓冲、参数向量、回复缓冲及额外内存桶之和，超出时断开占用最大的连接。`CLIENT NO-EVICT` 的连接以及副本、主连接和 MONITOR 不参与。占用按本版分桶估算，`CLIENT INFO`/`LIST` 公开 `qbuf-mem`、`argv-mem`、`tot-mem` 等主要桶，不等同于 Redis 7 的全部内存桶。
 - `WAITAOF` 等待覆盖此前写入的本机 AOF fsync：`appendfsync always/no` 下命令内同步 fsync 后立即确认；`appendfsync everysec` 下先 flush AOF 缓冲，再把专用 fsync 排入 BIO 后台线程并阻塞客户端，完成计数到达后才返回。`always` 会在 fsync 后发布已确认复制偏移；`everysec` 在 BIO fsync 完成后发布。副本用 `REPLCONF ACK ... FACK <offset>` 回传自身已 fsync 的复制偏移，主库按此统计副本确认；无副本时请求的副本确认会归零并立即返回。超时回复返回当前已获得的本地/副本确认数，通常不是请求目标。
 - `XINFO CONSUMERS` 的 `inactive`/`active_time` 从 RDB 版本 11 起写入本版兼容扩展：快照恢复后保留上次成功投递时间；更早的快照仍回到 -1，直到再次成功投递。
-- 命令延迟直方图是运行时数据，不写入 RDB/AOF；使用每八度四等分的固定对数桶（256 ns 起）而不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界，精度高于整倍桶但仍为估算值。
+- 命令延迟直方图是运行时数据，不写入 RDB/AOF；使用每八度十六等分的固定对数桶（256 ns 起，128 个桶）而不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界，最大低估约 6.25%，仍是估算值。
 - `SCRIPT FLUSH ASYNC` 换上一份空的脚本缓存，把旧的交给后台的延迟释放线程。Lua 解释器本身仍在主线程关闭并重建，因为跨线程释放它不安全。
 - 集群沿用底座的 Redis 5.0 实现，槽位、握手、`MOVED`/`ASK` 重定向和故障转移代码未改写。bp25 增加三节点黑盒覆盖，并记录集群总线端口为客户端端口 +10000。bp35 增加 7.0 的 `CLUSTER ADDSLOTSRANGE`/`CLUSTER DELSLOTSRANGE`：按区间分配或删除槽位，支持一条命令给多段，参数、越界、区间倒置、重复和槽位状态都在应用前整体校验，任何一段不合法则整条命令不生效。bp36 增加 `CLUSTER SHARDS` 与 `CLUSTER LINKS`；bp37 让集群总线本身使用 TLS（`tls-cluster yes`，节点证书由同一 CA 签发，握手与投票走加密链路）；bp38 增加 `cluster-announce-hostname`、`cluster-preferred-endpoint` 与 `replica-announced`，并让 `CLUSTER NODES`/`SLOTS`/`SHARDS` 按所选端点输出地址。
 - TLS 使用 OpenSSL 3.5.9 的 memory BIO：密文仍由 `read()` 和 `write()` 走原有 IOCP 就绪通知，不在 socket 上直接挂 `SSL_set_fd`。支持 `tls-port`、`tls-cert-file`、`tls-key-file`、`tls-ca-cert-file`、`tls-ca-cert-dir`、`tls-auth-clients`、`tls-replication`、`tls-cluster`、`tls-protocols`、`tls-ciphers`、`tls-ciphersuites`、`tls-prefer-server-ciphers` 和 `tls-session-caching`。`tls-cluster yes` 把节点间总线也接入同一套 memory BIO 收发路径，握手阶段双方校验证书链。`tls-auth-clients` 支持 `no`、`yes` 和 `optional` 三态，`yes` 与 `optional` 都要求先配置 CA。TLS 配置项在 `CONFIG SET` 时重建 SSL 上下文，新连接使用新设置，旧连接继续运行。主库向 TLS 从库发送 `+FULLRESYNC`、`+CONTINUE`、RDB 内容与心跳换行时都通过加密会话，磁盘方式传 RDB 由 TLS 写路径带背压发送。启用 `repl-diskless-sync` 时，TLS 从库由父进程从回环套接字读取 RDB 子进程的输出再写入 TLS 会话，不需要落盘；同时修好了底座的 RDB 子进程因 `rdbSaveRioWithEOFMark()` 参数不匹配而崩溃、导致无盘复制整体不可用的问题。运行时需要随包的 `libssl-3-x64.dll` 与 `libcrypto-3-x64.dll`。

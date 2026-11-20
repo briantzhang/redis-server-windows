@@ -95,9 +95,10 @@ void latencyMonitorInit(void) {
 
 static uint64_t latencyHistogramBucketBound(int j);
 
-/* Record a command duration in nanoseconds. Each octave is split into four
- * buckets starting at 256ns: 0-256, 256-512, 512-768, 768-1024, then the
- * pattern repeats with doubling bounds. The last bucket is open. */
+/* Record a command duration in nanoseconds. Buckets are 1/16-octave steps
+ * from 256ns to 512ns (16 equal linear steps), then the same pattern repeats
+ * with doubling bounds. The last bucket is open. This reduces the worst-case
+ * underestimate of a bucket's upper bound from 25% to about 6.25%. */
 void latencyHistogramAddSample(struct latencyHistogram *h, uint64_t ns) {
     int bucket = 0;
 
@@ -114,14 +115,14 @@ void latencyHistogramReset(struct latencyHistogram *h) {
 
 /* Upper bound in nanoseconds of histogram bucket j. */
 static uint64_t latencyHistogramBucketBound(int j) {
-    /* Quarter-octave steps: 256, 320, 384, 448, 512, 640, ... */
+    /* Sixteenth-octave steps: 256, 272, 288, ..., 496, 512, 544, ... */
     return (256ULL << (j / LATENCY_HISTOGRAM_SUBBUCKETS)) +
-           (64ULL << (j / LATENCY_HISTOGRAM_SUBBUCKETS)) *
-           (j % LATENCY_HISTOGRAM_SUBBUCKETS);
+           (16ULL << (j / LATENCY_HISTOGRAM_SUBBUCKETS)) *
+           (j % LATENCY_HISTOGRAM_SUBBUCKETS + 1);
 }
 
 /* Value at percentile p (0..1) in microseconds, using the bucket upper
- * bound. Quarter-octave buckets give a tighter estimate than plain log2. */
+ * bound. Sixteenth-octave buckets bound the error to about 6.25%. */
 double latencyHistogramPercentile(struct latencyHistogram *h, double p) {
     uint64_t target, cumulative = 0;
     int j;

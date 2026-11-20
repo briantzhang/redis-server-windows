@@ -5079,6 +5079,9 @@ class BackportRegression(unittest.TestCase):
         self.assertTrue(buckets)
         self.assertTrue(all(isinstance(item, tuple) for item in buckets))
         self.assertEqual(list(dict(buckets).values())[-1], entry[b"calls"])
+        bounds = [bound for bound, _ in buckets]
+        self.assertEqual(bounds, sorted(bounds))
+        self.assertLessEqual(bounds[0], 1)
 
     def test_xinfo_consumers_inactive(self):
         key = self.key("xinfo:inactive")
