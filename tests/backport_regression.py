@@ -3878,6 +3878,12 @@ class BackportRegression(unittest.TestCase):
                          [[b"key", [b"RW", b"access", b"update"]]])
         self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "GET", "key"),
                          [[b"key", [b"RO", b"access"]]])
+        # GETEX reads the old value; an expiration option also updates it.
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "GETEX", "key"),
+                         [[b"key", [b"RO", b"access"]]])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "GETEX", "key",
+                                  "EX", "10"),
+                         [[b"key", [b"RW", b"access", b"update"]]])
         # BITOP's destination is overwritten, its sources are only read.
         self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "BITOP",
                                   "AND", "dest", "src"),
@@ -4759,7 +4765,7 @@ class BackportRegression(unittest.TestCase):
             self.cmd("ACL", "SETUSER", "bprw", "on", ">pw",
                      "%R~ro:*", "%W~wo:*", "~both:*",
                      "+@read", "+@write", "+set", "+get", "+del",
-                     "+getdel", "+copy", "+bitop"),
+                     "+getdel", "+getex", "+copy", "+bitop"),
             b"OK")
         info = self.flat_map(self.cmd("ACL", "GETUSER", "bprw"))
         self.assertEqual(info[b"keys"], [b"%R~ro:*", b"%W~wo:*", b"~both:*"])
@@ -4819,6 +4825,13 @@ class BackportRegression(unittest.TestCase):
             self.cmd("ACL", "DRYRUN", "bprw", "SET", "wo:a", "v", "GET")
         self.assertEqual(self.cmd("ACL", "DRYRUN", "bprw", "SET",
                                   "both:a", "v", "GET"), b"OK")
+        # GETEX reads the old value, but only writes with an expiration.
+        self.assertEqual(self.cmd("ACL", "DRYRUN", "bprw", "GETEX",
+                                  "ro:a"), b"OK")
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "DRYRUN", "bprw", "GETEX", "ro:a", "EX", "10")
+        self.assertEqual(self.cmd("ACL", "DRYRUN", "bprw", "GETEX",
+                                  "both:a", "EX", "10"), b"OK")
 
         # Invalid specifiers are rejected.
         with self.assertRaises(RedisError):

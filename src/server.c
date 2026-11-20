@@ -3492,11 +3492,20 @@ static const cmdDocKeySpec *commandKeySpecFor(const cmdDocEntry *doc,
  * ACL_KEY_READ, keys that may be inserted, updated or deleted need
  * ACL_KEY_WRITE. Specs marked variable_flags (SET) depend on runtime
  * options: SET ... GET reads the old value, so it needs both read and
- * write; all other forms only write. Other variable commands keep the
- * conservative command-level fallback. */
+ * write. GETEX always reads and only writes when an expiration option is
+ * present. Other variable commands keep the conservative command-level
+ * fallback. */
 int getKeyPermissionFlags(struct redisCommand *cmd, robj **argv, int argc,
                           int keypos) {
     int flags = 0, variable = 0, f;
+    /* GETEX always returns the old value and only changes the key when an
+     * expiration option is present. Its command spec is static but too
+     * coarse for ACL checks, so resolve it before the spec fallback. */
+    if (!strcasecmp(cmd->name,"getex")) {
+        flags = ACL_KEY_READ;
+        if (argc > 3) flags |= ACL_KEY_WRITE;
+        return flags;
+    }
     const cmdDocEntry *doc = commandDocLookup(cmd->name);
     const cmdDocKeySpec *spec = commandKeySpecFor(doc, argv, argc, keypos);
 
@@ -3673,14 +3682,15 @@ NULL
                 int f, n = 0;
                 addReplyMultiBulkLen(c,2);
                 addReplyBulk(c,c->argv[keys[j]+2]);
-                if (spec && !strcasecmp(cmd->name,"set")) {
-                    /* SET's spec is variable_flags. Report the effective
-                     * flags for these arguments instead of the marker. */
+                if (spec && (!strcasecmp(cmd->name,"set") ||
+                             !strcasecmp(cmd->name,"getex"))) {
+                    /* SET and GETEX have runtime-dependent key access.
+                     * Report the effective flags instead of the marker. */
                     int perms = getKeyPermissionFlags(
                         cmd, c->argv+2, c->argc-2, keys[j]);
                     int is_read = (perms & ACL_KEY_READ) != 0;
                     int is_write = (perms & ACL_KEY_WRITE) != 0;
-                    addReplyMultiBulkLen(c,3);
+                    addReplyMultiBulkLen(c,is_write ? 3 : 2);
                     addReplyBulkCString(c,is_read && is_write ? "RW" :
                                         (is_write ? "OW" : "RO"));
                     addReplyBulkCString(c,"access");
