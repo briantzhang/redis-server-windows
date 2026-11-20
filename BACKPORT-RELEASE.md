@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp66
+# Redis for Windows 5.0.14.1-bp67
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -107,7 +107,7 @@ ACL 支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@categor
 - 成功的带 TTL 的 SET 在 AOF 中记录为普通 SET + 绝对 PEXPIREAT；KEEPTTL 记录实际保留的截止时间。
 - GETEX 的写入记录为 PEXPIREAT、PERSIST 或 DEL/UNLINK；GETDEL 记录为 DEL。
 - 条件过期仅记录成功结果的绝对截止时间，恢复时不重新判断 NX/XX/GT/LT。
-- RESP3 接入了类型、握手和 push：`HELLO 3` 把该连接切到协议 3，map、set、null、bool、double 和 verbatim 按协议编码，`RESET` 退回协议 2。Pub/Sub 的订阅确认、消息、分片消息以及 TRACKING 失效在协议 3 下都是 `>` push 帧；协议 2 保持普通数组，TRACKING 失效仍走 Pub/Sub。协议 3 的订阅连接可以继续执行普通命令，协议 2 的订阅态限制不变。不迁入新版 RDB 整体格式，AOF 使用多段布局。TLS 覆盖客户端监听、主从复制链路（`tls-replication yes`）和集群总线（`tls-cluster yes`）；客户端/复制 TLS 的证书、私钥与 CA 文件支持 `CONFIG SET` 热加载并重建上下文（对新建连接生效），`tls-cluster` 开关仍需启动时配置。网络收发由多个 IO 线程分担，命令解析与执行仍在主线程。ACL 键权限按命令键规格区分读与写。`COMMAND DOCS` 的文档取自 Redis 7.0.15 的命令表，`ZRANK`/`ZREVRANK` 的 `WITHSCORE` 取自 7.2.5。原底座已有功能保留，但本版没有对其做现代化升级。
+- RESP3 接入了类型、握手和 push：`HELLO 3` 把该连接切到协议 3，map、set、null、bool、double 和 verbatim 按协议编码，`RESET` 退回协议 2。Pub/Sub 的订阅确认、消息、分片消息以及 TRACKING 失效在协议 3 下都是 `>` push 帧；协议 2 保持普通数组，TRACKING 失效仍走 Pub/Sub。协议 3 的订阅连接可以继续执行普通命令，协议 2 的订阅态限制不变。不迁入新版 RDB 整体格式，AOF 使用多段布局。TLS 覆盖客户端监听、主从复制链路（`tls-replication yes`）和集群总线（`tls-cluster yes`）；客户端/复制 TLS 的证书、私钥与 CA 文件支持 `CONFIG SET` 热加载并重建上下文（对新建连接生效），`tls-cluster` 开关仍需启动时配置。网络收发由多个 IO 线程分担，命令解析与执行仍在主线程。ACL 键权限按命令键规格区分读与写，`SET ... GET` 按当前参数识别为读写键。`COMMAND DOCS` 的文档取自 Redis 7.0.15 的命令表，`ZRANK`/`ZREVRANK` 的 `WITHSCORE` 取自 7.2.5。原底座已有功能保留，但本版没有对其做现代化升级。
 - `maxmemory-clients` 限制普通客户端的查询缓冲、参数向量、回复缓冲及额外内存桶之和，超出时断开占用最大的连接。`CLIENT NO-EVICT` 的连接以及副本、主连接和 MONITOR 不参与。占用按本版分桶估算，`CLIENT INFO`/`LIST` 公开 `qbuf-mem`、`argv-mem`、`tot-mem` 等主要桶，不等同于 Redis 7 的全部内存桶。
 - `WAITAOF` 等待覆盖此前写入的本机 AOF fsync：`appendfsync always/no` 下命令内同步 fsync 后立即确认；`appendfsync everysec` 下先 flush AOF 缓冲，再把专用 fsync 排入 BIO 后台线程并阻塞客户端，完成计数到达后返回 `[1, 0]`，超时返回 `[0, 0]`。BIO 完成计数按作业类型累计，每个 WAITAOF 等待自己的目标计数。副本 AOF 落盘未被跟踪，回复中的副本数恒为 0。
 - `XINFO CONSUMERS` 的 `inactive`/`active_time` 是运行时数据，不写入本版 RDB：快照恢复后 `inactive` 回到 -1，直到再次成功投递。

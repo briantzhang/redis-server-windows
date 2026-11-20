@@ -3863,8 +3863,11 @@ class BackportRegression(unittest.TestCase):
 
         self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "SET",
                                   "key", "value"),
-                         [[b"key", [b"RW", b"access", b"update",
-                                     b"variable_flags"]]])
+                         [[b"key", [b"OW", b"access", b"update"]]])
+        # SET ... GET also reads the old value, so both permissions apply.
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "SET",
+                                  "key", "value", "GET"),
+                         [[b"key", [b"RW", b"access", b"update"]]])
         self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "GET", "key"),
                          [[b"key", [b"RO", b"access"]]])
         # BITOP's destination is overwritten, its sources are only read.
@@ -4753,10 +4756,15 @@ class BackportRegression(unittest.TestCase):
         with self.assertRaises(RedisError):
             cli.command("BITOP", "AND", "ro:bits", "ro:a")
 
-        # DRYRUN applies the same key permissions.
+        # DRYRUN applies the same key permissions. SET ... GET also reads
+        # the old value, so a write-only pattern is not enough for it.
         self.assertEqual(self.cmd("ACL", "DRYRUN", "bprw", "GET", "ro:a"), b"OK")
         with self.assertRaises(RedisError):
             self.cmd("ACL", "DRYRUN", "bprw", "SET", "ro:a", "v")
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "DRYRUN", "bprw", "SET", "wo:a", "v", "GET")
+        self.assertEqual(self.cmd("ACL", "DRYRUN", "bprw", "SET",
+                                  "both:a", "v", "GET"), b"OK")
 
         # Invalid specifiers are rejected.
         with self.assertRaises(RedisError):

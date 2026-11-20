@@ -3468,9 +3468,10 @@ static const cmdDocKeySpec *commandKeySpecFor(const cmdDocEntry *doc,
 
 /* What one key argument needs from an ACL key pattern. Read keys need
  * ACL_KEY_READ, keys that may be inserted, updated or deleted need
- * ACL_KEY_WRITE. Specs marked variable_flags (SET, SETEX) depend on runtime
- * options, so they fall back to the command-level flags instead of claiming
- * that a plain SET reads the old value. */
+ * ACL_KEY_WRITE. Specs marked variable_flags (SET) depend on runtime
+ * options: SET ... GET reads the old value, so it needs both read and
+ * write; all other forms only write. Other variable commands keep the
+ * conservative command-level fallback. */
 int getKeyPermissionFlags(struct redisCommand *cmd, robj **argv, int argc,
                           int keypos) {
     int flags = 0, variable = 0, f;
@@ -3492,6 +3493,17 @@ int getKeyPermissionFlags(struct redisCommand *cmd, robj **argv, int argc,
         }
         if (!variable) return flags;
         flags = 0;
+    }
+
+    if (variable && !strcasecmp(cmd->name,"set")) {
+        int j;
+        for (j = 3; j < argc; j++) {
+            if (!strcasecmp(argv[j]->ptr,"get")) {
+                flags = ACL_KEY_READ | ACL_KEY_WRITE;
+                return flags;
+            }
+        }
+        return ACL_KEY_WRITE;
     }
 
     /* No key spec, or one whose flags depend on the options given. */
@@ -3639,7 +3651,19 @@ NULL
                 int f, n = 0;
                 addReplyMultiBulkLen(c,2);
                 addReplyBulk(c,c->argv[keys[j]+2]);
-                if (spec) {
+                if (spec && !strcasecmp(cmd->name,"set")) {
+                    /* SET's spec is variable_flags. Report the effective
+                     * flags for these arguments instead of the marker. */
+                    int perms = getKeyPermissionFlags(
+                        cmd, c->argv+2, c->argc-2, keys[j]);
+                    int is_read = (perms & ACL_KEY_READ) != 0;
+                    int is_write = (perms & ACL_KEY_WRITE) != 0;
+                    addReplyMultiBulkLen(c,3);
+                    addReplyBulkCString(c,is_read && is_write ? "RW" :
+                                        (is_write ? "OW" : "RO"));
+                    addReplyBulkCString(c,"access");
+                    if (is_write) addReplyBulkCString(c,"update");
+                } else if (spec) {
                     for (f = 0; f < 8 && spec->flags[f]; f++) n++;
                     addReplyMultiBulkLen(c,n);
                     for (f = 0; f < n; f++) addReplyBulkCString(c,spec->flags[f]);
