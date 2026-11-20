@@ -1440,6 +1440,23 @@ static int configSetOne(client *c, robj *nameobj, robj *o) {
             addReplyError(c,tlsLastConfigError());
             return C_ERR;
         }
+    } config_set_special_field("tls-cluster") {
+        int old = server.tls_cluster;
+        int mode = yesnotoi(o->ptr);
+        if (mode == -1) goto badfmt;
+        server.tls_cluster = mode;
+        if (mode && (!server.tls_cert_file || !server.tls_key_file ||
+                     (!server.tls_ca_cert_file && !server.tls_ca_cert_dir)))
+        {
+            server.tls_cluster = old;
+            addReplyError(c,"tls-cluster requires tls-cert-file, tls-key-file and a CA");
+            return C_ERR;
+        }
+        if (tlsApplyConfig() != C_OK) {
+            server.tls_cluster = old;
+            addReplyError(c,tlsLastConfigError());
+            return C_ERR;
+        }
     } config_set_special_field("tls-cert-file") {
         char *old = server.tls_cert_file;
         server.tls_cert_file = zstrdup(o->ptr);

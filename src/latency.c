@@ -93,16 +93,16 @@ void latencyMonitorInit(void) {
 
 /* ---------------------- Per-command latency histograms -------------------- */
 
-/* Record a command duration in nanoseconds. Bucket zero holds everything up
- * to 1024ns, bucket N holds up to 1024<<N, and the last bucket is open. */
+static uint64_t latencyHistogramBucketBound(int j);
+
+/* Record a command duration in nanoseconds. Each octave is split into four
+ * buckets starting at 256ns: 0-256, 256-512, 512-768, 768-1024, then the
+ * pattern repeats with doubling bounds. The last bucket is open. */
 void latencyHistogramAddSample(struct latencyHistogram *h, uint64_t ns) {
-    uint64_t bound = 1024;
     int bucket = 0;
 
-    while (ns > bound && bucket < LATENCY_HISTOGRAM_BUCKETS-1) {
-        bound <<= 1;
-        bucket++;
-    }
+    while (bucket < LATENCY_HISTOGRAM_BUCKETS-1 &&
+           ns > latencyHistogramBucketBound(bucket)) bucket++;
     h->buckets[bucket]++;
     h->count++;
 }
@@ -112,8 +112,16 @@ void latencyHistogramReset(struct latencyHistogram *h) {
     h->count = 0;
 }
 
+/* Upper bound in nanoseconds of histogram bucket j. */
+static uint64_t latencyHistogramBucketBound(int j) {
+    /* Quarter-octave steps: 256, 320, 384, 448, 512, 640, ... */
+    return (256ULL << (j / LATENCY_HISTOGRAM_SUBBUCKETS)) +
+           (64ULL << (j / LATENCY_HISTOGRAM_SUBBUCKETS)) *
+           (j % LATENCY_HISTOGRAM_SUBBUCKETS);
+}
+
 /* Value at percentile p (0..1) in microseconds, using the bucket upper
- * bound. Buckets are coarse by design, like the upstream log2 histogram. */
+ * bound. Quarter-octave buckets give a tighter estimate than plain log2. */
 double latencyHistogramPercentile(struct latencyHistogram *h, double p) {
     uint64_t target, cumulative = 0;
     int j;
@@ -125,9 +133,10 @@ double latencyHistogramPercentile(struct latencyHistogram *h, double p) {
     for (j = 0; j < LATENCY_HISTOGRAM_BUCKETS; j++) {
         cumulative += h->buckets[j];
         if (cumulative >= target)
-            return (double)((1024ULL << j) / 1000.0);
+            return (double)latencyHistogramBucketBound(j) / 1000.0;
     }
-    return (double)((1024ULL << (LATENCY_HISTOGRAM_BUCKETS-1)) / 1000.0);
+    return (double)latencyHistogramBucketBound(
+        LATENCY_HISTOGRAM_BUCKETS-1) / 1000.0;
 }
 
 /* Add the specified sample to the specified time series "event".
@@ -530,7 +539,7 @@ static void latencyCommandReplyWithHistogram(client *c,
     for (j = 0; j < LATENCY_HISTOGRAM_BUCKETS; j++) {
         cumulative += h->buckets[j];
         if (cumulative == previous) continue;
-        addReplyLongLong(c,(PORT_LONGLONG)((1024ULL << j)/1000));
+        addReplyLongLong(c,(PORT_LONGLONG)(latencyHistogramBucketBound(j)/1000));
         addReplyLongLong(c,(PORT_LONGLONG)cumulative);
         previous = cumulative;
         emitted++;

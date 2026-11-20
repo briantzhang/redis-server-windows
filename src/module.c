@@ -5450,7 +5450,8 @@ NULL
             addReply(c,shared.ok);
         else
             addReplyError(c,
-                "Error loading the extension. Please check the server logs.");
+                "Error loading the module. On Windows it must be a compatible "
+                "x64 DLL exporting RedisModule_OnLoad; check the server logs.");
     } else if (!strcasecmp(subcmd,"unload") && c->argc == 3) {
         if (moduleUnload(c->argv[2]->ptr) == C_OK)
             addReply(c,shared.ok);

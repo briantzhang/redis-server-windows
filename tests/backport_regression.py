@@ -2408,12 +2408,12 @@ class BackportRegression(unittest.TestCase):
         rdb_path = Path(self.server.directory) / "dump.rdb"
         with rdb_path.open("rb") as f:
             magic = f.read(9)
-        self.assertEqual(magic, b"REDIS0010")
+        self.assertEqual(magic, b"REDIS0011")
 
         payload = self.cmd("DUMP", key)
-        self.assertEqual(len(payload), 13)  # value, version 10, checksum
+        self.assertEqual(len(payload), 13)  # value, version 11, checksum
         self.assertEqual(payload[2:3], b"v")
-        self.assertEqual(payload[3:5], struct.pack("<H", 10))
+        self.assertEqual(payload[3:5], struct.pack("<H", 11))
         self.assertEqual(self.cmd("DEL", key), 1)
         self.assertEqual(self.cmd("RESTORE", key, "0", payload), b"OK")
         self.assertEqual(self.cmd("GET", key), b"v")
@@ -3438,8 +3438,16 @@ class BackportRegression(unittest.TestCase):
             shard = self.flat_map(admin.command("CLUSTER", "SHARDS")[0])
             self.assertEqual(shard[b"shard-id"], myid)
             help_text = b"\n".join(admin.command("CLUSTER", "HELP"))
-            for name in (b"MYSHARDID", b"MIGRATION", b"SLOT-STATS"):
+            for name in (b"MYSHARDID", b"MIGRATION", b"SLOT-STATS",
+                         b"COUNTKEYSINSLOT", b"GETKEYSINSLOT", b"LINKS"):
                 self.assertIn(name, help_text)
+
+            # Read-only slot/link queries expose the state just written.
+            self.assertEqual(admin.command("CLUSTER", "COUNTKEYSINSLOT",
+                                           str(slot)), 1)
+            self.assertEqual(admin.command("CLUSTER", "GETKEYSINSLOT",
+                                           str(slot), "10"), [key])
+            self.assertIsInstance(admin.command("CLUSTER", "LINKS"), list)
 
             # SETSLOT is enough to expose migration state without a peer.
             admin.command("CLUSTER", "SETSLOT", "50", "migrating", myid)
@@ -5043,6 +5051,25 @@ class BackportRegression(unittest.TestCase):
         self.assertIn(b"active-time", cfull)
         self.assertGreater(cfull[b"active-time"], 0)
 
+    def test_xinfo_consumers_active_time_survives_restart(self):
+        if self.server is None:
+            self.skipTest("Consumer active-time persistence requires --server")
+        key = self.key("xinfo:active:persist")
+        self.cmd("DEL", key)
+        self.cmd("XADD", key, "1-0", "f", "1")
+        self.cmd("XGROUP", "CREATE", key, "g", "0")
+        self.cmd("XREADGROUP", "GROUP", "g", "c1", "COUNT", "1",
+                 "STREAMS", key, ">")
+        self.cmd("SAVE")
+        before = self.flat_map(
+            self.cmd("XINFO", "CONSUMERS", key, "g")[0])[b"inactive"]
+        self.assertGreaterEqual(before, 0)
+
+        self.restart()
+        after = self.flat_map(
+            self.cmd("XINFO", "CONSUMERS", key, "g")[0])[b"inactive"]
+        self.assertGreaterEqual(after, before)
+
     def test_client_tracking_pubsub_invalidate(self):
         if self.server is None:
             self.skipTest("CLIENT TRACKING test requires --server")
@@ -5336,6 +5363,16 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(sub._read(),
                          [b"pmessage", b"__keyevent@0__:*",
                           b"__keyevent@0__:keymiss", missing])
+
+    def test_module_load_diagnostic(self):
+        # Windows modules must be compatible x64 DLLs. A bad path produces a
+        # clear diagnostic instead of an opaque generic error.
+        self.assertEqual(self.cmd("MODULE", "LIST"), [])
+        with self.assertRaises(RedisError) as ctx:
+            self.cmd("MODULE", "LOAD", "missing-module.dll")
+        message = str(ctx.exception).lower()
+        self.assertIn("windows", message)
+        self.assertIn("x64 dll", message)
 
     def test_quit_script_help_and_command_info(self):
         # QUIT is a registered command (COMMAND INFO / COUNT see it).
@@ -6001,6 +6038,24 @@ class BackportRegression(unittest.TestCase):
                          str(tls["ca"]).replace("\\", "/").encode())
         with self.tls_connect(client_cert=True) as tls_client:
             self.assertEqual(tls_client.command("PING"), b"PONG")
+
+    def test_tls_cluster_runtime_toggle(self):
+        """CONFIG SET tls-cluster validates and can be toggled at runtime."""
+        if self.server is None or self.server.tls_port is None:
+            self.skipTest("TLS tests require a managed --server instance")
+
+        self.assertEqual(self.cmd("CONFIG", "GET", "tls-cluster"),
+                         [b"tls-cluster", b"no"])
+        with self.assertRaises(RedisError):
+            self.cmd("CONFIG", "SET", "tls-cluster", "maybe")
+        self.assertEqual(self.cmd("CONFIG", "GET", "tls-cluster"),
+                         [b"tls-cluster", b"no"])
+        self.assertEqual(self.cmd("CONFIG", "SET", "tls-cluster", "yes"), b"OK")
+        self.assertEqual(self.cmd("CONFIG", "GET", "tls-cluster"),
+                         [b"tls-cluster", b"yes"])
+        self.assertEqual(self.cmd("CONFIG", "SET", "tls-cluster", "no"), b"OK")
+        self.assertEqual(self.cmd("CONFIG", "GET", "tls-cluster"),
+                         [b"tls-cluster", b"no"])
 
     def test_tls_protocol_and_cipher_options(self):
         """TLS protocol, cipher and session options apply at runtime."""

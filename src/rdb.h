@@ -38,7 +38,7 @@
 
 /* The current RDB version. When the format changes in a way that is no longer
  * backward compatible this number gets incremented. */
-#define RDB_VERSION 10
+#define RDB_VERSION 11
 
 /* Defines related to the dump file format. To store 32 bits lengths for short
  * keys requires a lot of space, so we check the most significant 2 bits of
@@ -148,6 +148,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key);
 size_t rdbSavedObjectLen(robj *o);
 robj *rdbLoadObject(int type, rio *rdb, robj *key);
 int rdbSanitizeDumpPayload(const unsigned char *payload, size_t len);
+extern int rdb_loading_version;  /* RDB version of the payload being loaded. */
 void backgroundSaveDoneHandler(int exitcode, int bysignal);
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, PORT_LONGLONG expiretime);
 ssize_t rdbSaveSingleModuleAux(rio *rdb, int when, moduleType *mt);

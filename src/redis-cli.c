@@ -1282,6 +1282,21 @@ static redisReply *reconnectingRedisCommand(redisContext *c, const char *fmt, ..
 static int parseOptions(int argc, char **argv) {
     int i;
 
+    /* The bundled hiredis has no TLS transport. Fail with a clear message
+     * instead of attempting a plaintext handshake against a TLS port. */
+    for (i = 1; i < argc; i++) {
+        if (!strcmp(argv[i],"--tls") || !strcmp(argv[i],"--sni") ||
+            !strcmp(argv[i],"--cacert") || !strcmp(argv[i],"--cert") ||
+            !strcmp(argv[i],"--key") || !strcmp(argv[i],"--insecure") ||
+            !strncmp(argv[i],"rediss://",9)) {
+            fprintf(stderr,
+                "This Windows build of redis-cli does not support TLS. "
+                "Use a TLS-capable client for tls-port connections; "
+                "the bundled redis-cli only speaks plaintext.\n");
+            exit(1);
+        }
+    }
+
     for (i = 1; i < argc; i++) {
         int lastarg = i==argc-1;
 
@@ -1530,7 +1545,7 @@ static void usage(void) {
 "                     You can also use the " REDIS_CLI_AUTH_ENV " environment\n"
 "                     variable to pass this password more safely\n"
 "                     (if both are used, this argument takes predecence).\n"
-"  -u <uri>           Server URI.\n"
+"  -u <uri>           Server URI (rediss:// is not supported in this build).\n"
 "  -r <repeat>        Execute specified command N times.\n"
 "  -i <interval>      When -r is used, waits <interval> seconds per command.\n"
 "                     It is possible to specify sub-second times like -i 0.1.\n"

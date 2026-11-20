@@ -5609,6 +5609,8 @@ void restoreCommand(client *c) {
         return;
     }
 
+    rdb_loading_version = ((unsigned char*)c->argv[3]->ptr)[sdslen(c->argv[3]->ptr)-9] << 8 |
+                          ((unsigned char*)c->argv[3]->ptr)[sdslen(c->argv[3]->ptr)-10];
     rioInitWithBuffer(&payload,c->argv[3]->ptr);
     if (((type = rdbLoadObjectType(&payload)) == -1) ||
         ((obj = rdbLoadObject(type,&payload,key)) == NULL))

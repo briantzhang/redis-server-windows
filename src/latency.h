@@ -62,8 +62,10 @@ struct latencyStats {
 };
 
 /* Per-command latency histogram. Samples are recorded in nanoseconds and
- * grouped in power-of-two buckets starting at 1024ns, so the reply can expose
- * microsecond bucket boundaries without keeping every sample. */
+ * grouped into quarter-octave buckets starting at 256ns. This keeps the
+ * per-command footprint small while making percentile estimates four times
+ * finer than plain power-of-two buckets. */
+#define LATENCY_HISTOGRAM_SUBBUCKETS 4
 #define LATENCY_HISTOGRAM_BUCKETS 32
 struct latencyHistogram {
     uint64_t count;                              /* Samples recorded. */

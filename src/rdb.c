@@ -85,6 +85,11 @@ void rdbCheckThenExit(int linenum, char *reason, ...) {
     exit(1);
 }
 
+/* RDB version currently being loaded. Set by rdbLoadRio() and by the DUMP
+ * payload loader before rdbLoadObject() decodes values. The server is
+ * single-threaded while loading, so a file-scope value is safe. */
+int rdb_loading_version = RDB_VERSION;
+
 static int rdbWriteRaw(rio *rdb, void *p, size_t len) {
     if (rdb && rioWrite(rdb,p,len) == 0)
         return -1;
@@ -765,6 +770,12 @@ size_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg) {
 
         /* Last seen time. */
         if ((n = rdbSaveMillisecondTime(rdb,consumer->seen_time)) == -1)
+            return -1;
+        nwritten += n;
+
+        /* RDB 11: last successful delivery time (0 means never). */
+        if ((n = rdbSaveLen(rdb,consumer->active_time < 0 ?
+                                 0 : (uint64_t)consumer->active_time)) == -1)
             return -1;
         nwritten += n;
 
@@ -1879,6 +1890,11 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, robj *key) {
                     streamLookupConsumer(cgroup,cname,SLC_NONE);
                 sdsfree(cname);
                 consumer->seen_time = rdbLoadMillisecondTime(rdb,RDB_VERSION);
+                consumer->active_time = -1;
+                if (rdb_loading_version >= 11) {
+                    uint64_t active = rdbLoadLen(rdb,NULL);
+                    if (active) consumer->active_time = active;
+                }
 
                 /* Load the PEL about entries owned by this specific
                  * consumer. */
@@ -2014,6 +2030,7 @@ int rdbLoadRio(rio *rdb, rdbSaveInfo *rsi, int loading_aof) {
         return C_ERR;
     }
     rdbver = atoi(buf+5);
+    rdb_loading_version = rdbver;
     if (rdbver < 1 || rdbver > RDB_VERSION) {
         serverLog(LL_WARNING,"Can't handle RDB format version %d",rdbver);
         errno = EINVAL;
@@ -2856,6 +2873,7 @@ typedef struct dumpCursor {
     const unsigned char *p;
     size_t len;
     size_t pos;
+    int rdbver;                     /* RDB version from the DUMP footer. */
 } dumpCursor;
 
 typedef struct dumpString {
@@ -3439,6 +3457,8 @@ static int dumpValidateObject(dumpCursor *c, int rdbtype) {
                 uint64_t pel_size;
                 if (dumpReadString(c, &s, 0) == C_ERR) return C_ERR;
                 if (dumpSkip(c, 8) == C_ERR) return C_ERR;
+                if (c->rdbver >= 11 && dumpLen(c, &pel_size) == C_ERR)
+                    return C_ERR; /* active_time */
                 if (dumpLen(c, &pel_size) == C_ERR) return C_ERR;
                 if (pel_size > (uint64_t)c->len) return C_ERR;
                 if (dumpSkip(c, (size_t)pel_size * sizeof(streamID)) == C_ERR)
@@ -3468,6 +3488,7 @@ int rdbSanitizeDumpPayload(const unsigned char *payload, size_t len) {
     c.p = payload;
     c.len = len - 10;
     c.pos = 0;
+    c.rdbver = (payload[len-9] << 8) | payload[len-10];
 
     if (dumpByte(&c, &type) == C_ERR) return C_ERR;
     if (!rdbIsObjectType(type)) return C_ERR;
