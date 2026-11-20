@@ -3069,6 +3069,8 @@ class BackportRegression(unittest.TestCase):
         with self.assertRaises(RedisError):
             self.cmd("FCALL", "get_value", "1", key)
         self.assertEqual(self.cmd("FUNCTION", "FLUSH"), b"OK")
+        with self.assertRaises(RedisError):
+            self.cmd("FUNCTION", "KILL")
         self.assertEqual(self.cmd("FUNCTION", "LIST"), [])
 
     def test_functions_dump_restore(self):
@@ -3093,6 +3095,17 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("FUNCTION", "RESTORE", payload, "REPLACE"), b"OK")
         self.assertEqual(self.cmd("FCALL", "echo", "0", "again"), b"again")
         self.assertEqual(self.cmd("FUNCTION", "FLUSH"), b"OK")
+
+    def test_sanitize_dump_payload_stream_consumer(self):
+        """The sanitizer accepts current stream payloads with consumers."""
+        self.cmd("DEL", "sanitize:stream")
+        self.cmd("XADD", "sanitize:stream", "*", "f", "v")
+        self.cmd("XGROUP", "CREATE", "sanitize:stream", "g", "0")
+        self.cmd("XREADGROUP", "GROUP", "g", "c", "COUNT", "1", "STREAMS",
+                 "sanitize:stream", ">")
+        payload = self.cmd("DUMP", "sanitize:stream")
+        self.assertEqual(self.cmd("RESTORE", "sanitize:copy", "0", payload), b"OK")
+        self.assertTrue(self.cmd("XINFO", "CONSUMERS", "sanitize:copy", "g"))
 
     def test_redis_cli_tls_ping(self):
         """The Windows redis-cli negotiates TLS and verifies test certificates."""
@@ -3437,6 +3450,7 @@ class BackportRegression(unittest.TestCase):
 
             hello3 = clients[0].command("HELLO", "3")
             self.assertEqual(self.flat_map(hello3)[b"proto"], 3)
+            self.assertEqual(self.flat_map(hello3)[b"username"], b"default")
             resp3_shards = clients[0].command("CLUSTER", "SHARDS")
             resp3_shard = self.flat_map(resp3_shards[0])
             self.assertEqual(resp3_shard[b"slots"], [0, 16383])
@@ -4270,6 +4284,14 @@ class BackportRegression(unittest.TestCase):
         # AOF is acknowledged synchronously.
         self.assertEqual(self.cmd("WAITAOF", "1", "0", "100"), [1, 0])
         self.assertEqual(self.cmd("WAITAOF", "0", "0", "100"), [0, 0])
+        # numlocal is a boolean; values outside 0/1 are rejected before any
+        # AOF or replica state is consulted.
+        for invalid in ("2", "-1"):
+            with self.assertRaises(RedisError):
+                self.cmd("WAITAOF", invalid, "0", "100")
+        with self.assertRaises(RedisError):
+            self.cmd("WAITAOF", "1", "0", "-1")
+        self.assertEqual(self.cmd("WAITAOF", "1", "0", "0"), [1, 0])
         # No replica is attached: the replica count stays 0 even when more
         # replicas are requested, and WAITAOF returns immediately.
         self.assertEqual(self.cmd("WAITAOF", "1", "2", "100"), [1, 0])

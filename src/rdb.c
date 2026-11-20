@@ -3454,10 +3454,10 @@ static int dumpValidateObject(dumpCursor *c, int rdbtype) {
             if (dumpLen(c, &consumers) == C_ERR) return C_ERR;
             if (consumers > (uint64_t)c->len) return C_ERR;
             for (j = 0; j < consumers; j++) {
-                uint64_t pel_size;
+                uint64_t active_time, pel_size;
                 if (dumpReadString(c, &s, 0) == C_ERR) return C_ERR;
                 if (dumpSkip(c, 8) == C_ERR) return C_ERR;
-                if (c->rdbver >= 11 && dumpLen(c, &pel_size) == C_ERR)
+                if (c->rdbver >= 11 && dumpLen(c, &active_time) == C_ERR)
                     return C_ERR; /* active_time */
                 if (dumpLen(c, &pel_size) == C_ERR) return C_ERR;
                 if (pel_size > (uint64_t)c->len) return C_ERR;

@@ -2848,7 +2848,7 @@ void helloCommand(client *c) {
     /* The negotiated version applies to this reply and everything after it.
      * A map is a flat field/value array on a RESP2 connection. */
     if (ver) c->resp = (int)ver;
-    addReplyMapLen(c,7);
+    addReplyMapLen(c,8);
     addReplyBulkCString(c,"server");
     addReplyBulkCString(c,"redis");
     addReplyBulkCString(c,"version");
@@ -2863,6 +2863,8 @@ void helloCommand(client *c) {
     else addReplyBulkCString(c,"standalone");
     addReplyBulkCString(c,"role");
     addReplyBulkCString(c,server.masterhost ? "replica" : "master");
+    addReplyBulkCString(c,"username");
+    addReplyBulkCString(c,c->user ? ACLUserName(c->user) : "default");
     addReplyBulkCString(c,"modules");
     addReplyMultiBulkLen(c,0);
 }

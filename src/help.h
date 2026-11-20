@@ -815,7 +815,7 @@ struct commandHelp {
     "2.8.0" },
     { "HELLO",
     "[protover [AUTH username password] [SETNAME clientname]]",
-    "Handshake with the server; this build accepts RESP2 only",
+    "Handshake with the server; this build accepts RESP2 and RESP3",
     9,
     "6.0.0" },
     { "SCARD",

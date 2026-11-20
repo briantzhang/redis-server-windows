@@ -41,6 +41,7 @@ typedef struct functionLib {
 
 static dict *function_libs;
 static dict *functions;
+static sds current_function_name;
 
 static int compileLibraries(client *c);
 static int functionLoadCode(client *c, sds code, int replace, int quiet);
@@ -434,6 +435,7 @@ void fcallCommand(client *c) {
     lua_getglobal(lua,"ARGV");
 
     server.lua_caller = c;
+    current_function_name = sdsnew(fi->name);
     start = mstime();
     server.lua_time_start = start;
     server.lua_kill = 0;
@@ -450,6 +452,8 @@ void fcallCommand(client *c) {
             queueClientForReprocessing(server.master);
     }
     server.lua_caller = NULL;
+    sdsfree(current_function_name);
+    current_function_name = NULL;
 
     if (err) {
         addReplyErrorFormat(c,"ERR Error running function (call to %s): %s",
@@ -755,9 +759,30 @@ NULL };
         addReplyBulkCString(c,"function_list");
         addReplyMultiBulkLen(c,0);
         addReplyBulkCString(c,"running_script");
-        addReplyNull(c);
+        if (current_function_name == NULL) addReplyNull(c);
+        else {
+            addReplyMapLen(c,3);
+            addReplyBulkCString(c,"name");
+            addReplyBulkCString(c,current_function_name);
+            addReplyBulkCString(c,"command");
+            addReplyBulkCString(c,server.lua_caller &&
+                                  server.lua_caller->argv ?
+                                  (char*)server.lua_caller->argv[0]->ptr : "FCALL");
+            addReplyBulkCString(c,"duration_ms");
+            addReplyLongLong(c,server.lua_time_start ?
+                             (PORT_LONGLONG)(mstime()-server.lua_time_start) : 0);
+        }
     } else if (!strcasecmp(c->argv[1]->ptr,"kill") && c->argc == 2) {
-        addReplyError(c,"NOTBUSY No functions in execution right now.");
+        if (current_function_name == NULL) {
+            addReplyError(c,"NOTBUSY No functions in execution right now.");
+        } else if (server.lua_caller->flags & CLIENT_MASTER) {
+            addReplyError(c,"UNKILLABLE The busy function was sent by a master instance in the context of replication and cannot be killed.");
+        } else if (server.lua_write_dirty) {
+            addReplyError(c,"UNKILLABLE Sorry the function already executed write commands against the dataset. You can either wait the function termination or kill the server in a hard way using the SHUTDOWN NOSAVE command.");
+        } else {
+            server.lua_kill = 1;
+            addReply(c,shared.ok);
+        }
     } else if (!strcasecmp(c->argv[1]->ptr,"dump") && c->argc == 2) {
         addReplyBulkSds(c,functionsDump());
     } else if (!strcasecmp(c->argv[1]->ptr,"restore")) {
