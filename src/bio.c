@@ -79,6 +79,9 @@ static list *bio_jobs[BIO_NUM_OPS];
  * that there are no longer jobs of this type to be executed before performing
  * the sensible operation. This data is also useful for reporting. */
 static PORT_ULONGLONG bio_pending[BIO_NUM_OPS];
+/* Number of jobs fully processed by type. Used by WAITAOF to detect when a
+ * background fsync enqueued for a client has completed. */
+static PORT_ULONGLONG bio_completed[BIO_NUM_OPS];
 
 /* This structure represents a background Job. It is only used locally to this
  * file as the API does not expose the internals at all. */
@@ -229,6 +232,7 @@ void *bioProcessBackgroundJobs(void *arg) {
         pthread_mutex_lock(&bio_mutex[type]);
         listDelNode(bio_jobs[type],ln);
         bio_pending[type]--;
+        bio_completed[type]++;
 
         /* Unblock threads blocked on bioWaitStepOfType() if any. */
         pthread_cond_broadcast(&bio_step_cond[type]);
@@ -240,6 +244,15 @@ PORT_ULONGLONG bioPendingJobsOfType(int type) {
     PORT_ULONGLONG val;
     pthread_mutex_lock(&bio_mutex[type]);
     val = bio_pending[type];
+    pthread_mutex_unlock(&bio_mutex[type]);
+    return val;
+}
+
+/* Return the number of jobs of the specified type that completed. */
+PORT_ULONGLONG bioCompletedJobsOfType(int type) {
+    PORT_ULONGLONG val;
+    pthread_mutex_lock(&bio_mutex[type]);
+    val = bio_completed[type];
     pthread_mutex_unlock(&bio_mutex[type]);
     return val;
 }

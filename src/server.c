@@ -1503,6 +1503,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     if (listLength(server.clients_waiting_acks))
         processClientsWaitingReplicas();
 
+    /* Unblock WAITAOF clients whose background fsync completed. */
+    if (listLength(server.clients_waiting_aof_fsync))
+        processClientsWaitingAofFsync();
+
     /* Check if there are clients unblocked by modules that implement
      * blocking commands. */
     moduleHandleBlockedClients();
@@ -2281,6 +2285,7 @@ void initServer(void) {
     server.ready_keys = listCreate();
     server.tracking_clients = 0;
     server.clients_waiting_acks = listCreate();
+    server.clients_waiting_aof_fsync = listCreate();
     server.get_ack_from_slaves = 0;
     server.clients_paused = 0;
     server.client_pause_type = CLIENT_PAUSE_OFF;

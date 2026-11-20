@@ -203,6 +203,9 @@ void unblockClient(client *c) {
         unblockClientWaitingData(c);
     } else if (c->btype == BLOCKED_WAIT) {
         unblockClientWaitingReplicas(c);
+    } else if (c->btype == BLOCKED_AOF_FSYNC) {
+        listDelNode(server.clients_waiting_aof_fsync,c->waiting_aof_node);
+        c->waiting_aof_node = NULL;
     } else if (c->btype == BLOCKED_MODULE) {
         unblockClientFromModule(c);
     } else if (c->btype == BLOCKED_PAUSE) {
@@ -230,6 +233,10 @@ void replyToBlockedClientTimedOut(client *c) {
         addReply(c,shared.nullmultibulk);
     } else if (c->btype == BLOCKED_WAIT) {
         addReplyLongLong(c,replicationCountAcksByOffset(c->bpop.reploffset));
+    } else if (c->btype == BLOCKED_AOF_FSYNC) {
+        addReplyMultiBulkLen(c,2);
+        addReplyLongLong(c,0);
+        addReplyLongLong(c,0);
     } else if (c->btype == BLOCKED_MODULE) {
         moduleBlockedClientTimedOut(c);
     } else {

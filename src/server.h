@@ -326,7 +326,8 @@ typedef PORT_LONGLONG ustime_t; /* microsecond time type. */
 #define BLOCKED_STREAM 4  /* XREAD. */
 #define BLOCKED_ZSET 5    /* BZPOP et al. */
 #define BLOCKED_PAUSE 6   /* Blocked by CLIENT PAUSE */
-#define BLOCKED_NUM 7     /* Number of blocked states. */
+#define BLOCKED_AOF_FSYNC 7 /* WAITAOF. */
+#define BLOCKED_NUM 8     /* Number of blocked states. */
 
 /* Client request types */
 #define PROTO_REQ_INLINE 1
@@ -772,6 +773,9 @@ typedef struct blockingState {
     int numreplicas;        /* Number of replicas we are waiting for ACK. */
     PORT_LONGLONG reploffset;   /* Replication offset to reach. */
 
+    /* BLOCKED_AOF_FSYNC */
+    PORT_ULONGLONG aof_fsync_completed; /* BIO completion count to wait for. */
+
     /* BLOCKED_MODULE */
     void *module_blocked_handle; /* RedisModuleBlockedClient structure.
                                     which is opaque for the Redis core, only
@@ -854,6 +858,7 @@ typedef struct client {
     multiState mstate;      /* MULTI/EXEC state */
     int btype;              /* Type of blocking op if CLIENT_BLOCKED. */
     listNode *paused_list_node; /* list node in server.paused_clients */
+    listNode *waiting_aof_node; /* list node in server.clients_waiting_aof_fsync */
     blockingState bpop;     /* blocking state */
     PORT_LONGLONG woff;         /* Last write global replication offset. */
     list *watched_keys;     /* Keys WATCHED for MULTI/EXEC CAS */
@@ -1371,6 +1376,7 @@ struct redisServer {
     unsigned int repl_scriptcache_size; /* Max number of elements. */
     /* Synchronous replication. */
     list *clients_waiting_acks;         /* Clients waiting in WAIT command. */
+    list *clients_waiting_aof_fsync;    /* Clients waiting in WAITAOF. */
     int get_ack_from_slaves;            /* If true we send REPLCONF GETACK. */
     /* Limits */
     unsigned int maxclients;            /* Max number of simultaneous clients */
@@ -1849,6 +1855,7 @@ int rdbSaveRio(rio *rdb, int *error, int flags, rdbSaveInfo *rsi);
 
 /* AOF persistence */
 void flushAppendOnlyFile(int force);
+void aof_background_fsync(int fd);
 void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int argc);
 void aofRemoveTempFile(pid_t childpid);
 int rewriteAppendOnlyFileBackground(void);
@@ -2185,6 +2192,7 @@ int functionsRewriteAOF(rio *aof);
 /* Blocked clients */
 void processUnblockedClients(void);
 void blockClient(client *c, int btype);
+void processClientsWaitingAofFsync(void);
 void unblockClient(client *c);
 void queueClientForReprocessing(client *c);
 void replyToBlockedClientTimedOut(client *c);

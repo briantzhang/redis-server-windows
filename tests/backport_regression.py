@@ -4213,6 +4213,29 @@ class BackportRegression(unittest.TestCase):
         with self.assertRaises(RedisError):
             self.cmd("WAITAOF", "1", "0", "100")
 
+    def test_wait_aof_everysec_async_acknowledgement(self):
+        """WAITAOF with everysec waits for a real background fsync."""
+        if self.server is None:
+            self.skipTest("WAITAOF async tests require --server")
+        directory = Path(self.temp.name) / "waitaof-everysec-async"
+        directory.mkdir()
+        server = ManagedServer(
+            self.server.executable, directory, OPTIONS.timeout,
+            OPTIONS.startup_timeout, aof=True,
+            extra_config="appendfsync everysec\n")
+        self.addCleanup(server.close)
+        server.start()
+        with RESP2("127.0.0.1", server.port, OPTIONS.timeout) as client:
+            key = self.key("waitaof:async")
+            self.assertEqual(client.command("SET", key, b"value"), b"OK")
+            # The background fsync completes promptly, so the client is
+            # unblocked with a real local acknowledgement.
+            self.assertEqual(client.command("WAITAOF", "1", "0", "5000"), [1, 0])
+            self.assertEqual(client.command("GET", key), b"value")
+            # A zero timeout is accepted and returns the acknowledgement
+            # once the fsync completes.
+            self.assertEqual(client.command("WAITAOF", "1", "0", "0"), [1, 0])
+
     def test_shutdown_option_validation(self):
         if self.server is None:
             self.skipTest("SHUTDOWN tests require --server")

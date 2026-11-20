@@ -39,6 +39,7 @@
 #endif
 
 #include "server.h"
+#include "bio.h"
 #include "tls.h"
 #include "cluster.h"
 
@@ -3244,13 +3245,14 @@ void waitCommand(client *c) {
 
 /* WAITAOF <numlocal> <numreplicas> <timeout>
  *
- * There is no asynchronous AOF fsync acknowledgement and no replica-side AOF
- * tracking in this 5.0 backport, so the local fsync is done synchronously
- * before replying and the replica count is always reported as zero. */
+ * The local acknowledgement waits for an AOF fsync covering the writes
+ * preceding this command. With appendfsync always/no the fsync is done
+ * synchronously; with everysec it is queued to the BIO fsync thread and the
+ * client is blocked until that job completes or the timeout expires.
+ * Replica AOF acknowledgements are not tracked in this backport and remain 0. */
 void waitaofCommand(client *c) {
     PORT_LONGLONG numlocal, numreplicas;
     mstime_t timeout;
-    PORT_LONGLONG acked_local = 0;
 
     if (server.masterhost) {
         addReplyError(c,"WAITAOF cannot be used with replica instances.");
@@ -3263,7 +3265,6 @@ void waitaofCommand(client *c) {
         return;
     if (getTimeoutFromObjectOrReply(c,c->argv[3],&timeout,UNIT_MILLISECONDS)
         != C_OK) return;
-    (void) timeout;
 
     if (numlocal < 0 || numreplicas < 0) {
         addReplyError(c,"numlocal and numreplicas can't be negative");
@@ -3276,22 +3277,56 @@ void waitaofCommand(client *c) {
     }
 
     if (numlocal > 0) {
-        /* The manifest may be rebuilt by a concurrent rewrite between two
-         * WAITAOF calls. The fd recorded in the server state always points at
-         * the file that receives new writes, whether that is the current
-         * incremental file or a legacy single AOF. */
+        /* Flush pending AOF buffer first so the fsync covers preceding
+         * writes. The fd in server state always points at the file that
+         * receives new writes, whether an incremental file or legacy AOF. */
         flushAppendOnlyFile(1);
-        if (server.aof_fd == -1 || redis_fsync(server.aof_fd) == -1) {
+        if (server.aof_fd == -1) {
+            addReplyError(c,"Error trying to fsync the AOF file");
+            return;
+        }
+        if (server.aof_fsync == AOF_FSYNC_EVERYSEC) {
+            /* Queue a dedicated background fsync and block until its
+             * completion is observed. */
+            PORT_ULONGLONG target = bioCompletedJobsOfType(BIO_AOF_FSYNC) + 1;
+            aof_background_fsync(server.aof_fd);
+            c->bpop.aof_fsync_completed = target;
+            c->bpop.timeout = timeout ? mstime() + timeout : 0;
+            c->waiting_aof_node = listAddNodeTail(
+                server.clients_waiting_aof_fsync,c);
+            blockClient(c,BLOCKED_AOF_FSYNC);
+            return;
+        }
+        if (redis_fsync(server.aof_fd) == -1) {
             addReplyError(c,"Error trying to fsync the AOF file");
             return;
         }
         server.aof_fsync_offset = server.aof_current_size;
-        acked_local = 1;
     }
 
     addReplyMultiBulkLen(c,2);
-    addReplyLongLong(c,acked_local);
+    addReplyLongLong(c,numlocal > 0 ? 1 : 0);
     addReplyLongLong(c,0); /* Replica AOF acknowledgements are not tracked. */
+}
+
+/* Check clients blocked in WAITAOF and unblock those whose background
+ * fsync has completed. Called from beforeSleep() after AOF flushing. */
+void processClientsWaitingAofFsync(void) {
+    listNode *ln, *next;
+    PORT_ULONGLONG completed = bioCompletedJobsOfType(BIO_AOF_FSYNC);
+
+    ln = listFirst(server.clients_waiting_aof_fsync);
+    while (ln) {
+        client *c = listNodeValue(ln);
+        next = listNextNode(ln);
+        if (completed >= c->bpop.aof_fsync_completed) {
+            unblockClient(c);
+            addReplyMultiBulkLen(c,2);
+            addReplyLongLong(c,1);
+            addReplyLongLong(c,0);
+        }
+        ln = next;
+    }
 }
 
 /* This is called by unblockClient() to perform the blocking op type

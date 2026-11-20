@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp65
+# Redis for Windows 5.0.14.1-bp66
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
@@ -117,15 +117,15 @@ ACL 支持 `on/off`、`>password`、`+@category/-@category`、`+cmd/-cmd`、`~ke
 
 TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM 证书链和私钥；设置 `tls-ca-cert-file` 后可用 `tls-auth-clients yes` 要求客户端证书；`optional` 会校验客户端出示的证书，同时允许不带证书的匿名连接。明文 `port` 可以同时保留，方便本地运维连接。TLS 由 OpenSSL 3 的 memory BIO 接入现有 IOCP 收发路径，不改变命令解析与执行线程模型；程序目录必须同时有 `libssl-3-x64.dll` 和 `libcrypto-3-x64.dll`。从库设置 `tls-replication yes` 后可以连主库的 `tls-port`，握手、`PSYNC`、RDB 传输和后续增量命令都在同一个 TLS 会话里；主库给从库回 `+FULLRESYNC`、`+CONTINUE`、RDB 内容和心跳换行时同样走加密通道，主库启用 `repl-diskless-sync yes` 时，TLS 从库也能无盘同步：RDB 子进程把数据写进一对回环套接字，由主进程转发进 TLS 会话，不再落盘。 `tls-protocols` 用空格分隔 `TLSv1`/`TLSv1.1`/`TLSv1.2`/`TLSv1.3`；`tls-ciphers` 管 TLS 1.2 及以下，`tls-ciphersuites` 管 TLS 1.3；`tls-session-caching no` 关闭会话复用。这几项与 `tls-prefer-server-ciphers`、`tls-auth-clients` 都支持 `CONFIG SET`，重建上下文后对新建连接生效，已有连接不受影响。
 
-`CLIENT PAUSE WRITE` 只拦写命令与 `EXEC`，`CLIENT PAUSE ALL` 连读命令一起拦；被暂停的连接在恢复后按原顺序执行已解析的命令。`CONFIG SET` 多参数时逐对应用，后面的参数非法时前面的已经生效。`COMMAND LIST FILTERBY ACLCAT` 用命令级读写标志近似 `read`/`write`/`keyspace` 分类；`COMMAND GETKEYSANDFLAGS` 按每条命令的键规格给出标志，同一条命令的不同键可以不同，例如 `BITOP` 的目标键是 `OW update`、源键是 `RO access`。键位置不固定的参数（`SORT` 的 `STORE`）仍按命令级标志近似。`CLIENT KILL LADDR` 匹配的是服务端监听地址，因此同一监听地址上的所有连接都会命中；`MAXAGE` 按连接建立到现在的秒数计算。`LATENCY HISTOGRAM` 使用固定的对数桶，不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界，适合看数量级而不是精确尾延迟。`latency-tracking no` 只停止新采样，已有直方图保留到下一次重置。`WAITAOF` 在本版没有异步 fsync 确认机制：它在命令内同步刷盘后立即返回 `[本机确认, 0]`，不会阻塞到超时，也不跟踪副本的 AOF 落盘。`SHUTDOWN ABORT` 只能取消已置位但尚未执行的关闭请求，此时没有“关闭进行中”的状态。
+`CLIENT PAUSE WRITE` 只拦写命令与 `EXEC`，`CLIENT PAUSE ALL` 连读命令一起拦；被暂停的连接在恢复后按原顺序执行已解析的命令。`CONFIG SET` 多参数时逐对应用，后面的参数非法时前面的已经生效。`COMMAND LIST FILTERBY ACLCAT` 用命令级读写标志近似 `read`/`write`/`keyspace` 分类；`COMMAND GETKEYSANDFLAGS` 按每条命令的键规格给出标志，同一条命令的不同键可以不同，例如 `BITOP` 的目标键是 `OW update`、源键是 `RO access`。键位置不固定的参数（`SORT` 的 `STORE`）仍按命令级标志近似。`CLIENT KILL LADDR` 匹配的是服务端监听地址，因此同一监听地址上的所有连接都会命中；`MAXAGE` 按连接建立到现在的秒数计算。`LATENCY HISTOGRAM` 使用固定的对数桶，不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界，适合看数量级而不是精确尾延迟。`latency-tracking no` 只停止新采样，已有直方图保留到下一次重置。`WAITAOF` 会等待覆盖此前写入的本机 AOF fsync：`appendfsync always/no` 下命令内同步 fsync；`appendfsync everysec` 下把 fsync 放入后台线程并阻塞客户端直到该次 fsync 完成或超时（超时返回 `[0, 0]`）。副本 AOF 落盘未被跟踪，回复中的副本数固定为 0。`SHUTDOWN ABORT` 只能取消已置位但尚未执行的关闭请求，此时没有“关闭进行中”的状态。
 
 ## 没有合入的部分
 
 以下能力不在本版中，调用会返回 `unknown command` 或沿用底座的旧行为：
 
-- 证书与 `tls-cluster` 的切换只能在启动配置时完成，`CONFIG SET` 不会热加载证书或重建集群总线 TLS 上下文
-- 客户端内存驱逐只按查询缓冲、回复缓冲和参数向量估算，不按 Redis 7 的客户端内存桶分摊
-- 新版 RDB 格式（沿用 Redis 5 的 RDB 版本，多段 AOF 的 base 文件可选 RDB 前导）
+- `tls-cluster` 的开关仍需在启动配置中设置，`CONFIG SET` 不会重建集群总线 TLS 上下文；普通 TLS 监听的证书、私钥和 CA 文件已支持 `CONFIG SET` 热加载，对新建连接生效，已有连接不受影响
+- 客户端内存驱逐按查询缓冲、参数向量、回复缓冲及额外内存桶估算；`CLIENT INFO`/`LIST` 只公开其中主要桶，不按 Redis 7 的全部内存桶逐项公开
+- 新版 RDB 整体格式（当前 `RDB_VERSION 10` 仅加入流计数兼容扩展，不等同于 Redis 7/8 RDB）
 - Redis 8 的查询引擎
 
 持久化使用多段 AOF（`appendonlydir`、manifest、base 与增量文件）和原有的 RDB 格式。`redis-check-aof` 既能检查单个 AOF 文件，也能接受 `appendonlydir` 目录：按 manifest 顺序检查每个 base/增量文件，`--fix` 只截断最后一个增量文件的坏尾。仍然可以对具体的 `.incr.aof`/`.base.aof` 单独执行。`appenddirname` 与 `appendfilename` 一样只能在启动配置里设置，`CONFIG GET` 可读、`CONFIG REWRITE` 会写回，但不支持 `CONFIG SET`。流的快照在 Redis 5 的 RDB 版本内用兼容扩展保存 `entries-added`、`max-deleted-entry-id` 和消费组 `entries-read`；旧版快照仍按当前长度恢复计数。AOF（含重写）继续通过 `XSETID`/`XGROUP SETID` 保留这些计数。带 TTL 的写入在 AOF 里记成普通 `SET` 加一条绝对时间的 `PEXPIREAT`，重放时不会把相对过期时间再算一遍。
@@ -144,7 +144,7 @@ TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM �
 
 ## 验证
 
-在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，134 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
+在本机（Windows 11、MSVC 14.44 / v143）用当前源码编译后，135 项回归全部通过，测试使用临时目录和随机端口，不连接业务 Redis：
 
 ```bash
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
