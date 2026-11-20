@@ -5481,6 +5481,11 @@ class BackportRegression(unittest.TestCase):
         message = str(ctx.exception).lower()
         self.assertIn("windows", message)
         self.assertIn("x64 dll", message)
+        self.assertIn("redismodule_onload", message)
+
+        help_text = b"\n".join(self.cmd("MODULE", "HELP")).lower()
+        self.assertIn(b"x64 dll", help_text)
+        self.assertIn(b"redismodule_onload", help_text)
 
     def test_quit_script_help_and_command_info(self):
         # QUIT is a registered command (COMMAND INFO / COUNT see it).

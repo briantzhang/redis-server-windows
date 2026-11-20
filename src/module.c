@@ -5433,6 +5433,7 @@ void moduleCommand(client *c) {
 "LIST -- Return a list of loaded modules.",
 "LOAD <path> [arg ...] -- Load a module library from <path>.",
 "UNLOAD <name> -- Unload a module.",
+"On Windows LOAD requires a compatible x64 DLL exporting RedisModule_OnLoad.",
 NULL
         };
         addReplyHelp(c, help);

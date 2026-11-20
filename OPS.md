@@ -590,7 +590,7 @@ AOF 启动失败：
 ## 9. 不在本版范围内的事
 
 - 不支持把一份数据目录挂给两个进程同时写。
-- Windows 构建可尝试通过 `loadmodule` 加载兼容的 x64 DLL，但仅保证底座已有的模块 ABI；`MODULE LOAD` 失败时会明确提示需要兼容的 x64 DLL 和 `RedisModule_OnLoad`。含未知模块数据的 RDB 和含模块类型的 DUMP payload 无法加载或 `RESTORE`；Functions 走 Lua，不依赖模块，可以使用。
+- Windows 构建可尝试通过 `loadmodule` 加载兼容的 x64 DLL，但仅保证底座已有的模块 ABI；`MODULE LOAD` 失败与 `MODULE HELP` 都会明确提示需要兼容的 x64 DLL 和 `RedisModule_OnLoad`。含未知模块数据的 RDB 和含模块类型的 DUMP payload 无法加载或 `RESTORE`；Functions 走 Lua，不依赖模块，可以使用。
 - 集群功能沿用底座实现，已有本机三节点覆盖，但没有验证哨兵、跨机器网络分区和真实故障切换；生产不要仅凭本版测试结论做故障切换。
 - ACL 已实现用户、口令、命令分类、键/频道通配符和 `%R~`/`%W~` 键读写权限；`SET`、`SETEX` 这类选项相关命令按命令级标志近似。见第 3 节。
 - 客户端可以用 `HELLO 3` 切到 RESP3：map、set、null、bool、double 和 verbatim 都有。协议 3 下 Pub/Sub 的订阅确认、消息以及 `CLIENT TRACKING` 失效都用 push 帧（`>`）发送，失效不需要 `REDIRECT`；协议 2 仍是普通数组，失效继续走 `__redis__:invalidate` 频道，必须 `REDIRECT` 到已订阅该频道的连接。协议 3 的订阅连接可以继续执行任意普通命令（回包与 push 分开），协议 2 的订阅连接仍只允许订阅管理命令和 PING/QUIT/RESET。Redisson 单机模式下的 `SET ... KEEPTTL`、`GETEX`、`GETDEL` 属于本版已实现的范围。
