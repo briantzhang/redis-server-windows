@@ -25,6 +25,11 @@ bench = dist/'benchmark-windows.json'
 subprocess.run([sys.executable,'-I',str(root/'tests'/'backport_benchmark.py'),
                 '--server',str(server),'--output',str(bench)],check=True)
 version = subprocess.check_output([str(server),'--version'],text=True).strip()
+verification = dist/'verification-windows.md'
+if verification.exists():
+    previous = verification.read_text(encoding='utf-8')
+    if version not in previous:
+        raise SystemExit('Existing verification report is for another version: ' + version)
 report = f'''# Windows 本机验证报告
 
 时间：{datetime.now(timezone.utc).isoformat()}

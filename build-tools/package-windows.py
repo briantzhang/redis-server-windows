@@ -8,7 +8,7 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '5.0.14.1-bp79'
+VERSION = '5.0.14.1-bp80'
 NAME = 'Redis-x64-' + VERSION
 DIST = ROOT / 'dist'
 PKG = DIST / NAME
@@ -40,6 +40,9 @@ def main():
     version = subprocess.check_output([str(BUILD/'redis-server.exe'), '--version'], text=True)
     if VERSION not in version:
         raise SystemExit('Unexpected redis-server version: ' + version)
+    verification = DIST/'verification-windows.md'
+    if not verification.is_file() or VERSION not in verification.read_text(encoding='utf-8'):
+        raise SystemExit('A matching native verification report is required')
     test_log = ROOT/'build-tools'/'regression-windows.log'
     if not test_log.exists() or not test_log.read_text(encoding='utf-8').rstrip().endswith('OK'):
         raise SystemExit('A successful native regression log is required')

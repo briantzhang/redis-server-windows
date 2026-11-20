@@ -594,3 +594,5 @@ AOF 启动失败：
 - 集群功能沿用底座实现，已有本机三节点覆盖，但没有验证哨兵、跨机器网络分区和真实故障切换；生产不要仅凭本版测试结论做故障切换。
 - ACL 已实现用户、口令、命令分类、键/频道通配符和 `%R~`/`%W~` 键读写权限；`SET`、`SETEX` 这类选项相关命令按命令级标志近似。见第 3 节。
 - 客户端可以用 `HELLO 3` 切到 RESP3：map、set、null、bool、double 和 verbatim 都有。协议 3 下 Pub/Sub 的订阅确认、消息以及 `CLIENT TRACKING` 失效都用 push 帧（`>`）发送，失效不需要 `REDIRECT`；协议 2 仍是普通数组，失效继续走 `__redis__:invalidate` 频道，必须 `REDIRECT` 到已订阅该频道的连接。协议 3 的订阅连接可以继续执行任意普通命令（回包与 push 分开），协议 2 的订阅连接仍只允许订阅管理命令和 PING/QUIT/RESET。Redisson 单机模式下的 `SET ... KEEPTTL`、`GETEX`、`GETDEL` 属于本版已实现的范围。
+
+验证与打包脚本：`python build-tools/verify-native.py` 会先跑全量回归和基准测试，再写入 `dist/verification-windows.md`；若该文件已存在但版本号与当前 `redis-server.exe --version` 不一致，会直接报错，避免不同构建的验证结果混用。`python build-tools/package-windows.py` 除检查服务器版本和回归日志外，还会检查验证报告包含相同版本，然后才生成发布包。
