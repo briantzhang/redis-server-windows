@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp78
+# Redis for Windows 5.0.14.1-bp79
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。

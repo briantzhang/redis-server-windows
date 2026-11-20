@@ -2418,6 +2418,33 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("RESTORE", key, "0", payload), b"OK")
         self.assertEqual(self.cmd("GET", key), b"v")
 
+    def test_dump_version_compatibility_matrix(self):
+        if self.server is None:
+            self.skipTest("DUMP version tests require --server")
+        key = self.key("dump:version:matrix")
+        self.cmd("DEL", key)
+        self.cmd("SET", key, "v")
+        dump = self.cmd("DUMP", key)
+        self.assertEqual(dump[-10:-8], struct.pack("<H", 11))
+
+        # A DUMP footer from the previous local version must restore with
+        # the same value; the checksum covers everything before the footer.
+        old = bytearray(dump)
+        old[-10:-8] = struct.pack("<H", 10)
+        old[-8:] = struct.pack("<Q", crc64(bytes(old[:-8])))
+        dst = self.key("dump:version:old")
+        self.cmd("DEL", dst)
+        self.assertEqual(self.cmd("RESTORE", dst, "0", bytes(old)), b"OK")
+        self.assertEqual(self.cmd("GET", dst), b"v")
+
+        # A future RDB version is refused before loading value bytes.
+        future = bytearray(dump)
+        future[-10:-8] = struct.pack("<H", 12)
+        future[-8:] = struct.pack("<Q", crc64(bytes(future[:-8])))
+        with self.assertRaises(RedisError):
+            self.cmd("RESTORE", self.key("dump:version:future"), "0",
+                     bytes(future))
+
     def test_stream_xtrim_minid_and_limit(self):
         key = self.key("xtrim:minid")
         for ms in range(1, 7):
