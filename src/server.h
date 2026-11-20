@@ -2137,6 +2137,7 @@ void getKeysFreeResult(int *result);
 /* Key access bits for ACL: what a command argument needs from a key pattern. */
 #define ACL_KEY_READ  (1<<0)
 #define ACL_KEY_WRITE (1<<1)
+int commandHasRuntimeKeyFlags(struct redisCommand *cmd);
 int getKeyPermissionFlags(struct redisCommand *cmd, robj **argv, int argc,
                           int keypos);
 int *zunionInterGetKeys(struct redisCommand *cmd,robj **argv, int argc, int *numkeys);

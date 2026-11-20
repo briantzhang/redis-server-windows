@@ -3919,6 +3919,35 @@ class BackportRegression(unittest.TestCase):
             self.cmd("CONFIG", "SET", "maxmemory-samples", "1", "timeout")
         self.cmd("CONFIG", "SET", "maxmemory-samples", "5", "timeout", "0")
 
+    def test_command_getkeysandflags_option_aware(self):
+        """Key flags reflect STORE, GEO store and ZADD conditional options."""
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "SORT", "src",
+                                  "STORE", "dst"),
+                         [[b"src", [b"RO", b"access"]],
+                          [b"dst", [b"OW", b"access", b"update"]]])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "SORT_RO", "src",
+                                  "STORE", "dst"),
+                         [[b"src", [b"RO", b"access"]],
+                          [b"dst", [b"OW", b"access", b"update"]]])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "GEORADIUS", "geo",
+                                  "0", "0", "10", "km", "STORE", "dst"),
+                         [[b"geo", [b"RO", b"access"]],
+                          [b"dst", [b"OW", b"access", b"update"]]])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "GEOSEARCHSTORE",
+                                  "dst", "src", "FROMLONLAT", "0", "0",
+                                  "BYRADIUS", "10", "km"),
+                         [[b"dst", [b"OW", b"access", b"update"]],
+                          [b"src", [b"RO", b"access"]]])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "ZADD", "z",
+                                  "1", "m"),
+                         [[b"z", [b"OW", b"access", b"update"]]])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "ZADD", "z",
+                                  "GT", "1", "m"),
+                         [[b"z", [b"RW", b"access", b"update"]]])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "ZADD", "z",
+                                  "LT", "1", "m"),
+                         [[b"z", [b"RW", b"access", b"update"]]])
+
     def test_command_list_and_getkeysandflags(self):
         names = self.cmd("COMMAND", "LIST")
         self.assertIn(b"get", names)
@@ -4837,7 +4866,8 @@ class BackportRegression(unittest.TestCase):
             self.cmd("ACL", "SETUSER", "bprw", "on", ">pw",
                      "%R~ro:*", "%W~wo:*", "~both:*",
                      "+@read", "+@write", "+set", "+get", "+del",
-                     "+getdel", "+getex", "+copy", "+bitop"),
+                     "+getdel", "+getex", "+copy", "+bitop", "+sort",
+                     "+georadius", "+geosearchstore", "+zadd"),
             b"OK")
         info = self.flat_map(self.cmd("ACL", "GETUSER", "bprw"))
         self.assertEqual(info[b"keys"], [b"%R~ro:*", b"%W~wo:*", b"~both:*"])
@@ -4904,6 +4934,26 @@ class BackportRegression(unittest.TestCase):
             self.cmd("ACL", "DRYRUN", "bprw", "GETEX", "ro:a", "EX", "10")
         self.assertEqual(self.cmd("ACL", "DRYRUN", "bprw", "GETEX",
                                   "both:a", "EX", "10"), b"OK")
+
+        # Option-aware STORE destinations require write access.
+        self.assertEqual(self.cmd("ACL", "DRYRUN", "bprw", "SORT", "ro:a",
+                                  "STORE", "wo:sorted"), b"OK")
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "DRYRUN", "bprw", "SORT", "wo:a",
+                     "STORE", "ro:sorted")
+        self.assertEqual(self.cmd("ACL", "DRYRUN", "bprw", "GEOSEARCHSTORE",
+                                  "wo:geo", "ro:src", "FROMLONLAT", "0", "0",
+                                  "BYRADIUS", "10", "km"), b"OK")
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "DRYRUN", "bprw", "GEOSEARCHSTORE",
+                     "ro:geo", "ro:src", "FROMLONLAT", "0", "0",
+                     "BYRADIUS", "10", "km")
+        # ZADD GT reads the existing score; plain ZADD is write-only.
+        self.assertEqual(self.cmd("ACL", "DRYRUN", "bprw", "ZADD",
+                                  "both:z", "1", "m"), b"OK")
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "DRYRUN", "bprw", "ZADD", "wo:z",
+                     "GT", "1", "m")
 
         # Invalid specifiers are rejected.
         with self.assertRaises(RedisError):

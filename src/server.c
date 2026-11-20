@@ -3490,11 +3490,55 @@ static const cmdDocKeySpec *commandKeySpecFor(const cmdDocEntry *doc,
 
 /* What one key argument needs from an ACL key pattern. Read keys need
  * ACL_KEY_READ, keys that may be inserted, updated or deleted need
- * ACL_KEY_WRITE. Specs marked variable_flags (SET) depend on runtime
- * options: SET ... GET reads the old value, so it needs both read and
- * write. GETEX always reads and only writes when an expiration option is
- * present. Other variable commands keep the conservative command-level
- * fallback. */
+ * ACL_KEY_WRITE. Several option-aware commands need finer resolution than
+ * their command-level flags: SET ... GET, GETEX, SORT ... STORE, the GEO
+ * store forms and ZADD GT/LT. */
+static int commandIsStoreKey(const char *name, robj **argv, int argc,
+                             int keypos) {
+    int i, skip = 0;
+    if (!strcasecmp(name,"sort") || !strcasecmp(name,"sort_ro")) {
+        for (i = 2; i < argc; i++) {
+            if (skip > 0) { skip--; continue; }
+            if (!strcasecmp(argv[i]->ptr,"limit")) skip = 2;
+            else if (!strcasecmp(argv[i]->ptr,"get") ||
+                     !strcasecmp(argv[i]->ptr,"by")) skip = 1;
+            else if (!strcasecmp(argv[i]->ptr,"store") && i+1 < argc &&
+                     i+1 == keypos) return 1;
+        }
+        return 0;
+    }
+    if (!strncmp(name,"georadius",9)) {
+        for (i = 5; i < argc; i++) {
+            if ((!strcasecmp(argv[i]->ptr,"store") ||
+                 !strcasecmp(argv[i]->ptr,"storedist")) && i+1 < argc) {
+                if (i+1 == keypos) return 1;
+                i++;
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+static int zaddReadsExistingScore(robj **argv, int argc) {
+    int i;
+    for (i = 2; i < argc; i++) {
+        char *arg = argv[i]->ptr;
+        if (!strcasecmp(arg,"gt") || !strcasecmp(arg,"lt")) return 1;
+        if (strcasecmp(arg,"nx") && strcasecmp(arg,"xx") &&
+            strcasecmp(arg,"ch") && strcasecmp(arg,"incr")) break;
+    }
+    return 0;
+}
+
+int commandHasRuntimeKeyFlags(struct redisCommand *cmd) {
+    const char *name = cmd->name;
+    return !strcasecmp(name,"set") || !strcasecmp(name,"getex") ||
+           !strcasecmp(name,"sort") || !strcasecmp(name,"sort_ro") ||
+           !strncmp(name,"georadius",9) ||
+           !strcasecmp(name,"geosearchstore") || !strcasecmp(name,"zadd");
+}
+
 int getKeyPermissionFlags(struct redisCommand *cmd, robj **argv, int argc,
                           int keypos) {
     int flags = 0, variable = 0, f;
@@ -3505,6 +3549,22 @@ int getKeyPermissionFlags(struct redisCommand *cmd, robj **argv, int argc,
         flags = ACL_KEY_READ;
         if (argc > 3) flags |= ACL_KEY_WRITE;
         return flags;
+    }
+    if (!strcasecmp(cmd->name,"sort") || !strcasecmp(cmd->name,"sort_ro") ||
+        !strncmp(cmd->name,"georadius",9) ||
+        !strcasecmp(cmd->name,"geosearchstore") || !strcasecmp(cmd->name,"zadd")) {
+        flags = 0;
+        if (!(cmd->flags & CMD_WRITE) || (cmd->flags & CMD_READONLY))
+            flags |= ACL_KEY_READ;
+        if (cmd->flags & CMD_WRITE) flags |= ACL_KEY_WRITE;
+        if (!strcasecmp(cmd->name,"sort") || !strcasecmp(cmd->name,"sort_ro") ||
+            !strncmp(cmd->name,"georadius",9))
+            return commandIsStoreKey(cmd->name,argv,argc,keypos) ?
+                   ACL_KEY_WRITE : (flags & ACL_KEY_READ);
+        if (!strcasecmp(cmd->name,"geosearchstore"))
+            return keypos == 1 ? ACL_KEY_WRITE : ACL_KEY_READ;
+        return zaddReadsExistingScore(argv,argc) ?
+               ACL_KEY_READ | ACL_KEY_WRITE : ACL_KEY_WRITE;
     }
     const cmdDocEntry *doc = commandDocLookup(cmd->name);
     const cmdDocKeySpec *spec = commandKeySpecFor(doc, argv, argc, keypos);
@@ -3526,17 +3586,14 @@ int getKeyPermissionFlags(struct redisCommand *cmd, robj **argv, int argc,
         flags = 0;
     }
 
-    if (variable && !strcasecmp(cmd->name,"set")) {
+    if (!strcasecmp(cmd->name,"set")) {
         int j;
         for (j = 3; j < argc; j++) {
-            if (!strcasecmp(argv[j]->ptr,"get")) {
-                flags = ACL_KEY_READ | ACL_KEY_WRITE;
-                return flags;
-            }
+            if (!strcasecmp(argv[j]->ptr,"get"))
+                return ACL_KEY_READ | ACL_KEY_WRITE;
         }
         return ACL_KEY_WRITE;
     }
-
     /* No key spec, or one whose flags depend on the options given. */
     if (!(cmd->flags & CMD_WRITE) || (cmd->flags & CMD_READONLY))
         flags |= ACL_KEY_READ;
@@ -3689,10 +3746,9 @@ NULL
                 int f, n = 0;
                 addReplyMultiBulkLen(c,2);
                 addReplyBulk(c,c->argv[keys[j]+2]);
-                if (spec && (!strcasecmp(cmd->name,"set") ||
-                             !strcasecmp(cmd->name,"getex"))) {
-                    /* SET and GETEX have runtime-dependent key access.
-                     * Report the effective flags instead of the marker. */
+                if (commandHasRuntimeKeyFlags(cmd)) {
+                    /* Option-aware commands report the effective flags, even
+                     * when a dynamic key position has no static spec. */
                     int perms = getKeyPermissionFlags(
                         cmd, c->argv+2, c->argc-2, keys[j]);
                     int is_read = (perms & ACL_KEY_READ) != 0;
