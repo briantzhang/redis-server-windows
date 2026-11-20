@@ -3439,9 +3439,14 @@ class BackportRegression(unittest.TestCase):
                     break
                 time.sleep(0.2)
             self.assertEqual(directions, {b"to", b"from"})
+            cluster_ids = {
+                line.split()[0]
+                for line in clients[0].command("CLUSTER", "NODES").decode().splitlines()
+            }
             for item in links:
                 info = self.flat_map(item)
                 self.assertEqual(len(info[b"node"]), 40)
+                self.assertIn(info[b"node"].decode(), cluster_ids)
                 self.assertIn(info[b"direction"], (b"to", b"from"))
                 self.assertIn(info[b"events"], (b"r", b"rw", b"w", b""))
                 self.assertIn(b"create-time", info)

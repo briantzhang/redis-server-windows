@@ -4567,8 +4567,8 @@ static void clusterReplyLinks(client *c) {
     while ((ln = listNext(&li)) != NULL) {
         clusterLink *link = listNodeValue(ln);
         clusterNode *peer = link->node;
-        const char *nodeid = link->peer_name_set ? link->peer_name :
-                             (peer ? peer->name : NULL);
+        const char *nodeid = peer ? peer->name :
+                             (link->peer_name_set ? link->peer_name : NULL);
         int mask = link->fd != -1 ? aeGetFileEvents(server.el,link->fd) : 0;
         char events[3];
         int eventlen = 0;
