@@ -901,6 +901,13 @@ void replconfCommand(client *c) {
                 return;
             if (offset > c->repl_ack_off)
                 c->repl_ack_off = offset;
+            if (c->argc > j+3 && !strcasecmp(c->argv[j+2]->ptr,"fack")) {
+                PORT_LONGLONG aof_offset;
+                if (getLongLongFromObject(c->argv[j+3], &aof_offset) != C_OK)
+                    return;
+                if (aof_offset > c->repl_aof_off)
+                    c->repl_aof_off = aof_offset;
+            }
             c->repl_ack_time = server.unixtime;
             /* If this was a diskless replication, we need to really put
              * the slave online when the first ACK is received (which
@@ -2905,13 +2912,18 @@ void roleCommand(client *c) {
  * no effects. */
 void replicationSendAck(void) {
     client *c = server.master;
+    int send_fack = server.fsynced_reploff >= 0;
 
     if (c != NULL) {
         c->flags |= CLIENT_MASTER_FORCE_REPLY;
-        addReplyMultiBulkLen(c,3);
+        addReplyMultiBulkLen(c,send_fack ? 5 : 3);
         addReplyBulkCString(c,"REPLCONF");
         addReplyBulkCString(c,"ACK");
         addReplyBulkLongLong(c,c->reploff);
+        if (send_fack) {
+            addReplyBulkCString(c,"FACK");
+            addReplyBulkLongLong(c,server.fsynced_reploff);
+        }
         c->flags &= ~CLIENT_MASTER_FORCE_REPLY;
     }
 }
@@ -3188,8 +3200,23 @@ void replicationRequestAckFromSlaves(void) {
     server.get_ack_from_slaves = 1;
 }
 
-/* Return the number of slaves that already acknowledged the specified
- * replication offset. */
+/* Return the number of replicas that already acknowledged the specified
+ * replication offset as fsynced to their AOF. */
+int replicationCountAofAcksByOffset(PORT_LONGLONG offset) {
+    listIter li;
+    listNode *ln;
+    int count = 0;
+
+    listRewind(server.slaves,&li);
+    while((ln = listNext(&li))) {
+        client *slave = ln->value;
+
+        if (slave->replstate != SLAVE_STATE_ONLINE) continue;
+        if (slave->repl_aof_off >= offset) count++;
+    }
+    return count;
+}
+
 int replicationCountAcksByOffset(PORT_LONGLONG offset) {
     listIter li;
     listNode *ln;
@@ -3245,13 +3272,13 @@ void waitCommand(client *c) {
 
 /* WAITAOF <numlocal> <numreplicas> <timeout>
  *
- * The local acknowledgement waits for an AOF fsync covering the writes
- * preceding this command. With appendfsync always/no the fsync is done
- * synchronously; with everysec it is queued to the BIO fsync thread and the
- * client is blocked until that job completes or the timeout expires.
- * Replica AOF acknowledgements are not tracked in this backport and remain 0. */
+ * Wait until the writes preceding this command are fsynced locally and by
+ * the requested number of replicas. With appendfsync always/no the local
+ * fsync is synchronous; with everysec it is queued to the BIO fsync thread
+ * and the client blocks until the job completes or the timeout expires.
+ * Replicas report the fsynced replication offset with REPLCONF ACK FACK. */
 void waitaofCommand(client *c) {
-    PORT_LONGLONG numlocal, numreplicas;
+    PORT_LONGLONG numlocal, numreplicas, acklocal = 0, ackreplicas;
     mstime_t timeout;
 
     if (server.masterhost) {
@@ -3266,8 +3293,8 @@ void waitaofCommand(client *c) {
     if (getTimeoutFromObjectOrReply(c,c->argv[3],&timeout,UNIT_MILLISECONDS)
         != C_OK) return;
 
-    if (numlocal < 0 || numreplicas < 0) {
-        addReplyError(c,"numlocal and numreplicas can't be negative");
+    if (numlocal < 0 || numlocal > 1 || numreplicas < 0) {
+        addReplyError(c,"numlocal must be 0 or 1 and numreplicas can't be negative");
         return;
     }
     if (numlocal > 0 && server.aof_state == AOF_OFF) {
@@ -3286,45 +3313,88 @@ void waitaofCommand(client *c) {
             return;
         }
         if (server.aof_fsync == AOF_FSYNC_EVERYSEC) {
-            /* Queue a dedicated background fsync and block until its
-             * completion is observed. */
             PORT_ULONGLONG target = bioCompletedJobsOfType(BIO_AOF_FSYNC) + 1;
             aof_background_fsync(server.aof_fd);
-            c->bpop.aof_fsync_completed = target;
-            c->bpop.timeout = timeout ? mstime() + timeout : 0;
-            c->waiting_aof_node = listAddNodeTail(
-                server.clients_waiting_aof_fsync,c);
-            blockClient(c,BLOCKED_AOF_FSYNC);
-            return;
+            acklocal = 0;
+        } else {
+            if (redis_fsync(server.aof_fd) == -1) {
+                addReplyError(c,"Error trying to fsync the AOF file");
+                return;
+            }
+            server.aof_fsync_offset = server.aof_current_size;
+            acklocal = 1;
         }
-        if (redis_fsync(server.aof_fd) == -1) {
-            addReplyError(c,"Error trying to fsync the AOF file");
-            return;
-        }
-        server.aof_fsync_offset = server.aof_current_size;
     }
 
-    addReplyMultiBulkLen(c,2);
-    addReplyLongLong(c,numlocal > 0 ? 1 : 0);
-    addReplyLongLong(c,0); /* Replica AOF acknowledgements are not tracked. */
+    ackreplicas = replicationCountAofAcksByOffset(c->woff);
+    if (numreplicas > 0 && listLength(server.slaves) == 0) {
+        /* Match the pre-bp73 behavior when there are no replicas: the
+         * replica acknowledgement is not expected and reported as zero. */
+        numreplicas = 0;
+    }
+    if ((acklocal >= numlocal && ackreplicas >= numreplicas) ||
+        (c->flags & CLIENT_MULTI))
+    {
+        addReplyMultiBulkLen(c,2);
+        addReplyLongLong(c,acklocal);
+        addReplyLongLong(c,ackreplicas);
+        return;
+    }
+
+    /* Block for whichever acknowledgement is still missing. The local
+     * completion counter and replica FACK list are checked in beforeSleep. */
+    c->bpop.timeout = timeout ? mstime() + timeout : 0;
+    c->bpop.aof_offset = c->woff;
+    c->bpop.aof_numlocal = numlocal;
+    c->bpop.aof_numreplicas = numreplicas;
+    c->bpop.aof_fsync_completed =
+        bioCompletedJobsOfType(BIO_AOF_FSYNC) + 1;
+    listAddNodeTail(server.clients_waiting_aof_fsync,c);
+    c->waiting_aof_node = listLast(server.clients_waiting_aof_fsync);
+    blockClient(c,BLOCKED_AOF_FSYNC);
+    if (numreplicas > ackreplicas) replicationRequestAckFromSlaves();
 }
 
-/* Check clients blocked in WAITAOF and unblock those whose background
- * fsync has completed. Called from beforeSleep() after AOF flushing. */
+/* Check clients blocked in WAITAOF and unblock those whose local fsync and
+ * replica acknowledgements are complete. Called from beforeSleep(). */
 void processClientsWaitingAofFsync(void) {
     listNode *ln, *next;
     PORT_ULONGLONG completed = bioCompletedJobsOfType(BIO_AOF_FSYNC);
+    int last_numreplicas = 0;
+    PORT_LONGLONG last_offset = -1;
 
     ln = listFirst(server.clients_waiting_aof_fsync);
     while (ln) {
         client *c = listNodeValue(ln);
         next = listNextNode(ln);
-        if (completed >= c->bpop.aof_fsync_completed) {
-            unblockClient(c);
-            addReplyMultiBulkLen(c,2);
-            addReplyLongLong(c,1);
-            addReplyLongLong(c,0);
+        int acklocal;
+        int ackreplicas;
+
+        if (server.aof_fsync == AOF_FSYNC_EVERYSEC &&
+            c->bpop.aof_numlocal &&
+            completed < c->bpop.aof_fsync_completed)
+        {
+            ln = next;
+            continue;
         }
+        acklocal = c->bpop.aof_numlocal ? 1 : 0;
+
+        if (last_offset == c->bpop.aof_offset) {
+            ackreplicas = last_numreplicas;
+        } else {
+            ackreplicas = replicationCountAofAcksByOffset(c->bpop.aof_offset);
+            last_offset = c->bpop.aof_offset;
+            last_numreplicas = ackreplicas;
+        }
+        if (ackreplicas < c->bpop.aof_numreplicas) {
+            ln = next;
+            continue;
+        }
+
+        unblockClient(c);
+        addReplyMultiBulkLen(c,2);
+        addReplyLongLong(c,acklocal);
+        addReplyLongLong(c,ackreplicas);
         ln = next;
     }
 }

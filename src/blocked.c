@@ -64,6 +64,7 @@
  */
 
 #include "server.h"
+#include "bio.h"
 
 int serveClientBlockedOnList(client *receiver, robj *key, robj *dstkey, redisDb *db, robj *value, int wherefrom, int whereto);
 
@@ -234,9 +235,16 @@ void replyToBlockedClientTimedOut(client *c) {
     } else if (c->btype == BLOCKED_WAIT) {
         addReplyLongLong(c,replicationCountAcksByOffset(c->bpop.reploffset));
     } else if (c->btype == BLOCKED_AOF_FSYNC) {
+        int acklocal = 0;
+        int ackreplicas = replicationCountAofAcksByOffset(c->bpop.aof_offset);
+        if (c->bpop.aof_numlocal &&
+            (server.aof_fsync != AOF_FSYNC_EVERYSEC ||
+             bioCompletedJobsOfType(BIO_AOF_FSYNC) >=
+                c->bpop.aof_fsync_completed))
+            acklocal = 1;
         addReplyMultiBulkLen(c,2);
-        addReplyLongLong(c,0);
-        addReplyLongLong(c,0);
+        addReplyLongLong(c,acklocal);
+        addReplyLongLong(c,ackreplicas);
     } else if (c->btype == BLOCKED_MODULE) {
         moduleBlockedClientTimedOut(c);
     } else {

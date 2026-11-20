@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp72
+# Redis for Windows 5.0.14.1-bp73
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
 
@@ -55,7 +55,7 @@
 | `CLIENT KILL` 的 `LADDR` / `USER` / `MAXAGE` | 6.0 / 7.0 | 按本地监听地址、认证用户和连接存活秒数筛选；LADDR 会命中同一监听地址上的全部连接 |
 | `CLIENT LIST` / `CLIENT INFO` 的 `laddr=`、`user=` | 6.0 / 6.2 | 输出本地地址与当前认证用户名 |
 | `INFO everything` | 7.0 | 与 `INFO all` 等价地输出全部区段 |
-| `WAITAOF` | 7.2 | 同步刷盘并返回 `[本机确认, 0]`；不阻塞等待，不跟踪副本 AOF |
+| `WAITAOF` | 7.2 | 等待本机 AOF fsync 和副本 FACK 后返回 `[本机确认, 副本确认]`；无副本时副本数仍为 0 |
 | `SHUTDOWN` 的 `NOW` / `FORCE` / `ABORT` | 7.0 | NOW 不等副本，FORCE 在保存失败时仍退出，ABORT 取消已置位的关闭请求 |
 | `ACL LOG [count\|RESET]` | 6.0 | 记录命令、键与认证拒绝；相同条目在 60 秒内合并计数，`acllog-max-len` 限制长度 |
 | `ACL SAVE` / `ACL LOAD` / `aclfile` | 6.0 | 用户规则写入文件并在启动或手动加载时恢复；加载失败保留旧用户，缺失用户会断开其连接 |
@@ -109,7 +109,7 @@ ACL 支持 `on/off`、`>password`（SHA1 摘要保存）、`+@category/-@categor
 - 条件过期仅记录成功结果的绝对截止时间，恢复时不重新判断 NX/XX/GT/LT。
 - RESP3 接入了类型、握手和 push：`HELLO 3` 把该连接切到协议 3，map、set、null、bool、double 和 verbatim 按协议编码，`RESET` 退回协议 2。Pub/Sub 的订阅确认、消息、分片消息以及 TRACKING 失效在协议 3 下都是 `>` push 帧；协议 2 保持普通数组，TRACKING 失效仍走 Pub/Sub。协议 3 的订阅连接可以继续执行普通命令，协议 2 的订阅态限制不变。不迁入新版 RDB 整体格式，AOF 使用多段布局。TLS 覆盖客户端监听、主从复制链路（`tls-replication yes`）和集群总线（`tls-cluster yes`）；客户端/复制 TLS 的证书、私钥与 CA 文件支持 `CONFIG SET` 热加载并重建上下文（对新建连接生效），`tls-cluster` 开关也支持 `CONFIG SET` 热切换并重建集群总线上下文，启用时会校验证书、私钥和 CA 配置。网络收发由多个 IO 线程分担，命令解析与执行仍在主线程。ACL 键权限按命令键规格区分读与写，`SET ... GET` 按当前参数识别为读写键。`COMMAND DOCS` 的文档取自 Redis 7.0.15 的命令表，`ZRANK`/`ZREVRANK` 的 `WITHSCORE` 取自 7.2.5。原底座已有功能保留，但本版没有对其做现代化升级。
 - `maxmemory-clients` 限制普通客户端的查询缓冲、参数向量、回复缓冲及额外内存桶之和，超出时断开占用最大的连接。`CLIENT NO-EVICT` 的连接以及副本、主连接和 MONITOR 不参与。占用按本版分桶估算，`CLIENT INFO`/`LIST` 公开 `qbuf-mem`、`argv-mem`、`tot-mem` 等主要桶，不等同于 Redis 7 的全部内存桶。
-- `WAITAOF` 等待覆盖此前写入的本机 AOF fsync：`appendfsync always/no` 下命令内同步 fsync 后立即确认；`appendfsync everysec` 下先 flush AOF 缓冲，再把专用 fsync 排入 BIO 后台线程并阻塞客户端，完成计数到达后返回 `[1, 0]`，超时返回 `[0, 0]`。BIO 完成计数按作业类型累计，每个 WAITAOF 等待自己的目标计数。副本 AOF 落盘未被跟踪，回复中的副本数恒为 0。
+- `WAITAOF` 等待覆盖此前写入的本机 AOF fsync：`appendfsync always/no` 下命令内同步 fsync 后立即确认；`appendfsync everysec` 下先 flush AOF 缓冲，再把专用 fsync 排入 BIO 后台线程并阻塞客户端，完成计数到达后才返回。`always` 会在 fsync 后发布已确认复制偏移；`everysec` 在 BIO fsync 完成后发布。副本用 `REPLCONF ACK ... FACK <offset>` 回传自身已 fsync 的复制偏移，主库按此统计副本确认；无副本时请求的副本确认会归零并立即返回。超时回复返回当前已获得的本地/副本确认数，通常不是请求目标。
 - `XINFO CONSUMERS` 的 `inactive`/`active_time` 从 RDB 版本 11 起写入本版兼容扩展：快照恢复后保留上次成功投递时间；更早的快照仍回到 -1，直到再次成功投递。
 - 命令延迟直方图是运行时数据，不写入 RDB/AOF；使用每八度四等分的固定对数桶（256 ns 起）而不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界，精度高于整倍桶但仍为估算值。
 - `SCRIPT FLUSH ASYNC` 换上一份空的脚本缓存，把旧的交给后台的延迟释放线程。Lua 解释器本身仍在主线程关闭并重建，因为跨线程释放它不安全。

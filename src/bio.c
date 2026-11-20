@@ -90,6 +90,10 @@ struct bio_job {
     /* Job specific arguments pointers. If we need to pass more than three
      * arguments we can just pass a pointer to a structure or alike. */
     void *arg1, *arg2, *arg3;
+    /* AOF fsync jobs snapshot the replication offset being flushed so the
+     * main thread can publish it as a replica fsync acknowledgement. */
+    PORT_LONGLONG fsync_reploff;
+    int publish_fsync_reploff;
 };
 
 void *bioProcessBackgroundJobs(void *arg);
@@ -147,6 +151,24 @@ void bioCreateBackgroundJob(int type, void *arg1, void *arg2, void *arg3) {
     job->arg1 = arg1;
     job->arg2 = arg2;
     job->arg3 = arg3;
+    job->fsync_reploff = 0;
+    job->publish_fsync_reploff = 0;
+    pthread_mutex_lock(&bio_mutex[type]);
+    listAddNodeTail(bio_jobs[type],job);
+    bio_pending[type]++;
+    pthread_cond_signal(&bio_newjob_cond[type]);
+    pthread_mutex_unlock(&bio_mutex[type]);
+}
+
+void bioCreateFsyncJob(int type, int fd, PORT_LONGLONG reploff, int publish) {
+    struct bio_job *job = zmalloc(sizeof(*job));
+
+    job->time = time(NULL);
+    job->arg1 = (void*)(PORT_LONG)fd;
+    job->arg2 = NULL;
+    job->arg3 = NULL;
+    job->fsync_reploff = reploff;
+    job->publish_fsync_reploff = publish;
     pthread_mutex_lock(&bio_mutex[type]);
     listAddNodeTail(bio_jobs[type],job);
     bio_pending[type]++;
@@ -209,6 +231,8 @@ void *bioProcessBackgroundJobs(void *arg) {
             close((int)(PORT_LONG)job->arg1);  WIN_PORT_FIX /* cast (int) */
         } else if (type == BIO_AOF_FSYNC) {
             redis_fsync((int)(PORT_LONG)job->arg1);  WIN_PORT_FIX /* cast (int) */
+            if (job->publish_fsync_reploff)
+                server.fsynced_reploff_pending = job->fsync_reploff;
         } else if (type == BIO_LAZY_FREE) {
             /* What we free changes depending on what arguments are set:
              * arg1 -> free the object at pointer.

@@ -1,4 +1,4 @@
-# Redis for Windows 5.0.14.1-bp72
+# Redis for Windows 5.0.14.1-bp73
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
@@ -63,7 +63,7 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `CLIENT KILL` 的 `LADDR` / `USER` / `MAXAGE` | 6.0 / 7.0 | 按服务端本地地址、认证用户、连接存活秒数筛选要断开的连接 |
 | `CLIENT LIST` / `CLIENT INFO` 的 `laddr=`、`user=` 字段 | 6.0 / 6.2 | 输出连接的本地地址与当前认证用户 |
 | `INFO everything` | 7.0 | 与 `INFO all` 相同地输出全部区段 |
-| `WAITAOF numlocal numreplicas timeout` | 7.2 | 同步确认本机 AOF 已落盘；副本 AOF 计数固定为 0，见下方说明 |
+| `WAITAOF numlocal numreplicas timeout` | 7.2 | 等待本机 AOF fsync 与副本 FACK；无副本时副本确认返回 0 |
 | `SHUTDOWN [NOSAVE\|SAVE] [NOW] [FORCE] [ABORT]` | 7.0 | `NOW` 不等副本，`FORCE` 保存失败也退出，`ABORT` 取消待执行的关闭 |
 | `ACL LOG [count\|RESET]` | 6.0 | 记录被拒绝的命令、键和认证失败，相同条目在 60 秒内合并计数；`acllog-max-len` 控制上限 |
 | `ACL SAVE` / `ACL LOAD` 与 `aclfile` 配置 | 6.0 | 把用户规则写入文件并在启动或手动加载时恢复；规则文件损坏时保留内存中的旧用户 |
@@ -117,7 +117,7 @@ ACL 支持 `on/off`、`>password`、`+@category/-@category`、`+cmd/-cmd`、`~ke
 
 TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM 证书链和私钥；设置 `tls-ca-cert-file` 后可用 `tls-auth-clients yes` 要求客户端证书；`optional` 会校验客户端出示的证书，同时允许不带证书的匿名连接。明文 `port` 可以同时保留，方便本地运维连接。TLS 由 OpenSSL 3 的 memory BIO 接入现有 IOCP 收发路径，不改变命令解析与执行线程模型；程序目录必须同时有 `libssl-3-x64.dll` 和 `libcrypto-3-x64.dll`。随包 `redis-cli.exe` 只支持明文；传入 `--tls` 等 TLS 参数会给出明确错误提示，连接加密端口需使用支持 TLS 的客户端。从库设置 `tls-replication yes` 后可以连主库的 `tls-port`，握手、`PSYNC`、RDB 传输和后续增量命令都在同一个 TLS 会话里；主库给从库回 `+FULLRESYNC`、`+CONTINUE`、RDB 内容和心跳换行时同样走加密通道，主库启用 `repl-diskless-sync yes` 时，TLS 从库也能无盘同步：RDB 子进程把数据写进一对回环套接字，由主进程转发进 TLS 会话，不再落盘。 `tls-protocols` 用空格分隔 `TLSv1`/`TLSv1.1`/`TLSv1.2`/`TLSv1.3`；`tls-ciphers` 管 TLS 1.2 及以下，`tls-ciphersuites` 管 TLS 1.3；`tls-session-caching no` 关闭会话复用。这几项与 `tls-prefer-server-ciphers`、`tls-auth-clients` 都支持 `CONFIG SET`，重建上下文后对新建连接生效，已有连接不受影响。
 
-`CLIENT PAUSE WRITE` 只拦写命令与 `EXEC`，`CLIENT PAUSE ALL` 连读命令一起拦；被暂停的连接在恢复后按原顺序执行已解析的命令。`CONFIG SET` 多参数时逐对应用，后面的参数非法时前面的已经生效。`COMMAND LIST FILTERBY ACLCAT` 用命令级读写标志近似 `read`/`write`/`keyspace` 分类；`COMMAND GETKEYSANDFLAGS` 按每条命令的键规格给出标志，同一条命令的不同键可以不同，例如 `BITOP` 的目标键是 `OW update`、源键是 `RO access`。`SET ... GET` 的键标志按当前参数解析为读写；键位置仍不固定的参数（`SORT` 的 `STORE`）按命令级标志近似。`CLIENT KILL LADDR` 匹配的是服务端监听地址，因此同一监听地址上的所有连接都会命中；`MAXAGE` 按连接建立到现在的秒数计算。`LATENCY HISTOGRAM` 使用每八度四等分的固定对数桶（256 ns 起），不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界，比整倍桶更细但仍是估算值。`latency-tracking no` 只停止新采样，已有直方图保留到下一次重置。`WAITAOF` 会等待覆盖此前写入的本机 AOF fsync：`appendfsync always/no` 下命令内同步 fsync；`appendfsync everysec` 下把 fsync 放入后台线程并阻塞客户端直到该次 fsync 完成或超时（超时返回 `[0, 0]`）。副本 AOF 落盘未被跟踪，回复中的副本数固定为 0。`SHUTDOWN ABORT` 只能取消已置位但尚未执行的关闭请求，此时没有“关闭进行中”的状态。
+`CLIENT PAUSE WRITE` 只拦写命令与 `EXEC`，`CLIENT PAUSE ALL` 连读命令一起拦；被暂停的连接在恢复后按原顺序执行已解析的命令。`CONFIG SET` 多参数时逐对应用，后面的参数非法时前面的已经生效。`COMMAND LIST FILTERBY ACLCAT` 用命令级读写标志近似 `read`/`write`/`keyspace` 分类；`COMMAND GETKEYSANDFLAGS` 按每条命令的键规格给出标志，同一条命令的不同键可以不同，例如 `BITOP` 的目标键是 `OW update`、源键是 `RO access`。`SET ... GET` 的键标志按当前参数解析为读写；键位置仍不固定的参数（`SORT` 的 `STORE`）按命令级标志近似。`CLIENT KILL LADDR` 匹配的是服务端监听地址，因此同一监听地址上的所有连接都会命中；`MAXAGE` 按连接建立到现在的秒数计算。`LATENCY HISTOGRAM` 使用每八度四等分的固定对数桶（256 ns 起），不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界，比整倍桶更细但仍是估算值。`latency-tracking no` 只停止新采样，已有直方图保留到下一次重置。`WAITAOF` 会等待覆盖此前写入的本机 AOF fsync：`appendfsync always/no` 下命令内同步 fsync；`appendfsync everysec` 下把 fsync 放入后台线程并阻塞客户端直到该次 fsync 完成或超时，超时返回当前已获得的确认数。副本通过 `REPLCONF ACK ... FACK` 回传已 fsync 的复制偏移，主库据此统计副本确认；无副本时请求的副本数会归零并立即返回。`SHUTDOWN ABORT` 只能取消已置位但尚未执行的关闭请求，此时没有“关闭进行中”的状态。
 
 ## 没有合入的部分
 

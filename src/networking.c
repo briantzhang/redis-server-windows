@@ -184,6 +184,7 @@ client *createClient(int fd) {
     c->reploff = 0;
     c->read_reploff = 0;
     c->repl_ack_off = 0;
+    c->repl_aof_off = 0;
     c->repl_ack_time = 0;
     c->slave_listening_port = 0;
     c->slave_ip[0] = '\0';

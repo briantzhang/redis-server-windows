@@ -4163,11 +4163,57 @@ class BackportRegression(unittest.TestCase):
         # AOF is acknowledged synchronously.
         self.assertEqual(self.cmd("WAITAOF", "1", "0", "100"), [1, 0])
         self.assertEqual(self.cmd("WAITAOF", "0", "0", "100"), [0, 0])
+        # No replica is attached: the replica count stays 0 even when more
+        # replicas are requested, and WAITAOF returns immediately.
         self.assertEqual(self.cmd("WAITAOF", "1", "2", "100"), [1, 0])
         with self.assertRaises(RedisError):
             self.cmd("WAITAOF", "-1", "0", "100")
         with self.assertRaises(RedisError):
             self.cmd("WAITAOF", "0", "-1", "100")
+
+    def test_wait_aof_tracks_replica_fsync_ack(self):
+        """WAITAOF counts replica FACKs after local and replica fsync."""
+        if self.server is None:
+            self.skipTest("WAITAOF replica tests require --server")
+        root = Path(self.temp.name) / "waitaof-replicas"
+        root.mkdir()
+        master_dir = root / "master"
+        replica_dir = root / "replica"
+        master_dir.mkdir()
+        replica_dir.mkdir()
+        extra = "appendfsync everysec\n"
+        master = ManagedServer(self.server.executable, master_dir,
+                               OPTIONS.timeout, OPTIONS.startup_timeout,
+                               aof=True, extra_config=extra)
+        replica = ManagedServer(self.server.executable, replica_dir,
+                                OPTIONS.timeout, OPTIONS.startup_timeout,
+                                aof=True, extra_config=extra,
+                                replicaof=("127.0.0.1", master.port))
+        self.addCleanup(master.close)
+        self.addCleanup(replica.close)
+        master.start()
+        replica.start()
+        with RESP2("127.0.0.1", master.port, OPTIONS.timeout) as client:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                info = client.command("INFO", "replication").decode()
+                if "connected_slaves:1" in info and "state=online" in info:
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("replica did not reach the online state")
+
+            # The replica reports the offset of a previously fsynced write,
+            # so a new WAITAOF must wait for a newer FACK.
+            key = self.key("waitaof:replica")
+            self.assertEqual(client.command("WAIT", "1", "5000"), 1)
+            self.assertEqual(client.command("SET", key, b"one"), b"OK")
+            self.assertEqual(client.command("WAITAOF", "1", "1", "5000"),
+                             [1, 1])
+            self.assertEqual(client.command("SET", key, b"two"), b"OK")
+            self.assertEqual(client.command("WAITAOF", "1", "1", "5000"),
+                             [1, 1])
+            self.assertEqual(client.command("GET", key), b"two")
 
     def test_wait_aof_after_multipart_rewrite(self):
         """WAITAOF acknowledges the current incremental file before and after

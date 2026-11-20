@@ -30,6 +30,7 @@
 /* Exported API */
 void bioInit(void);
 void bioCreateBackgroundJob(int type, void *arg1, void *arg2, void *arg3);
+void bioCreateFsyncJob(int type, int fd, PORT_LONGLONG reploff, int publish);
 PORT_ULONGLONG bioPendingJobsOfType(int type);
 PORT_ULONGLONG bioCompletedJobsOfType(int type);
 PORT_ULONGLONG bioWaitStepOfType(int type);

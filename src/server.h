@@ -775,6 +775,9 @@ typedef struct blockingState {
 
     /* BLOCKED_AOF_FSYNC */
     PORT_ULONGLONG aof_fsync_completed; /* BIO completion count to wait for. */
+    PORT_LONGLONG aof_offset;       /* Replication offset to wait for AOF ACKs. */
+    int aof_numlocal;               /* Local AOF acknowledgements required. */
+    int aof_numreplicas;            /* Replica AOF acknowledgements required. */
 
     /* BLOCKED_MODULE */
     void *module_blocked_handle; /* RedisModuleBlockedClient structure.
@@ -847,6 +850,7 @@ typedef struct client {
     PORT_LONGLONG read_reploff; /* Read replication offset if this is a master. */
     PORT_LONGLONG reploff;      /* Applied replication offset if this is a master. */
     PORT_LONGLONG repl_ack_off; /* Replication ack offset, if this is a slave. */
+    PORT_LONGLONG repl_aof_off; /* AOF fsync ack offset, if this is a slave. */
     PORT_LONGLONG repl_ack_time;/* Replication ack time, if this is a slave. */
     PORT_LONGLONG psync_initial_offset; /* FULLRESYNC reply offset other slaves
                                        copying this slave output buffer
@@ -1241,6 +1245,8 @@ struct redisServer {
     off_t aof_rewrite_base_size;    /* AOF size on latest startup or rewrite. */
     off_t aof_current_size;         /* AOF current size. */
     off_t aof_fsync_offset;         /* AOF offset which is already synced to disk. */
+    PORT_LONGLONG fsynced_reploff;  /* Largest replication offset confirmed fsynced. */
+    PORT_LONGLONG fsynced_reploff_pending; /* Offset to publish after background fsync. */
     int aof_rewrite_scheduled;      /* Rewrite once BGSAVE terminates. */
     pid_t aof_child_pid;            /* PID if rewriting process */
     list *aof_rewrite_buf_blocks;   /* Hold changes during an AOF rewrite. */
@@ -2193,6 +2199,7 @@ int functionsRewriteAOF(rio *aof);
 void processUnblockedClients(void);
 void blockClient(client *c, int btype);
 void processClientsWaitingAofFsync(void);
+int replicationCountAofAcksByOffset(PORT_LONGLONG offset);
 void unblockClient(client *c);
 void queueClientForReprocessing(client *c);
 void replyToBlockedClientTimedOut(client *c);

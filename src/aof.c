@@ -662,7 +662,7 @@ int aofFsyncInProgress(void) {
 /* Starts a background task that performs fsync() against the specified
  * file descriptor (the one of the AOF file) in another thread. */
 void aof_background_fsync(int fd) {
-    bioCreateBackgroundJob(BIO_AOF_FSYNC,(void*)(PORT_LONG)fd,NULL,NULL);
+    bioCreateFsyncJob(BIO_AOF_FSYNC,fd,server.master_repl_offset,1);
 }
 
 /* Kills an AOFRW child process if exists */
@@ -980,6 +980,8 @@ try_fsync:
         latencyAddSampleIfNeeded("aof-fsync-always",latency);
         server.aof_fsync_offset = server.aof_current_size;
         server.aof_last_fsync = server.unixtime;
+        server.fsynced_reploff = server.fsynced_reploff_pending =
+            server.master_repl_offset;
     } else if ((server.aof_fsync == AOF_FSYNC_EVERYSEC &&
                 server.unixtime > server.aof_last_fsync)) {
         if (!sync_in_progress) {

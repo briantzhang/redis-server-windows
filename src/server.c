@@ -1503,9 +1503,29 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     if (listLength(server.clients_waiting_acks))
         processClientsWaitingReplicas();
 
+    /* A background fsync may have advanced the replication offset that is
+     * safe to acknowledge to replicas. */
+    if (server.fsynced_reploff_pending > server.fsynced_reploff)
+        server.fsynced_reploff = server.fsynced_reploff_pending;
+
     /* Unblock WAITAOF clients whose background fsync completed. */
-    if (listLength(server.clients_waiting_aof_fsync))
-        processClientsWaitingAofFsync();
+    if (listLength(server.clients_waiting_aof_fsync)) {
+        /* The blocking timeout is only seen by clientsCron(), which runs at
+         * server.hz resolution. Check it on every loop as well so short
+         * WAITAOF timeouts are honoured promptly. */
+        listIter li;
+        listNode *ln;
+        listRewind(server.clients_waiting_aof_fsync,&li);
+        while ((ln = listNext(&li)) != NULL) {
+            client *c = listNodeValue(ln);
+            if (c->bpop.timeout && c->bpop.timeout < mstime()) {
+                replyToBlockedClientTimedOut(c);
+                unblockClient(c);
+            }
+        }
+        if (listLength(server.clients_waiting_aof_fsync))
+            processClientsWaitingAofFsync();
+    }
 
     /* Check if there are clients unblocked by modules that implement
      * blocking commands. */
@@ -2287,6 +2307,8 @@ void initServer(void) {
     server.clients_waiting_acks = listCreate();
     server.clients_waiting_aof_fsync = listCreate();
     server.get_ack_from_slaves = 0;
+    server.fsynced_reploff = -1;
+    server.fsynced_reploff_pending = 0;
     server.clients_paused = 0;
     server.client_pause_type = CLIENT_PAUSE_OFF;
     server.system_memory_size = zmalloc_get_memory_size();
