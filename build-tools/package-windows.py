@@ -8,7 +8,7 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '5.0.14.1-bp85'
+VERSION = '5.0.14.1-bp86'
 NAME = 'Redis-x64-' + VERSION
 DIST = ROOT / 'dist'
 PKG = DIST / NAME
@@ -53,6 +53,8 @@ def main():
         shutil.copy2(ROOT/'deps'/'openssl'/'bin'/name, PKG/name)
     for name in ['COPYING', 'BACKPORT-RELEASE.md']:
         shutil.copy2(ROOT/name, PKG/name)
+    for name in ['service-admin.ps1', 'verify-checksums.py']:
+        shutil.copy2(ROOT/'build-tools'/name, PKG/name)
     licenses = PKG/'licenses'
     licenses.mkdir()
     for src, dest in [('deps/hiredis/COPYING','hiredis-COPYING'),
@@ -119,6 +121,16 @@ Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；
 
 检查版本：redis-server.exe --version
 测试连接：redis-cli.exe -h 127.0.0.1 -p 6379 PING
+服务管理：以管理员权限运行
+      powershell -ExecutionPolicy Bypass -File service-admin.ps1 -Action install
+      powershell -ExecutionPolicy Bypass -File service-admin.ps1 -Action start
+      powershell -ExecutionPolicy Bypass -File service-admin.ps1 -Action status
+      powershell -ExecutionPolicy Bypass -File service-admin.ps1 -Action restart
+      powershell -ExecutionPolicy Bypass -File service-admin.ps1 -Action stop
+      powershell -ExecutionPolicy Bypass -File service-admin.ps1 -Action uninstall
+      安装使用当前目录的 redis.windows.conf 和 data 子目录，服务名默认 RedisBackport。
+      卸载不会自动停止服务；服务账户需要对 data 与日志文件路径有写权限。
+完整性：解压目录执行 python -I verify-checksums.py .，输出 OK 表示文件未改动。
 TLS：按 redis.windows.conf 的注释配置 tls-port 和证书后重启；必须保留
       libssl-3-x64.dll 与 libcrypto-3-x64.dll。随包 redis-cli 可用
       --tls --cacert <CA> -p <tls-port> PING 连接；也可用 rediss:// URI。

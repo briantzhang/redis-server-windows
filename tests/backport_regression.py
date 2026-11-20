@@ -1281,6 +1281,48 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.info_fields("persistence")["aof_enabled"], "1")
         verify_all("restart")
 
+    def test_aof_multipart_concurrent_rewrites(self):
+        """Multiple AOF rewrites and BGSAVE cycles preserve concurrent writes."""
+        if self.server is None:
+            self.skipTest("Persistence tests require --server")
+        self.assertEqual(self.info_fields("persistence")["aof_enabled"], "1")
+        prefix = self.key("aof:rewrite:").decode()
+        self.cmd("DEL", *[prefix + str(i) for i in range(200)])
+        values = {}
+        stop = threading.Event()
+        errors = []
+
+        def writer():
+            index = 0
+            try:
+                with self.connect() as client:
+                    while not stop.is_set() and index < 600:
+                        values[index] = ("value-%d" % index).encode()
+                        client.command("SET", prefix + str(index), values[index])
+                        index += 1
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        try:
+            for _ in range(2):
+                self.assertEqual(self.cmd("BGREWRITEAOF"),
+                                 b"Background append only file rewriting started")
+                self.wait_info_field("persistence", "aof_rewrite_in_progress", "0")
+                self.assertEqual(self.cmd("BGSAVE"), b"Background saving started")
+                self.wait_info_field("persistence", "rdb_bgsave_in_progress", "0")
+        finally:
+            stop.set()
+            thread.join(timeout=OPTIONS.timeout)
+        self.assertFalse(thread.is_alive(), "writer did not stop")
+        self.assertEqual(errors, [])
+        persistence = self.info_fields("persistence")
+        self.assertEqual(persistence["aof_last_bgrewrite_status"], "ok")
+        self.assertEqual(persistence["rdb_last_bgsave_status"], "ok")
+        for index, value in values.items():
+            self.assertEqual(self.cmd("GET", prefix + str(index)), value)
+
     def test_windows_socket_churn_and_split_writes(self):
         """Commands split across many small writes, multi-megabyte values and
         abrupt disconnects leave a Windows server responsive and consistent."""

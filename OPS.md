@@ -71,6 +71,22 @@
 .\redis-server.exe --service-uninstall --service-name RedisBp1
 ```
 
+发布包还提供 `service-admin.ps1`，用管理员 PowerShell 运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\service-admin.ps1 -Action install -Name RedisBp1
+powershell -ExecutionPolicy Bypass -File .\service-admin.ps1 -Action status -Name RedisBp1
+powershell -ExecutionPolicy Bypass -File .\service-admin.ps1 -Action restart -Name RedisBp1
+powershell -ExecutionPolicy Bypass -File .\service-admin.ps1 -Action stop -Name RedisBp1
+powershell -ExecutionPolicy Bypass -File .\service-admin.ps1 -Action uninstall -Name RedisBp1
+```
+
+脚本会检查管理员权限，安装后设为自动启动，启动时用 `redis-cli PING` 做健康检查；卸载要求服务已停止。服务账户必须对 `dir` 和 `logfile` 指向的路径有写权限。开机自启仍需在目标机器重启后人工验证。
+
+日志轮转：Redis 只向 `logfile` 追加，不会自行切分。不要用删除当前日志文件的方式轮转；应先复制归档，再停止服务、改名旧日志并启动服务，让进程重新打开文件。需要不中断服务时，改用外部日志采集器管理文件和保留期，并将日志目录与 `dump.rdb`、`appendonlydir` 数据目录分开。
+
+完整性校验：解压发布包后，在解压目录运行 `python -I verify-checksums.py .`；输出 `OK` 表示所有文件与 `checksums.sha256` 一致，输出 `FAILED` 时不要启动服务。
+
 ## 3. 建议的最小配置
 
 下面是单机、只本机访问、开启 AOF 的起点。按实际端口、目录和内存修改。
