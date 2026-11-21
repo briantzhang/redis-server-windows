@@ -41,8 +41,8 @@ report = f'''# Windows 本机验证报告
 - 测试为每项创建临时目录和回环随机端口，涵盖命令、边界、事务、并发、RDB 与 AOF 重启。
 - 性能数据：benchmark-windows.json；本机回环、单客户端、无 AOF，取三轮中位数。
 - 性能对比仅说明批量请求与逐条/流水线请求的区别，不能外推真实部署的整体吞吐。
-- 已增加有界的多段 AOF 并发重写与 BGSAVE 压力回归；发布包附带 Windows 服务管理脚本与校验工具。
-- 尚未完成：RuoYi/Redisson 全链路联调、小时级长期运行压力测试、异常断电恢复、Windows 服务开机自启实机验证。
+- 已包含有界的多段 AOF 并发重写、BGSAVE 压力与 kill 后 AOF 恢复回归；发布包附带 Windows 服务管理脚本与校验工具。
+- 小时级长跑步骤见 OPS.md；默认回归只保留有界压力。尚未完成：RuoYi/Redisson 全链路联调、目标机器长跑与重启后的 Windows 服务开机自启验证。
 - 安全边界：本次是功能回移，不声明已补齐 Redis 5 之后全部安全修复；无集群升级。
 '''
 (dist/'verification-windows.md').write_text(report,encoding='utf-8')

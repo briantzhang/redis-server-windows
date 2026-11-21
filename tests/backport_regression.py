@@ -1281,6 +1281,35 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.info_fields("persistence")["aof_enabled"], "1")
         verify_all("restart")
 
+    def test_abrupt_restart_recovers_multipart_aof(self):
+        """A killed server recovers the last acknowledged write from AOF."""
+        if self.server is None:
+            self.skipTest("Persistence tests require --server")
+        directory = Path(self.temp.name) / "abrupt-restart"
+        directory.mkdir()
+        server = ManagedServer(OPTIONS.server, str(directory), OPTIONS.timeout,
+                               OPTIONS.startup_timeout, aof=True,
+                               extra_config="appendfsync always\
+")
+        self.addCleanup(server.close)
+        server.start()
+        key = "abrupt:key"
+        writer = RESP2("127.0.0.1", server.port, OPTIONS.timeout)
+        try:
+            self.assertEqual(writer.command("SET", key, "before-kill"), b"OK")
+            self.assertEqual(writer.command("WAITAOF", "1", "0", "1000"), [1, 0])
+            self.assertTrue(server.process.poll() is None)
+            server.process.kill()
+            server.process.wait(timeout=OPTIONS.timeout)
+            server.process = None
+            server.start()
+            assert server.process is not None
+            reader = RESP2("127.0.0.1", server.port, OPTIONS.timeout)
+            self.addCleanup(reader.close)
+            self.assertEqual(reader.command("GET", key), b"before-kill")
+        finally:
+            writer.close()
+
     def test_aof_multipart_concurrent_rewrites(self):
         """Multiple AOF rewrites and BGSAVE cycles preserve concurrent writes."""
         if self.server is None:

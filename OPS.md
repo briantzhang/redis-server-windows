@@ -569,6 +569,8 @@ BGREWRITEAOF
 
 流的 `entries-added` 和 `max-deleted-entry-id` 不写入 RDB 快照：从 `dump.rdb` 恢复后前者按当前长度重算、后者归零；从 AOF 恢复（含 AOF 重写）会保留。若业务依赖这两个计数，恢复时优先使用 AOF，或在恢复后用 `XSETID <key> <id> ENTRIESADDED <n> MAXDELETEDID <id>` 校正。
 
+小时级长跑验证：发布前默认回归只覆盖有界压力。需要长时间观察时，在独立目录启动服务并持续运行 `SET/GET/INCR/EXPIRE` 混合负载，每 10 秒采集一次 `INFO memory`、`INFO clients`、`INFO persistence` 与 `INFO stats` 到 JSONL；结束时比较 `used_memory`、`connected_clients` 是否回落、AOF 文件数与 manifest 是否一致，并执行一次 `BGSAVE`、`DEBUG RELOAD`、重启和抽样读取。该流程不纳入发布默认回归，应在目标机器单独执行。
+
 ## 7. 排查
 
 连不上：
