@@ -953,6 +953,26 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("GET", key), b"v")
         self.assertIsNone(self.cmd("GET", key2))
 
+    def test_expire_wrongtype_and_type_boundaries(self):
+        """Expire and type commands keep their documented edge semantics."""
+        missing = self.key("expire:missing")
+        self.assertEqual(self.cmd("DEL", missing), 0)
+        for command, argument in (("EXPIRE", 60), ("PEXPIRE", 60000),
+                                  ("EXPIREAT", 2000000000),
+                                  ("PEXPIREAT", 2000000000000)):
+            self.assertEqual(self.cmd(command, missing, argument), 0)
+        self.assertEqual(self.cmd("EXPIRETIME", missing), -2)
+        self.assertEqual(self.cmd("PEXPIRETIME", missing), -2)
+        self.assertEqual(self.cmd("PERSIST", missing), 0)
+
+        listing = self.key("expire:list")
+        self.cmd("DEL", listing)
+        self.cmd("RPUSH", listing, "a")
+        # This backport treats expiry metadata as type-independent.
+        self.assertEqual(self.cmd("EXPIRE", listing, 60), 1)
+        self.assertGreater(self.cmd("TTL", listing), 0)
+        self.assertEqual(self.cmd("TYPE", listing), b"list")
+
     def test_expire_condition_matrix(self):
         for command in ("EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT"):
             with self.subTest(command=command):
@@ -3144,6 +3164,23 @@ class BackportRegression(unittest.TestCase):
             self.cmd("FUNCTION", "KILL")
         self.assertEqual(self.cmd("FUNCTION", "LIST"), [])
 
+    def test_function_kill_and_stats_idle(self):
+        """FUNCTION STATS reports the Lua engine and KILL reports NOTBUSY."""
+        self.cmd("FUNCTION", "FLUSH")
+        self.addCleanup(self.cmd, "FUNCTION", "FLUSH")
+
+        stats = self.flat_map(self.cmd("FUNCTION", "STATS"))
+        engines = self.flat_map(stats[b"engines"])
+        lua = self.flat_map(engines[b"LUA"])
+        self.assertIn(b"libraries_count", lua)
+        self.assertIn(b"functions_count", lua)
+        self.assertIsNone(lua[b"running_script"])
+
+        with self.assertRaises(RedisError) as ctx:
+            self.cmd("FUNCTION", "KILL")
+        self.assertIn("NOTBUSY", str(ctx.exception))
+
+
     def test_functions_dump_restore(self):
         code = (
             "#!lua name=bp24dump\n"
@@ -3166,6 +3203,26 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("FUNCTION", "RESTORE", payload, "REPLACE"), b"OK")
         self.assertEqual(self.cmd("FCALL", "echo", "0", "again"), b"again")
         self.assertEqual(self.cmd("FUNCTION", "FLUSH"), b"OK")
+
+    def test_dump_type_compatibility_matrix(self):
+        """DUMP/RESTORE round-trips the common value types."""
+        cases = [
+            ("string", lambda k: self.cmd("SET", k, "v")),
+            ("list", lambda k: self.cmd("RPUSH", k, "a", "b")),
+            ("set", lambda k: self.cmd("SADD", k, "a", "b")),
+            ("hash", lambda k: self.cmd("HSET", k, "f", "v")),
+            ("zset", lambda k: self.cmd("ZADD", k, "1", "m")),
+            ("stream", lambda k: self.cmd("XADD", k, "*", "f", "v")),
+        ]
+        for index, (kind, setup) in enumerate(cases):
+            key = self.key("dump:type:%d" % index)
+            target = self.key("dump:type:copy:%d" % index)
+            self.cmd("DEL", key, target)
+            setup(key)
+            payload = self.cmd("DUMP", key)
+            self.assertEqual(self.cmd("RESTORE", target, "0", payload), b"OK")
+            self.assertEqual(self.cmd("DUMP", target)[:2], payload[:2])
+            self.assertEqual(self.cmd("TYPE", target), self.cmd("TYPE", key))
 
     def test_sanitize_dump_payload_stream_consumer(self):
         """The sanitizer accepts current stream payloads with consumers."""
@@ -3214,6 +3271,28 @@ class BackportRegression(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"certificate", result.stdout.lower())
+
+    def test_hiredis_async_tls_api(self):
+        """The Windows hiredis build exports an async TLS connector."""
+        root = Path(__file__).resolve().parent.parent
+        header = (root / "deps" / "hiredis" / "async.h").read_bytes()
+        source = (root / "deps" / "hiredis" / "async.c").read_bytes()
+        self.assertIn(b"redisAsyncConnectTLS", header)
+        self.assertIn(b"redisAsyncConnectTLS", source)
+        self.assertIn(b"redisTlsHandshake", source)
+
+    def test_redis_benchmark_tls(self):
+        """redis-benchmark can drive a TLS listener with --insecure."""
+        bench = Path(OPTIONS.server).with_name("redis-benchmark.exe") if OPTIONS.server else None
+        if bench is None or not bench.exists() or self.server.tls is None:
+            self.skipTest("benchmark TLS test requires --server and openssl")
+        result = subprocess.run(
+            [str(bench), "--tls", "--insecure", "-h", "127.0.0.1",
+             "-p", str(self.server.tls_port), "-c", "2", "-n", "20",
+             "-t", "ping", "-q"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
+        self.assertIn(b"PING", result.stdout)
 
     def test_redis_cli_cluster_help(self):
         """The Windows redis-cli build exposes the full cluster manager set."""
@@ -3761,6 +3840,87 @@ class BackportRegression(unittest.TestCase):
         self.assertGreater(second_in, first_in)
         self.assertGreater(second_out, first_out)
 
+    def test_redis_cli_uri_tls_query_params(self):
+        """rediss:// query parameters configure TLS verification."""
+        cli = Path(OPTIONS.server).with_name("redis-cli.exe") if OPTIONS.server else None
+        if cli is None or not cli.exists() or self.server.tls is None:
+            self.skipTest("redis-cli TLS tests require --server and openssl")
+        certs = self.server.tls
+        port = str(self.server.tls_port)
+        ca = str(certs["ca"]).replace("\\", "/")
+        uri = "rediss://127.0.0.1:%s/0?cacert=%s" % (port, ca)
+        result = subprocess.run(
+            [str(cli), "-u", uri, "PING"], stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
+        self.assertIn(b"PONG", result.stdout)
+
+    def test_cluster_tls_runtime_observability(self):
+        """TLS cluster mode still exposes LINKS/SHARDS/MIGRATION."""
+        if self.server is None or self.server.tls is None:
+            self.skipTest("TLS cluster tests require --server and openssl")
+        directory = Path(self.temp.name) / "cluster-tls-observe"
+        directory.mkdir()
+        node = ManagedServer(
+            OPTIONS.server, str(directory), OPTIONS.timeout,
+            OPTIONS.startup_timeout, cluster=True, tls=self.server.tls,
+            extra_config="tls-cluster yes\n",
+        )
+        try:
+            node.start()
+            client = RESP2("127.0.0.1", node.port, OPTIONS.timeout)
+            try:
+                client.command("CLUSTER", "ADDSLOTSRANGE", "0", "16383")
+                self.assertEqual(
+                    client.command("CLUSTER", "MYSHARDID"),
+                    client.command("CLUSTER", "MYID"))
+                self.assertEqual(client.command("CLUSTER", "MIGRATION"), [])
+                links = client.command("CLUSTER", "LINKS")
+                self.assertIsInstance(links, list)
+                shards = client.command("CLUSTER", "SHARDS")
+                self.assertEqual(len(shards), 1)
+                self.assertEqual(self.flat_map(shards[0])[b"slots"],
+                                 [0, 16383])
+            finally:
+                client.close()
+        finally:
+            node.close()
+
+    def test_redis_cli_cluster_tls_options(self):
+        """Cluster manager connects to TLS nodes with --tls and --insecure."""
+        cli = Path(OPTIONS.server).with_name("redis-cli.exe") if OPTIONS.server else None
+        if cli is None or not cli.exists():
+            self.skipTest("redis-cli cluster tests require --server")
+        certs = self.server.tls if self.server else None
+        if certs is None:
+            self.skipTest("cluster TLS CLI tests require openssl")
+        directory = Path(self.temp.name) / "cli-cluster-tls"
+        directory.mkdir()
+        node = ManagedServer(
+            OPTIONS.server, str(directory), OPTIONS.timeout,
+            OPTIONS.startup_timeout, cluster=True, tls=certs,
+            extra_config="tls-cluster yes\n",
+        )
+        try:
+            node.start()
+            client = RESP2("127.0.0.1", node.port, OPTIONS.timeout)
+            try:
+                client.command("CLUSTER","ADDSLOTSRANGE","0","16383")
+                args = [str(cli), "--tls", "--insecure", "-h", "127.0.0.1",
+                        "-p", str(node.tls_port), "--cluster", "info",
+                        "127.0.0.1:%d" % node.tls_port]
+                result = subprocess.run(
+                    args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    timeout=20)
+                output = result.stdout.decode("utf-8", "replace")
+                fmt = "%s\n%s"
+                self.assertEqual(result.returncode, 0, fmt % (args, output))
+                self.assertIn("0 keys in 1 masters", output)
+            finally:
+                client.close()
+        finally:
+            node.close()
+
     def test_cluster_hostname_and_replica_announced(self):
         if self.server is None:
             self.skipTest("cluster tests require --server")
@@ -4037,6 +4197,23 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "ZADD", "z",
                                   "LT", "1", "m"),
                          [[b"z", [b"RW", b"access", b"update"]]])
+
+    def test_command_getkeysandflags_runtime_matrix(self):
+        """SET/GETEX option variants report their effective access flags."""
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "SET", "k", "v"),
+                         [[b"k", [b"OW", b"access", b"update"]]])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "SET", "k", "v", "GET"),
+                         [[b"k", [b"RW", b"access", b"update"]]])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "GETEX", "k"),
+                         [[b"k", [b"RO", b"access"]]])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "GETEX", "k", "EX", "10"),
+                         [[b"k", [b"RW", b"access", b"update"]]])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "SORT", "src"),
+                         [[b"src", [b"RO", b"access"]]])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYSANDFLAGS", "GEORADIUS", "geo",
+                                  "0", "0", "10", "km", "STOREDIST", "dst"),
+                         [[b"geo", [b"RO", b"access"]],
+                          [b"dst", [b"OW", b"access", b"update"]]])
 
     def test_command_list_and_getkeysandflags(self):
         names = self.cmd("COMMAND", "LIST")
@@ -5053,6 +5230,14 @@ class BackportRegression(unittest.TestCase):
             self.cmd("ACL", "DRYRUN", "bprw", "ZADD", "wo:z",
                      "GT", "1", "m")
 
+        # Georadius STORE/STOREDIST are option-aware for ACL too.
+        self.assertEqual(self.cmd("ACL", "DRYRUN", "bprw", "GEORADIUS",
+                                  "ro:geo", "0", "0", "10", "km",
+                                  "STORE", "wo:geo2"), b"OK")
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "DRYRUN", "bprw", "GEORADIUS", "wo:geo",
+                     "0", "0", "10", "km", "STOREDIST", "ro:geo3")
+
         # Invalid specifiers are rejected.
         with self.assertRaises(RedisError):
             self.cmd("ACL", "SETUSER", "bprw", "%X~a")
@@ -5219,6 +5404,18 @@ class BackportRegression(unittest.TestCase):
         self.assertEqual(self.cmd("ZSCORE", key, "a"), 1.5)
         self.assertIsNone(self.cmd("ZSCORE", key, "missing"))
         self.assertIsNone(self.cmd("GET", self.key("resp3:absent")))
+
+    def test_hello_negotiated_protocol_fields(self):
+        """HELLO reports the negotiated protocol and authenticated user."""
+        hello = self.flat_map(self.cmd("HELLO", "3"))
+        self.assertEqual(hello[b"proto"], 3)
+        self.assertEqual(hello[b"username"], b"default")
+        self.assertEqual(hello[b"mode"], b"standalone")
+        self.addCleanup(lambda: self.cmd("HELLO", "2"))
+
+        # The server keeps speaking RESP3 after the handshake.
+        config = dict(self.flat_map(self.cmd("CONFIG", "GET", "appendonly")))
+        self.assertIn(b"appendonly", config)
 
     def test_resp3_map_replies(self):
         # RESP2 keeps the historical flat field/value arrays.

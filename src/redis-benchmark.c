@@ -92,6 +92,12 @@ static struct config {
     sds dbnumstr;
     char *tests;
     char *auth;
+    int tls;
+    int tls_insecure;
+    const char *tls_cacert;
+    const char *tls_cert;
+    const char *tls_key;
+    const char *tls_sni;
 } config;
 
 typedef struct _client {
@@ -116,6 +122,7 @@ extern pthread_mutex_t used_memory_mutex;
 
 /* Prototypes */
 static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+static void runTlsBenchmark(char *title, char *cmd, int len);
 static void createMissingClients(client c);
 
 /* Implementation */
@@ -390,7 +397,12 @@ static client createClient(char *cmd, size_t len, client from) {
     int j;
     client c = zmalloc(sizeof(struct _client));
 
-    if (config.hostsocket == NULL) {
+    if (config.hostsocket == NULL && config.tls) {
+        c->context = redisConnectTLS(config.hostip,config.hostport,
+            config.tls_cacert, config.tls_cert, config.tls_key,
+            config.tls_sni ? config.tls_sni : config.hostip,
+            !config.tls_insecure);
+    } else if (config.hostsocket == NULL) {
 #ifdef _WIN32
         SOCKADDR_STORAGE ss;
         c->context = redisPreConnectNonBlock(config.hostip,config.hostport, &ss);
@@ -540,12 +552,53 @@ static void showLatencyReport(void) {
     }
 }
 
+/* TLS contexts use blocking hiredis BIOs, so drive them synchronously
+ * instead of mixing them with the IOCP event loop. */
+static void runTlsBenchmark(char *title, char *cmd, int len) {
+    client c;
+    int i;
+    config.title = title;
+    config.requests_issued = 0;
+    config.requests_finished = 0;
+    c = createClient(cmd,len,NULL);
+    config.start = mstime();
+    for (i = 0; i < config.requests; i++) {
+        redisReply *reply;
+        if (config.randomkeys) randomizeClientKey(c);
+        c->start = ustime();
+        c->latency = -1;
+        if (redisAppendFormattedCommand(c->context,c->obuf,sdslen(c->obuf)) != REDIS_OK) {
+            fprintf(stderr,"Error: %s\n",c->context->errstr);
+            exit(1);
+        }
+        if (redisGetReply(c->context,(void**)&reply) != REDIS_OK || reply == NULL) {
+            fprintf(stderr,"Error: %s\n",c->context->errstr);
+            exit(1);
+        }
+        if (reply->type == REDIS_REPLY_ERROR) {
+            fprintf(stderr,"Unexpected error reply: %s\n",reply->str ? reply->str : "");
+            exit(1);
+        }
+        freeReplyObject(reply);
+        c->latency = ustime()-c->start;
+        config.latency[config.requests_finished++] = c->latency;
+    }
+    config.totlatency = mstime()-config.start;
+    showLatencyReport();
+    freeAllClients();
+}
+
 static void benchmark(char *title, char *cmd, int len) {
     client c;
 
     config.title = title;
     config.requests_issued = 0;
     config.requests_finished = 0;
+
+    if (config.tls && config.hostsocket == NULL) {
+        runTlsBenchmark(title,cmd,len);
+        return;
+    }
 
     c = createClient(cmd,len,NULL);
     createMissingClients(c);
@@ -624,6 +677,19 @@ int parseOptions(int argc, const char **argv) {
             config.tests = sdscat(config.tests,(char*)argv[++i]);
             config.tests = sdscat(config.tests,",");
             sdstolower(config.tests);
+        } else if (!strcmp(argv[i],"--tls")) {
+            config.tls = 1;
+        } else if (!strcmp(argv[i],"--sni") && !lastarg) {
+            config.tls_sni = argv[++i];
+        } else if (!strcmp(argv[i],"--cacert") && !lastarg) {
+            config.tls_cacert = argv[++i];
+        } else if (!strcmp(argv[i],"--cert") && !lastarg) {
+            config.tls_cert = argv[++i];
+        } else if (!strcmp(argv[i],"--key") && !lastarg) {
+            config.tls_key = argv[++i];
+        } else if (!strcmp(argv[i],"--insecure")) {
+            config.tls_insecure = 1;
+            config.tls = 1;
         } else if (!strcmp(argv[i],"--dbnum")) {
             if (lastarg) goto invalid;
             config.dbnum = atoi(argv[++i]);
@@ -652,6 +718,12 @@ usage:
 " -p <port>          Server port (default 6379)\n"
 " -s <socket>        Server socket (overrides host and port)\n"
 " -a <password>      Password for Redis Auth\n"
+" --tls              Use TLS when connecting to the server\n"
+" --sni <name>       TLS SNI and hostname for certificate verification\n"
+" --cacert <file>    CA certificate used to verify the server\n"
+" --cert <file>      Client certificate chain file\n"
+" --key <file>       Client private key file\n"
+" --insecure         Skip TLS certificate verification\n"
 " -c <clients>       Number of parallel connections (default 50)\n"
 " -n <requests>      Total number of requests (default 100000)\n"
 " -d <size>          Data size of SET/GET value in bytes (default 3)\n"

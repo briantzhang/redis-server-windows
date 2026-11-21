@@ -403,19 +403,39 @@ static sds percentDecode(const char *pe, size_t len) {
 }
 
 /* Parse a URI and extract the server connection information.
- * URI scheme is based on the the provisional specification[1] excluding support
- * for query parameters. Valid URIs are:
+ * URI scheme is based on the the provisional specification[1] with TLS query options.
+ * Valid URIs are:
  *   scheme:    "redis://"
  *   authority: [<username> ":"] <password> "@"] [<hostname> [":" <port>]]
- *   path:      ["/" [<db>]]
+ *   path:      ["/" [<db>]]["?" <tls-options>]
  *
  *  [1]: https://www.iana.org/assignments/uri-schemes/prov/redis */
+
+static sds uriGetParam(const char *query, const char *name) {
+    const char *curr = query;
+    size_t namelen = strlen(name);
+    while (curr != NULL && *curr != '\0') {
+        const char *sep = strchr(curr, '&');
+        const char *value = strchr(curr, '=');
+        size_t len = sep ? (size_t)(sep - curr) : strlen(curr);
+        if (value != NULL && (size_t)(value - curr) == namelen &&
+            !strncmp(curr, name, namelen))
+        {
+            size_t vlen = sep ? (size_t)(sep - value - 1) : strlen(value + 1);
+            return percentDecode(value + 1, vlen);
+        }
+        curr = sep ? sep + 1 : NULL;
+    }
+    return NULL;
+}
+
 static void parseRedisUri(const char *uri) {
 
     const char *scheme;
     const char *curr = uri;
     const char *end = uri + strlen(uri);
-    const char *userinfo, *username, *port, *host, *path;
+    const char *userinfo, *username, *port, *host, *path, *query;
+    sds value;
     size_t schemelen;
 
     /* URI must start with a valid scheme. */
@@ -457,6 +477,37 @@ static void parseRedisUri(const char *uri) {
     }
     curr = path ? path + 1 : end;
     if (curr == end) return;
+
+    /* Extract query parameters for TLS options when present. */
+    query = strchr(curr, '?');
+    if (query != NULL) {
+        value = uriGetParam(query + 1, "tls");
+        if (value != NULL) {
+            config.tls = strcasecmp(value, "true") == 0 ||
+                         strcasecmp(value, "1") == 0 ||
+                         strcasecmp(value, "yes") == 0;
+            sdsfree(value);
+        }
+        if ((value = uriGetParam(query + 1, "sni")) != NULL) {
+            config.tls_sni = value;
+        }
+        if ((value = uriGetParam(query + 1, "cacert")) != NULL) {
+            config.tls_cacert = value;
+        }
+        if ((value = uriGetParam(query + 1, "cert")) != NULL) {
+            config.tls_cert = value;
+        }
+        if ((value = uriGetParam(query + 1, "key")) != NULL) {
+            config.tls_key = value;
+        }
+        if ((value = uriGetParam(query + 1, "insecure")) != NULL) {
+            config.tls_insecure = strcasecmp(value, "true") == 0 ||
+                                  strcasecmp(value, "1") == 0 ||
+                                  strcasecmp(value, "yes") == 0;
+            sdsfree(value);
+        }
+        curr = sdsnewlen(curr, (size_t)(query - curr));
+    }
 
     /* Extract database number. */
     config.dbnum = atoi(curr);

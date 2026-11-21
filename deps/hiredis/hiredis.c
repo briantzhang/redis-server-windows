@@ -630,7 +630,7 @@ static void redisTlsSetError(redisContext *c, int type, const char *prefix) {
 	__redisSetError(c, type, buf);
 }
 
-static void redisTlsCleanup(redisContext *c) {
+void redisTlsCleanup(redisContext *c) {
 	SSL *ssl = (SSL *)c->tls_ssl;
 
 	if (ssl != NULL) {
@@ -675,7 +675,7 @@ static int redisTlsDrainOutput(redisContext *c) {
 	return REDIS_OK;
 }
 
-static int redisTlsHandshake(redisContext *c) {
+int redisTlsHandshake(redisContext *c) {
 	SSL *ssl = (SSL *)c->tls_ssl;
 	BIO *in = (BIO *)c->tls_in_bio;
 	char buf[1024 * 16];
@@ -712,7 +712,7 @@ static int redisTlsHandshake(redisContext *c) {
 	return REDIS_ERR;
 }
 
-static int redisTlsSetup(redisContext *c, const char *host) {
+int redisTlsSetup(redisContext *c, const char *host) {
 	SSL_CTX *ctx;
 	SSL *ssl;
 	BIO *in, *out;
@@ -783,7 +783,7 @@ static int redisTlsSetup(redisContext *c, const char *host) {
 	return REDIS_OK;
 }
 
-static void redisContextInitTlsStrings(redisContext *c, const char *host,
+void redisContextInitTlsStrings(redisContext *c, const char *host,
 	const char *ca_cert, const char *cert, const char *key, int verify)
 {
 	if (host != NULL) c->tls_host = redisTlsDupString(host);

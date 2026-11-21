@@ -179,6 +179,26 @@ redisAsyncContext *redisAsyncConnect(const char *ip, int port) {
 	return ac;
 }
 
+redisAsyncContext *redisAsyncConnectTLS(const char *ip, int port,
+    const char *ca_cert, const char *cert, const char *key,
+    const char *sni, int verify)
+{
+    SOCKADDR_STORAGE ss;
+    redisContext *c = redisPreConnectNonBlock(ip, port, &ss);
+    redisAsyncContext *ac;
+    if (c == NULL) return NULL;
+    c->flags |= REDIS_TLS;
+    redisContextInitTlsStrings(c, sni ? sni : ip, ca_cert, cert, key, verify);
+    ac = redisAsyncInitialize(c);
+    if (ac == NULL) { redisFree(c); return NULL; }
+    if (WSIOCP_SocketConnect(ac->c.fd, &ss) != 0) {
+        ac->c.err = errno;
+        strerror_r(errno, ac->c.errstr, sizeof(ac->c.errstr));
+    }
+    __redisAsyncCopyError(ac);
+    return ac;
+}
+
 redisAsyncContext *redisAsyncConnectBind(const char *ip, int port, const char *source_addr) {
 	SOCKADDR_STORAGE ss;
 	redisContext *c = redisPreConnectNonBlock(ip, port, &ss);
@@ -550,6 +570,15 @@ static int __redisAsyncHandleConnect(redisAsyncContext *ac) {
 		return REDIS_ERR;
 	}
 
+	if (c->flags & REDIS_TLS) {
+		if (redisTlsSetup(c, c->tls_host) == REDIS_ERR ||
+		    redisTlsHandshake(c) == REDIS_ERR) {
+			__redisAsyncCopyError(ac);
+			if (ac->onConnect) ac->onConnect(ac, REDIS_ERR);
+			__redisAsyncDisconnect(ac);
+			return REDIS_ERR;
+		}
+	}
 	/* Mark context as connected. */
 	c->flags |= REDIS_CONNECTED;
 	if (ac->onConnect) ac->onConnect(ac, REDIS_OK);

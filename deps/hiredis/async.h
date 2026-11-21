@@ -109,6 +109,10 @@ redisAsyncContext *redisAsyncConnectBind(const char *ip, int port, const char *s
 redisAsyncContext *redisAsyncConnectBindWithReuse(const char *ip, int port,
                                                   const char *source_addr);
 redisAsyncContext *redisAsyncConnectUnix(const char *path);
+redisAsyncContext *redisAsyncConnectTLS(const char *ip, int port,
+    const char *ca_cert, const char *cert, const char *key,
+    const char *sni, int verify);
+
 int redisAsyncSetConnectCallback(redisAsyncContext *ac, redisConnectCallback *fn);
 int redisAsyncSetDisconnectCallback(redisAsyncContext *ac, redisDisconnectCallback *fn);
 void redisAsyncDisconnect(redisAsyncContext *ac);

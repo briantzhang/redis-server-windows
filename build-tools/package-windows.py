@@ -133,7 +133,9 @@ Windows x64 原生免编译 ZIP。解压后双击 start.cmd，在前台运行；
 完整性：解压目录执行 python -I verify-checksums.py .，输出 OK 表示文件未改动。
 TLS：按 redis.windows.conf 的注释配置 tls-port 和证书后重启；必须保留
       libssl-3-x64.dll 与 libcrypto-3-x64.dll。随包 redis-cli 可用
-      --tls --cacert <CA> -p <tls-port> PING 连接；也可用 rediss:// URI。
+      --tls --cacert <CA> -p <tls-port> PING 连接；也可用 rediss:// URI，
+      并通过 ?cacert=<CA>&sni=<name>&insecure=true 传入 TLS 查询参数。
+      redis-benchmark 可用 --tls --insecure -p <tls-port> -t ping 压测 TLS 监听端口。
       自签名测试环境可加 --insecure；双向认证用 --cert 与 --key。
       OpenSSL 许可证见 licenses/openssl-LICENSE.txt。
       主从复制加密：从库设置 tls-replication yes，并用 replicaof 指向主库
