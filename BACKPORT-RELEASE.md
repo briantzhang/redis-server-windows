@@ -1,6 +1,15 @@
-# Redis for Windows 5.0.14.1-bp87
+# Redis for Windows 5.0.14.1-bp88
 
 本版本以 tporadowski/redis 的 `v5.0.14.1` 标签为底座，选择性回移 Redis 6.0–7.2 的单机命令能力。它是自维护 Windows 移植版，不是 Redis 官方 6、7 或 8 发行版。
+
+## 版本变更摘要
+
+- bp88：补齐剩余回移清单的回归与文档：修正 redis-cli 断线重连时丢失原对端地址的问题，TLS 集群 CLI 回归扩展到 `info`/`check`/`call` 与 `rediss://` 参数，补充动态键规格、TLS 工具与运维说明。
+- bp87：redis-benchmark 与 hiredis 异步 TLS，redis-cli TLS/URI 参数，ACL 选项级键权限与 GETKEYSANDFLAGS 动态标志，FUNCTION/RDB/RESP3/集群观测回归补强。
+- bp86：Windows 服务管理、校验和验证与打包工具，运维文档。
+- bp85：WAITAOF、CLUSTER 观测与 RDB/DUMP 稳定性修复。
+- bp84：RDB/DUMP 与 RESP3 回归补强。
+- bp81：redis-cli TLS 与集群 TLS 路径打通。
 
 ## 本次范围
 
@@ -143,7 +152,7 @@ bp44 用 `build-tools/bench-hotpaths.py` 在同一进程内交替测量 bp28 与
 python -I tests/backport_regression.py --server msvs/x64/Release/redis-server.exe
 ```
 
-覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。本轮覆盖 `FUNCTION` / `FCALL` 及 DUMP/RESTORE 往返、三节点集群组网与重定向，以及 TLS 明文/密文双监听、256 KiB 往返、流水线和 `tls-auth-clients yes` 客户端证书校验，RESP3 下 Pub/Sub 与 TRACKING 的 push 帧，ACL 的 `%R~`/`%W~` 键权限，TLS 主从复制的全量同步、部分重同步与增量传播，TLS 协议/套件/会话配置的运行时校验与热应用，`tls-auth-clients` 三态切换与不受信客户端证书的拒绝，无盘复制下 TLS 与明文从库的并行全量同步，RESP3 订阅连接执行普通命令，`new`/`keymiss` 通知事件，以及 AOF 时间戳注释的写入、重写与重载，`CLUSTER ADDSLOTSRANGE`/`DELSLOTSRANGE` 的区间分配、删除、错误校验与槽位释放后的 `CLUSTERDOWN`，`CLUSTER SHARDS`/`LINKS`，集群总线 TLS 组网与节点证书校验，`cluster-announce-hostname`/`cluster-preferred-endpoint`/`replica-announced`，`shutdown-timeout` 的等待与超时，`repl-diskless-load` 三种模式及失败回退，`sanitize-dump-payload` 三模式、CORRUPT payload 拒绝与 `CONFIG REWRITE`，`FAILOVER` 的 ABORT、超时恢复、`TO` 指定目标与自动选目标，以及 Windows 底座在持续写入下的 BGSAVE/BGREWRITEAOF、AOF 运行时开关、3 字节分段写入、1 MiB value、1500 条流水线、连接抖动和空闲超时；共 138 项。保留 bp23 的 RESP3 及 bp22 及更早用例。
+覆盖新命令、非法参数、过期边界、原子性、WATCH/MULTI、原有命令冒烟及 RDB/AOF 重启。本轮覆盖 `FUNCTION` / `FCALL` 及 DUMP/RESTORE 往返、三节点集群组网与重定向，以及 TLS 明文/密文双监听、256 KiB 往返、流水线和 `tls-auth-clients yes` 客户端证书校验，RESP3 下 Pub/Sub 与 TRACKING 的 push 帧，ACL 的 `%R~`/`%W~` 键权限，TLS 主从复制的全量同步、部分重同步与增量传播，TLS 协议/套件/会话配置的运行时校验与热应用，`tls-auth-clients` 三态切换与不受信客户端证书的拒绝，无盘复制下 TLS 与明文从库的并行全量同步，RESP3 订阅连接执行普通命令，`new`/`keymiss` 通知事件，以及 AOF 时间戳注释的写入、重写与重载，`CLUSTER ADDSLOTSRANGE`/`DELSLOTSRANGE` 的区间分配、删除、错误校验与槽位释放后的 `CLUSTERDOWN`，`CLUSTER SHARDS`/`LINKS`，集群总线 TLS 组网与节点证书校验，`cluster-announce-hostname`/`cluster-preferred-endpoint`/`replica-announced`，`shutdown-timeout` 的等待与超时，`repl-diskless-load` 三种模式及失败回退，`sanitize-dump-payload` 三模式、CORRUPT payload 拒绝与 `CONFIG REWRITE`，`FAILOVER` 的 ABORT、超时恢复、`TO` 指定目标与自动选目标，以及 Windows 底座在持续写入下的 BGSAVE/BGREWRITEAOF、AOF 运行时开关、3 字节分段写入、1 MiB value、1500 条流水线、连接抖动和空闲超时；共 159 项。保留 bp23 的 RESP3 及 bp22 及更早用例。
 
 这是一轮选择性回移，不等于已完成上游所有安全补丁或生产压力验证。生产投放仍需在业务负载下检验 Redisson 调用、后台持久化、异常断电恢复和长时间运行。
 

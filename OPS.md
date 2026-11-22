@@ -1,6 +1,6 @@
 # 运维手册
 
-适用版本：Redis for Windows `5.0.14.1-bp49`，仅 Windows x64，支持单机和集群模式。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
+适用版本：Redis for Windows `5.0.14.1-bp88`，仅 Windows x64，支持单机和集群模式。没有 Windows ARM64 构建。底座是 tporadowski/redis `v5.0.14.1`。
 
 本文只覆盖这一个可执行文件的日常操作。AOF 采用 Redis 7 的多段布局：`appenddirname` 目录里放 manifest、一个 base 文件和一个增量文件，旧单文件 AOF 会在首次重写时自动迁移。TLS 覆盖客户端监听、主从复制和集群总线，见第 4c、4d、4e 节；主动切换主库见第 4f 节。集群模式沿用底座实现，见第 4b 节。ACL 已按 Redis 6 的范围实现，见第 3 节。
 
@@ -39,7 +39,7 @@
 .\redis-server.exe --version
 ```
 
-应看到 `v=5.0.14.1-bp49`。如果不是这个版本号，说明运行的不是这份回移。
+应看到 `v=5.0.14.1-bp88`。如果不是这个版本号，说明运行的不是这份回移。
 
 另开一个窗口检查存活：
 
@@ -357,7 +357,7 @@ COMMAND LIST FILTERBY ACLCAT write
 COMMAND GETKEYSANDFLAGS MSET a 1 b 2
 ```
 
-`CONFIG GET` 对重叠的模式去重。`CONFIG SET` 逐对应用：如果第二对参数非法，第一对已经生效，返回错误后要自己检查当前值。`COMMAND GETKEYSANDFLAGS` 的键标志是按命令级读写属性近似出来的（`RO`/`RW`、`access`、`update`），没有 Redis 7 的细粒度键规格。
+`CONFIG GET` 对重叠的模式去重。`CONFIG SET` 逐对应用：如果第二对参数非法，第一对已经生效，返回错误后要自己检查当前值。`COMMAND GETKEYSANDFLAGS` 按每条命令的键规格给出标志，同一条命令的不同键可以不同，例如 `BITOP` 的目标键是 `OW update`、源键是 `RO access`；`SET ... GET`、`GETEX`、`SORT ... STORE`、`GEORADIUS ... STORE`、`ZADD GT/LT` 按调用参数解析实际权限。
 
 地理搜索与连接排查：
 
@@ -443,6 +443,18 @@ openssl s_client -connect 127.0.0.1:6380 -servername redis.example -CAfile ca.cr
 ```
 
 需要客户端证书时再带 `-cert client.crt -key client.key`。TLS 覆盖客户端连接、主从复制和集群总线（`tls-cluster yes`）；Sentinel 仍是明文，证书路径也不支持热加载。
+
+## 4c-1. TLS 下的 redis-cli 与 redis-benchmark
+
+两个工具都支持 `--tls`、`--sni`、`--cacert`、`--cert`、`--key` 和 `--insecure`。客户端证书只在服务端要求 mTLS 时提供；自签 CA 应传 `--cacert`，临时联调才用 `--insecure`。
+
+```powershell
+.\redis-cli.exe --tls --cacert ca.crt -h redis.example -p 6380 PING
+.\redis-cli.exe --tls --insecure -p 6380 --cluster info 127.0.0.1:6380
+.\redis-benchmark.exe --tls --insecure -p 6380 -t ping -n 1000
+```
+
+`rediss://` URI 可用查询参数传证书和 SNI：`rediss://user:pass@host:6380/0?cacert=D:/redis/certs/ca.crt&sni=redis.example`。`--cluster` 的 `info`、`check`、`call`、`fix`、`reshard`、`import` 共用同一连接工厂；`import` 的源端参数 `--cluster-from` 也按这些 TLS 选项连接，断线后重连的是原对端，不会回到 CLI 的主连接地址。TLS benchmark 使用同步请求/回复驱动，避免与明文模式的 IOCP 流水线混用。
 
 ## 4d. TLS 主从复制
 
@@ -610,7 +622,7 @@ AOF 启动失败：
 - 不支持把一份数据目录挂给两个进程同时写。
 - Windows 构建可尝试通过 `loadmodule` 加载兼容的 x64 DLL，但仅保证底座已有的模块 ABI；`MODULE LOAD` 失败与 `MODULE HELP` 都会明确提示需要兼容的 x64 DLL 和 `RedisModule_OnLoad`。含未知模块数据的 RDB 和含模块类型的 DUMP payload 无法加载或 `RESTORE`；Functions 走 Lua，不依赖模块，可以使用。
 - 集群功能沿用底座实现，已有本机三节点覆盖，但没有验证哨兵、跨机器网络分区和真实故障切换；生产不要仅凭本版测试结论做故障切换。
-- ACL 已实现用户、口令、命令分类、键/频道通配符和 `%R~`/`%W~` 键读写权限；`SET`、`SETEX` 这类选项相关命令按命令级标志近似。见第 3 节。
+- ACL 已实现用户、口令、命令分类、键/频道通配符和 `%R~`/`%W~` 键读写权限，`SET ... GET`、`GETEX`、`SORT ... STORE`、`GEORADIUS ... STORE`、`ZADD GT/LT` 等选项相关命令按调用参数解析实际键权限。见第 3 节。
 - 客户端可以用 `HELLO 3` 切到 RESP3：map、set、null、bool、double 和 verbatim 都有。协议 3 下 Pub/Sub 的订阅确认、消息以及 `CLIENT TRACKING` 失效都用 push 帧（`>`）发送，失效不需要 `REDIRECT`；协议 2 仍是普通数组，失效继续走 `__redis__:invalidate` 频道，必须 `REDIRECT` 到已订阅该频道的连接。协议 3 的订阅连接可以继续执行任意普通命令（回包与 push 分开），协议 2 的订阅连接仍只允许订阅管理命令和 PING/QUIT/RESET。Redisson 单机模式下的 `SET ... KEEPTTL`、`GETEX`、`GETDEL` 属于本版已实现的范围。
 
 验证与打包脚本：`python build-tools/verify-native.py` 会先跑全量回归和基准测试，再写入 `dist/verification-windows.md`；若该文件已存在但版本号与当前 `redis-server.exe --version` 不一致，会直接报错，避免不同构建的验证结果混用。`python build-tools/package-windows.py` 除检查服务器版本和回归日志外，还会检查验证报告包含相同版本，然后才生成发布包。

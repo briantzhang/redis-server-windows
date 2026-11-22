@@ -862,6 +862,18 @@ static int cliSelect(void) {
  *      CC_FORCE: The connection is performed even if there is already
  *                a connected socket.
  *      CC_QUIET: Don't print errors if connection fails. */
+/* Reconnection needs the context's original peer, which the import path
+ * cannot supply from the global CLI options. hiredis already stores it. */
+static int cliContextPeer(redisContext *c, char *ip, size_t iplen, int *port) {
+    if (c == NULL) return -1;
+    if (c->connection_type == REDIS_CONN_UNIX) return -1;
+    if (c->tcp.host == NULL || iplen == 0) return -1;
+    strncpy(ip,c->tcp.host,iplen-1);
+    ip[iplen-1] = '\0';
+    *port = c->tcp.port;
+    return 0;
+}
+
 static redisContext *cliCreateContext(const char *ip, int port) {
     if (config.tls) {
         return redisConnectTLS(ip, port, config.tls_cacert, config.tls_cert,
@@ -1315,13 +1327,22 @@ static int cliSendCommand(int argc, char **argv, PORT_LONG repeat) {
     return REDIS_OK;
 }
 
-/* Send a command reconnecting the link if needed. */
+/* Send a command reconnecting the link if needed. The context carries its
+ * own peer address, so reconnects must not silently switch to the CLI's
+ * primary host: --cluster import talks to a separate source instance. */
 static redisReply *reconnectingRedisCommand(redisContext *c, const char *fmt, ...) {
     redisReply *reply = NULL;
     int tries = 0;
     va_list ap;
+    char peer_ip[256];
+    int peer_port = 0;
 
     assert(!c->err);
+    if (cliContextPeer(c,peer_ip,sizeof(peer_ip),&peer_port) != 0) {
+        strncpy(peer_ip,config.hostip,sizeof(peer_ip)-1);
+        peer_ip[sizeof(peer_ip)-1] = '\0';
+        peer_port = config.hostport;
+    }
     while(reply == NULL) {
         while (c->err & (REDIS_ERR_IO | REDIS_ERR_EOF)) {
             printf("\r\x1b[0K"); /* Cursor to left edge + clear line. */
@@ -1329,7 +1350,16 @@ static redisReply *reconnectingRedisCommand(redisContext *c, const char *fmt, ..
             fflush(stdout);
 
             redisFree(c);
-            c = cliCreateContext(config.hostip,config.hostport);
+            c = cliCreateContext(peer_ip,peer_port);
+            if (config.auth) {
+                redisReply *auth = redisCommand(c,"AUTH %s",config.auth);
+                if (auth == NULL || auth->type == REDIS_REPLY_ERROR) {
+                    if (auth) freeReplyObject(auth);
+                    fprintf(stderr,"Error: %s\n",c->errstr);
+                    exit(1);
+                }
+                freeReplyObject(auth);
+            }
             usleep(1000000);
         }
 

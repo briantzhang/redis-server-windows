@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp87
+# Redis for Windows 5.0.14.1-bp88
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp87`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp88`。
 
 ## 这个版本新增了什么
 
@@ -56,7 +56,7 @@ Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tpor
 | `EVAL_RO script numkeys key ...` / `EVALSHA_RO sha1 numkeys key ...` | 7.0 | 只读脚本入口，脚本里调用写命令直接报错 |
 | `CLIENT PAUSE timeout [WRITE\|ALL]`、`CLIENT UNPAUSE`、`CLIENT INFO` | 6.2 | 暂停写命令或全部命令、提前恢复、返回当前连接信息 |
 | `CONFIG GET pattern [pattern ...]`、`CONFIG SET param value [param value ...]` | 7.0 | 多模式查询（结果去重）与多参数设置；SET 按顺序应用，不是原子操作 |
-| `COMMAND LIST [FILTERBY PATTERN\|ACLCAT\|MODULE ...]`、`COMMAND GETKEYSANDFLAGS` | 7.0 | 列出命令名；键标志按命令级读写属性近似给出 |
+| `COMMAND LIST [FILTERBY PATTERN\|ACLCAT\|MODULE ...]`、`COMMAND GETKEYSANDFLAGS` | 7.0 | 列出命令名；键标志按每条命令的键规格给出，同一命令不同键可不同 |
 | `GEOSEARCH key FROMMEMBER\|FROMLONLAT ... BYRADIUS\|BYBOX ... [ASC\|DESC] [COUNT n [ANY]] [WITHCOORD\|WITHDIST\|WITHHASH]` | 6.2 | 按圆形或矩形区域搜索地理位置，支持 ANY 提前结束 |
 | `GEOSEARCHSTORE dst src ... [STOREDIST]` | 6.2 | 把搜索结果写入有序集合，可存距离；源键不存在时删除目标键 |
 | `ACL CAT [category]` / `ACL USERS` / `ACL GETUSER user` / `ACL GENPASS [bits]` / `ACL DRYRUN user cmd ...` | 6.0 | 列出命令分类与用户，查看用户规则，生成随机口令，预检权限 |

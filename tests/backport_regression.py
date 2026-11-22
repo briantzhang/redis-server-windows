@@ -3840,6 +3840,21 @@ class BackportRegression(unittest.TestCase):
         self.assertGreater(second_in, first_in)
         self.assertGreater(second_out, first_out)
 
+    def test_command_getkeysandflags_nested_key_specs(self):
+        """Dynamic and nested key specs report their own access flags."""
+        self.assertEqual(
+            self.cmd("COMMAND", "GETKEYSANDFLAGS", "XREAD", "STREAMS",
+                     "events", "0"),
+            [[b"events", [b"RO", b"access"]]])
+        self.assertEqual(
+            self.cmd("COMMAND", "GETKEYSANDFLAGS", "XREADGROUP", "GROUP",
+                     "g", "c", "STREAMS", "events", ">"),
+            [[b"events", [b"RW", b"access", b"update"]]])
+        self.assertEqual(
+            self.cmd("COMMAND", "GETKEYSANDFLAGS", "MIGRATE", "127.0.0.1",
+                     "6379", "migrating-key", "0", "5000"),
+            [[b"migrating-key", [b"RW", b"access", b"delete"]]])
+
     def test_redis_cli_uri_tls_query_params(self):
         """rediss:// query parameters configure TLS verification."""
         cli = Path(OPTIONS.server).with_name("redis-cli.exe") if OPTIONS.server else None
@@ -3906,20 +3921,41 @@ class BackportRegression(unittest.TestCase):
             client = RESP2("127.0.0.1", node.port, OPTIONS.timeout)
             try:
                 client.command("CLUSTER","ADDSLOTSRANGE","0","16383")
-                args = [str(cli), "--tls", "--insecure", "-h", "127.0.0.1",
-                        "-p", str(node.tls_port), "--cluster", "info",
-                        "127.0.0.1:%d" % node.tls_port]
+                base = [str(cli), "--tls", "--insecure", "-h", "127.0.0.1",
+                        "-p", str(node.tls_port)]
+                endpoint = "127.0.0.1:%d" % node.tls_port
+                for subcommand in ("info", "check", "call"):
+                    args = base + ["--cluster", subcommand]
+                    if subcommand == "call":
+                        args += [endpoint, "PING"]
+                    else:
+                        args.append(endpoint)
+                    result = subprocess.run(
+                        args, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, timeout=30)
+                    output = result.stdout.decode("utf-8", "replace")
+                    fmt = "%s\n%s"
+                    self.assertEqual(result.returncode, 0, fmt % (args, output))
+                    if subcommand == "info":
+                        self.assertIn("0 keys in 1 masters", output)
+                    elif subcommand == "check":
+                        self.assertIn("[OK]", output)
+                    else:
+                        self.assertIn(">>> Calling", output)
+                # The CA option is accepted with an explicit rediss URI.
+                uri = "rediss://127.0.0.1:%d/0?cacert=%s&insecure=true" % (
+                    node.tls_port, str(certs["ca"]).replace("\\", "/"))
                 result = subprocess.run(
-                    args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    timeout=20)
+                    [str(cli), "-u", uri, "PING"], stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, timeout=20)
                 output = result.stdout.decode("utf-8", "replace")
-                fmt = "%s\n%s"
-                self.assertEqual(result.returncode, 0, fmt % (args, output))
-                self.assertIn("0 keys in 1 masters", output)
+                self.assertEqual(result.returncode, 0, output)
+                self.assertIn("PONG", output)
             finally:
                 client.close()
         finally:
             node.close()
+
 
     def test_cluster_hostname_and_replica_announced(self):
         if self.server is None:
@@ -6881,6 +6917,20 @@ class BackportRegression(unittest.TestCase):
             if line.startswith(b"sync_partial_ok:"):
                 return int(line.split(b":", 1)[1])
         return 0
+
+
+    def test_redis_cli_reconnect_preserves_peer(self):
+        """CLI reconnects to the original peer, not the global host."""
+        source = (Path(__file__).resolve().parents[1] / "src" /
+                  "redis-cli.c").read_text(encoding="utf-8", errors="replace")
+        start = source.find("static redisReply *reconnectingRedisCommand(")
+        self.assertGreaterEqual(start, 0)
+        end = source.find("/*-----", start)
+        body = source[start:end]
+        self.assertIn("cliContextPeer(c,peer_ip", body)
+        self.assertIn("c = cliCreateContext(peer_ip,peer_port)", body)
+        self.assertNotIn("c = cliCreateContext(config.hostip,config.hostport)",
+                         body)
 
 
 def parse_args(argv):
