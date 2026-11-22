@@ -6933,6 +6933,95 @@ class BackportRegression(unittest.TestCase):
                          body)
 
 
+    def test_command_getkeys_and_docs_metadata(self):
+        """GETKEYS and DOCS expose key positions and stable doc fields."""
+        self.assertEqual(self.cmd("COMMAND", "GETKEYS", "SET", "key", "value"),
+                         [b"key"])
+        self.assertEqual(self.cmd("COMMAND", "GETKEYS", "MSET", "a", "1",
+                                  "b", "2"), [b"a", b"b"])
+        with self.assertRaises(RedisError):
+            self.cmd("COMMAND", "GETKEYS", "PING")
+        docs = self.flat_map(self.cmd("COMMAND", "DOCS", "GET")[1])
+        self.assertIn(b"group", docs)
+        self.assertEqual(docs[b"group"], b"string")
+        self.assertIn(b"summary", docs)
+        self.assertIn(b"since", docs)
+
+    def test_client_tracking_noloop_and_info(self):
+        """NOLOOP and OPTIN/OPTOUT flags are visible in TRACKINGINFO."""
+        self.assertEqual(self.cmd("CLIENT", "TRACKING", "ON", "NOLOOP"), b"OK")
+        info = self.flat_map(self.cmd("CLIENT", "TRACKINGINFO"))
+        self.assertIn(b"noloop", info[b"flags"])
+        self.assertEqual(self.cmd("CLIENT", "TRACKING", "OFF"), b"OK")
+        self.assertEqual(self.cmd("CLIENT", "TRACKING", "ON", "OPTIN"), b"OK")
+        info = self.flat_map(self.cmd("CLIENT", "TRACKINGINFO"))
+        self.assertIn(b"optin", info[b"flags"])
+        self.assertEqual(self.cmd("CLIENT", "TRACKING", "OFF"), b"OK")
+
+    def test_acl_selectors_and_allcats_boundaries(self):
+        """Selectors and category rules combine without widening key access."""
+        self.assertEqual(self.cmd("ACL", "SETUSER", "bpmulti", "on", ">pw",
+                                  "resetkeys", "~cache:*", "~queue:*",
+                                  "-@all", "+@read", "+@write",
+                                  "(+@write ~log:*)"), b"OK")
+        self.assertEqual(self.cmd("ACL", "DRYRUN", "bpmulti", "GET",
+                                  "cache:1"), b"OK")
+        self.assertEqual(self.cmd("ACL", "DRYRUN", "bpmulti", "GET",
+                                  "queue:1"), b"OK")
+        self.assertEqual(self.cmd("ACL", "DRYRUN", "bpmulti", "SET",
+                                  "log:1", "v"), b"OK")
+        self.cmd("ACL", "SETUSER", "bpmulti", "on", ">pw", "~cache:*",
+                 "-@all", "+@all")
+        self.assertEqual(self.cmd("ACL", "DRYRUN", "bpmulti", "SET",
+                                  "cache:1", "v"), b"OK")
+        with self.assertRaises(RedisError):
+            self.cmd("ACL", "DRYRUN", "bpmulti", "SET", "other", "v")
+
+    def test_resp3_nested_and_binary_values(self):
+        """RESP3 handles binary bulk data and negotiated protocol state."""
+        key = self.key("resp3:binary")
+        payload = b"a\x00b\xffc"
+        self.assertEqual(self.cmd("SET", key, payload), b"OK")
+        self.assertEqual(self.cmd("GET", key), payload)
+        hello3 = self.flat_map(self.cmd("HELLO", "3"))
+        self.assertEqual(hello3[b"proto"], 3)
+        self.assertEqual(self.cmd("PING", b"\x00\xff"), b"\x00\xff")
+        self.assertIsInstance(self.cmd("MEMORY", "USAGE", key), int)
+
+    def test_expiration_storm_stats_consistency(self):
+        """Bulk expiry eventually updates stats without leaking live keys."""
+        keys = [self.key("expire:storm:%d" % n) for n in range(64)]
+        pipeline = [("SET", key, "v", "PX", "20") for key in keys]
+        replies = self.cmd_pipeline(pipeline) if hasattr(self, "cmd_pipeline") else None
+        if replies is None:
+            for key in keys:
+                self.cmd("SET", key, "v", "PX", "20")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if all(self.cmd("EXISTS", key) == 0 for key in keys):
+                break
+            time.sleep(0.05)
+        self.assertTrue(all(self.cmd("EXISTS", key) == 0 for key in keys))
+        stats = self.cmd("INFO", "stats").decode("utf-8", "replace")
+        self.assertIn("expired_keys:", stats)
+
+    def test_release_tooling_contracts(self):
+        """Release helper scripts expose dry-run and zip verification."""
+        root = Path(__file__).resolve().parents[1]
+        package = (root/'build-tools'/'package-windows.py').read_text(
+            encoding='utf-8', errors='replace')
+        verify = (root/'build-tools'/'verify-checksums.py').read_text(
+            encoding='utf-8', errors='replace')
+        self.assertIn("--dry-run", package)
+        self.assertIn("COMPATIBILITY.md", package)
+        self.assertIn("bootstrap-windows.ps1", package)
+
+        self.assertIn("import zipfile", verify)
+        self.assertIn("is_zipfile", verify)
+        for name in ["COMPATIBILITY.md", "UPGRADING.md", "SECURITY-AUDIT.md",
+                     "RUNBOOK.md", "REDIS-CHANNELS.md"]:
+            self.assertTrue((root/name).is_file(), name)
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)

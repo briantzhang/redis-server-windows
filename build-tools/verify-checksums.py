@@ -7,6 +7,8 @@ skipped so a fresh unpack can always be verified.
 """
 import hashlib
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 
 
@@ -18,10 +20,7 @@ def digest(path):
     return h.hexdigest()
 
 
-def main():
-    if len(sys.argv) != 2:
-        raise SystemExit('usage: verify-checksums.py <unpacked-directory>')
-    root = Path(sys.argv[1]).resolve()
+def verify_root(root):
     checksums = root / 'checksums.sha256'
     if not checksums.is_file():
         raise SystemExit('missing checksums.sha256: ' + str(checksums))
@@ -54,6 +53,35 @@ def main():
         return 1
     print('OK')
     return 0
+
+
+def main():
+    if len(sys.argv) != 2:
+        raise SystemExit('usage: verify-checksums.py <unpacked-directory|release.zip>')
+    target = Path(sys.argv[1]).resolve()
+    if target.is_file():
+        if zipfile.is_zipfile(target):
+            with tempfile.TemporaryDirectory(prefix='redis-verify-') as temp:
+                root = Path(temp)
+                with zipfile.ZipFile(target) as archive:
+                    names = archive.namelist()
+                    prefix = ''
+                    if names and all(name.startswith(names[0].split('/')[0] + '/')
+                                     for name in names):
+                        prefix = names[0].split('/')[0] + '/'
+                    if prefix + 'checksums.sha256' not in names:
+                        raise SystemExit('release zip has no checksums.sha256')
+                    archive.extractall(root)
+                    for path in sorted(root.rglob('*'), reverse=True):
+                        if path.is_file() and path.name == 'checksums.sha256':
+                            for candidate in [path.parent, path.parent.parent]:
+                                if (candidate / 'checksums.sha256').is_file():
+                                    return verify_root(candidate)
+                    raise SystemExit('release zip has no unpackable release directory')
+        raise SystemExit('file is not a release zip: ' + str(target))
+    if not target.is_dir():
+        raise SystemExit('path not found: ' + str(target))
+    return verify_root(target)
 
 
 if __name__ == '__main__':

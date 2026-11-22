@@ -1,9 +1,9 @@
-# Redis for Windows 5.0.14.1-bp88
+# Redis for Windows 5.0.14.1-bp89
 
 Windows x64 上的单机 Redis，以 [tporadowski/redis](https://github.com/tporadowski/redis) 的
 `v5.0.14.1`（提交 `ec77f72dc`，2022-02 发布）为底座，选择性回移了 Redis 6.0–7.2 的一批单机命令。
 
-它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp88`。
+它不是 Redis 官方发行版，也不是 Redis 6、7 或 8。`redis-server --version` 报告的版本号是 `5.0.14.1-bp89`。
 
 ## 这个版本新增了什么
 
@@ -119,7 +119,7 @@ TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM �
 
 `CLIENT PAUSE WRITE` 只拦写命令与 `EXEC`，`CLIENT PAUSE ALL` 连读命令一起拦；被暂停的连接在恢复后按原顺序执行已解析的命令。`CONFIG SET` 多参数时逐对应用，后面的参数非法时前面的已经生效。`COMMAND LIST FILTERBY ACLCAT` 用命令级读写标志近似 `read`/`write`/`keyspace` 分类；`COMMAND GETKEYSANDFLAGS` 按每条命令的键规格给出标志，同一条命令的不同键可以不同，例如 `BITOP` 的目标键是 `OW update`、源键是 `RO access`。`SET ... GET` 的键标志按当前参数解析为读写；键位置仍不固定的参数（`SORT` 的 `STORE`）按命令级标志近似。`CLIENT KILL LADDR` 匹配的是服务端监听地址，因此同一监听地址上的所有连接都会命中；`MAXAGE` 按连接建立到现在的秒数计算。`LATENCY HISTOGRAM` 使用每八度十六等分的固定对数桶（256 ns 起，128 个桶），不是上游的 HDR 直方图，`INFO latencystats` 的百分位取桶上界，最大低估约 6.25%，仍是估算值。`latency-tracking no` 只停止新采样，已有直方图保留到下一次重置。`WAITAOF` 会等待覆盖此前写入的本机 AOF fsync：`appendfsync always/no` 下命令内同步 fsync；`appendfsync everysec` 下把 fsync 放入后台线程并阻塞客户端直到该次 fsync 完成或超时，超时返回当前已获得的确认数。副本通过 `REPLCONF ACK ... FACK` 回传已 fsync 的复制偏移，主库据此统计副本确认；无副本时请求的副本数会归零并立即返回。`SHUTDOWN ABORT` 只能取消已置位但尚未执行的关闭请求，此时没有“关闭进行中”的状态。
 
-## 没有合入的部分
+## 部分合入与未合入的部分
 
 以下能力不在本版中，调用会返回 `unknown command` 或沿用底座的旧行为：
 
@@ -129,6 +129,14 @@ TLS 监听通过 `tls-port` 开启，`tls-cert-file`/`tls-key-file` 指定 PEM �
 - Redis 8 的查询引擎
 
 持久化使用多段 AOF（`appendonlydir`、manifest、base 与增量文件）和原有的 RDB 格式。`redis-check-aof` 既能检查单个 AOF 文件，也能接受 `appendonlydir` 目录：按 manifest 顺序检查每个 base/增量文件，`--fix` 只截断最后一个增量文件的坏尾。仍然可以对具体的 `.incr.aof`/`.base.aof` 单独执行。`appenddirname` 与 `appendfilename` 一样只能在启动配置里设置，`CONFIG GET` 可读、`CONFIG REWRITE` 会写回，但不支持 `CONFIG SET`。流的快照在 Redis 5 的 RDB 版本内用兼容扩展保存 `entries-added`、`max-deleted-entry-id` 和消费组 `entries-read`；旧版快照仍按当前长度恢复计数。AOF（含重写）继续通过 `XSETID`/`XGROUP SETID` 保留这些计数。带 TTL 的写入在 AOF 里记成普通 `SET` 加一条绝对时间的 `PEXPIREAT`，重放时不会把相对过期时间再算一遍。
+
+## 配套文档
+
+- [兼容性矩阵](COMPATIBILITY.md)
+- [升级与迁移指南](UPGRADING.md)
+- [安全补丁审计边界](SECURITY-AUDIT.md)
+- [故障演练与长跑记录手册](RUNBOOK.md)
+- [分发渠道清单](REDIS-CHANNELS.md)
 
 ## 构建
 

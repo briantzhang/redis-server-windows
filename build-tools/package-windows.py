@@ -5,10 +5,11 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '5.0.14.1-bp88'
+VERSION = '5.0.14.1-bp89'
 NAME = 'Redis-x64-' + VERSION
 DIST = ROOT / 'dist'
 PKG = DIST / NAME
@@ -27,9 +28,12 @@ def digest(path):
 
 
 def main():
+    dry_run = len(sys.argv) > 1 and sys.argv[1] == '--dry-run'
+    if len(sys.argv) > 2 or (len(sys.argv) == 2 and not dry_run):
+        raise SystemExit('usage: package-windows.py [--dry-run]')
     DIST.mkdir(exist_ok=True)
     # A distinct release directory prevents mixing cached old binaries.
-    if PKG.exists():
+    if PKG.exists() and not dry_run:
         raise SystemExit('Release directory already exists: ' + str(PKG))
     for name in BINARIES:
         if not (BUILD/name).is_file():
@@ -46,6 +50,9 @@ def main():
     test_log = ROOT/'build-tools'/'regression-windows.log'
     if not test_log.exists() or not test_log.read_text(encoding='utf-8').rstrip().endswith('OK'):
         raise SystemExit('A successful native regression log is required')
+    if dry_run:
+        print('DRY RUN OK: version, build outputs, verification report and regression log')
+        return
     PKG.mkdir()
     for name in BINARIES:
         shutil.copy2(BUILD/name, PKG/name)
@@ -53,7 +60,8 @@ def main():
         shutil.copy2(ROOT/'deps'/'openssl'/'bin'/name, PKG/name)
     for name in ['COPYING', 'BACKPORT-RELEASE.md']:
         shutil.copy2(ROOT/name, PKG/name)
-    for name in ['service-admin.ps1', 'verify-checksums.py']:
+    for name in ['service-admin.ps1', 'verify-checksums.py',
+                 'bootstrap-windows.ps1', 'bench-gate.py']:
         shutil.copy2(ROOT/'build-tools'/name, PKG/name)
     licenses = PKG/'licenses'
     licenses.mkdir()
@@ -226,9 +234,14 @@ TLS：按 redis.windows.conf 的注释配置 tls-port 和证书后重启；必�
                 output.write(p, p.relative_to(DIST))
     sources = DIST/(NAME+'-source.zip')
     tracked = subprocess.check_output(['git','-C',str(ROOT),'ls-files','-z']).decode().split('\0')
-    extra = ['BACKPORT-RELEASE.md','tests/backport_regression.py','tests/backport_benchmark.py',
+    extra = ['BACKPORT-RELEASE.md','COMPATIBILITY.md','UPGRADING.md',
+             'SECURITY-AUDIT.md','RUNBOOK.md','REDIS-CHANNELS.md',
+             'tests/backport_regression.py','tests/backport_benchmark.py',
              'build-tools/build-windows.ps1','build-tools/package-windows.py',
-             'build-tools/verify-native.py']
+             'build-tools/verify-native.py','build-tools/verify-checksums.py',
+             'build-tools/bootstrap-windows.ps1',
+             'build-tools/generate-channel-manifests.py',
+             'build-tools/bench-gate.py','build-tools/bench-tls.py']
     with zipfile.ZipFile(sources,'w',zipfile.ZIP_DEFLATED) as output:
         for rel in sorted(set(tracked+extra)):
             if rel and (ROOT/rel).is_file():
